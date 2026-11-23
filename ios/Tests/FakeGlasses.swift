@@ -187,6 +187,18 @@ final class FakeGlasses {
             }
             let m = try DataX.parse(plain)
             let svc = m.service, type = m.type
+
+            // the provisioning link skips trust, so EndLinkSetup arrives here instead
+            if type == 0x1000 {
+                try send(DataX.message(DataX.chSetupMirror,
+                                       tags: [DataX.tag(2, 0x1000, last: true)]))
+                let ack = try DataX.parse(try readSealed(timeout: 20))
+                guard ack.error == Int(AirShield.stOK) else {
+                    throw LinkError.unexpected("EndLinkSetup not acked (0x\(String(ack.error ?? -1, radix: 16)))")
+                }
+                sawEndLinkStatus = true
+                continue
+            }
             if svc == Self.svcCaptures && type == Self.capEnum {
                 for rec in records {
                     try send(DataX.message(m.channel,

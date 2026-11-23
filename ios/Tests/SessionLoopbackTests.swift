@@ -17,10 +17,11 @@ final class SessionLoopbackTests: XCTestCase {
                                             assets: [("asset-a", 2, 2_730_026)])
         let payload = Data((0 ..< 5120).map { UInt8($0 % 256) })
         let peer = FakeGlasses(stream: glassStream, records: [record],
-                               file: ("Visor_20261123_110000.jpg", payload))
+                               file: ("Visor_20261123_110000.jpg", payload),
+                               log: { print("glass: \($0)") })
         peer.start()
 
-        let session = Session(stream: phoneStream, owner: owner)
+        let session = Session(stream: phoneStream, owner: owner, log: { print("phone: \($0)") })
 
         // the phone side has to run off the main thread: the stream callbacks are
         // scheduled on the main run loop, which `wait(for:)` keeps spinning.
@@ -30,16 +31,16 @@ final class SessionLoopbackTests: XCTestCase {
 
         let worker = Thread {
             do {
-                try session.handshake(timeout: 20)
+                try session.handshake(timeout: 10)
                 captured["handshake"] = true
 
-                let caps = try session.captureList(timeout: 20)
+                let caps = try session.captureList(timeout: 10)
                 captured["captures"] = caps.count
                 captured["handle"] = caps.first?.handle
                 captured["size"] = caps.first?.stills.first?.size
 
                 try session.requestAsset(handle: "cap-1", assetID: "asset-a")
-                let transfer = try session.receiveFile(timeout: 20)
+                let transfer = try session.receiveFile(timeout: 10)
                 captured["file"] = transfer?.name
                 captured["bytes"] = transfer?.data
                 captured["count"] = transfer?.data.count
@@ -51,7 +52,7 @@ final class SessionLoopbackTests: XCTestCase {
         worker.name = "loopback-phone"
         worker.start()
 
-        wait(for: [done], timeout: 60)
+        wait(for: [done], timeout: 45)
 
         if let failure {
             XCTFail("session failed: \(failure)")
@@ -74,22 +75,23 @@ final class SessionLoopbackTests: XCTestCase {
         let owner = OwnerMaterial.generate()
         let (phoneStream, glassStream) = SDUStream.loopbackPair()
         let peer = FakeGlasses(stream: glassStream, records: [],
-                               file: ("unused", Data()), expectTrust: false)
+                               file: ("unused", Data()), expectTrust: false,
+                               log: { print("glass: \($0)") })
         peer.start()
 
-        let session = Session(stream: phoneStream, owner: owner)
+        let session = Session(stream: phoneStream, owner: owner, log: { print("phone: \($0)") })
         let done = expectation(description: "setup-only handshake")
         var failure: String?
         let worker = Thread {
             do {
-                try session.handshake(timeout: 20, trust: false)
+                try session.handshake(timeout: 10, trust: false)
             } catch {
                 failure = "\(error)"
             }
             done.fulfill()
         }
         worker.start()
-        wait(for: [done], timeout: 40)
+        wait(for: [done], timeout: 30)
         if let failure { XCTFail("setup handshake failed: \(failure)") }
     }
 }
