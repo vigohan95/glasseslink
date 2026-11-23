@@ -107,11 +107,14 @@ struct OwnerMaterial {
     /// signs the digest verbatim, so the binding is wrapped in one before signing.
     func signRaw(digest: Data) throws -> Data {
         precondition(digest.count == 32, "binding digest is SHA-256")
-        let key = try P256.Signing.PrivateKey(rawRepresentation: scalar)
-        let sig = try key.signature(for: SHA256Digest(rawRepresentation: digest))
-        let raw = Self.derToRaw(sig.derRepresentation)
-        guard raw.count == 64 else { throw LinkError.io("signature is not 64 bytes") }
-        return raw
+        var nonce = Data(count: 32)
+        _ = nonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        return try signRaw(digest: digest, nonce: nonce)
+    }
+
+    /// Same operation with the nonce supplied, so tests can pin the output.
+    func signRaw(digest: Data, nonce: Data) throws -> Data {
+        try P256ECDSA.sign(digest: digest, scalar: scalar, nonce: nonce)
     }
 
     /// Security wants PKCS#8 (a bare 32-byte scalar is rejected with OSStatus -50), so

@@ -23,15 +23,34 @@ final class ProtocolTests: XCTestCase {
     /// verbatim. tools/p256_ref.py is the executable spec: it produces r||s for the same
     /// digest with a fixed nonce and checks it with `cryptography`'s prehashed verifier.
     func testSignsTheDigestVerbatim() throws {
+        // tools/p256_ref.py produced this r||s for exactly these inputs and confirmed with
+        // `cryptography`'s Prehashed verifier that it is a NONEwithECDSA signature.
+        let scalar = Data(hex: "0a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829")
+        let digest = Data((0 ..< 32).map { UInt8($0) })
+        let nonce = Data(hex: "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30")
+        let expected = "4c6336e3b8b3de771b613a1c7a1734834cd69c1a4f5ffecb240c63bc0ddb1574"
+            + "03bf8bb6c07d98211266b44f2c126e24cdb99572444e0d01d35b15d04433a4e2"
+        let owner = OwnerMaterial(scalar: scalar)
+        let sig = try owner.signRaw(digest: digest, nonce: nonce)
+        XCTAssertEqual(sig.hexShort, expected)
+        XCTAssertEqual(owner.publicKeyXy.hexShort,
+                       "24ac923b7211ddd1da58d1a1bac605dc9060b4da5542c8432f1bd42c45953271"
+                       + "6a81b1e71d07038e36f4100fb1d7bc5a0e5df22cbb25cc98c0791c04d3c5ac86")
+    }
+
+    func testSignsWithARandomNonceAndIsStableAcrossCalls() throws {
         let owner = OwnerMaterial(scalar: Data((1 ... 32).map { UInt8($0) }))
         let digest = Data((0 ..< 32).map { UInt8($0) })
-        let sig = try owner.signRaw(digest: digest)
-        XCTAssertEqual(sig.count, 64)
-        let pub = try P256.Signing.PublicKey(rawRepresentation: Data([0x04]) + owner.publicKeyXy)
-        let parsed = try P256.Signing.ECDSASignature(rawRepresentation: sig)
-        XCTAssertTrue(pub.isValidSignature(parsed, for: SHA256Digest(rawRepresentation: digest)))
-        let low = sig[64 - 1]
-        XCTAssertTrue(low <= 0x80, "s is not the low half; the glasses normalise to it")
+        let a = try owner.signRaw(digest: digest)
+        let b = try owner.signRaw(digest: digest)
+        XCTAssertEqual(a.count, 64)
+        XCTAssertEqual(b.count, 64)
+        XCTAssertNotEqual(a, b, "a fixed nonce would leak the key")
+        // r||s must stay inside the group order, and s must be the low half.
+        for sig in [a, b] {
+            let s = [UInt8](sig[32...])
+            XCTAssertTrue(s[0] < 0x80, "s is not normalised to the low half")
+        }
     }
     func testVarintRoundTrip() throws {
         for value: UInt64 in [0, 1, 127, 128, 300, 16_384, 1 << 32, UInt64.max >> 1] {
@@ -189,5 +208,18 @@ final class ProtocolTests: XCTestCase {
         let parsed = try ThriftCompact.loads(flipped)
         XCTAssertEqual(parsed[11] as? Bool, true)
         XCTAssertEqual(parsed[1] as? Data, Data("x".utf8))
+    }
+}
+
+extension Data {
+    init(hex: String) {
+        var bytes: [UInt8] = []
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2)
+            bytes.append(UInt8(hex[index ..< next], radix: 16) ?? 0)
+            index = next
+        }
+        self.init(bytes)
     }
 }

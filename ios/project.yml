@@ -15,6 +15,7 @@ targets:
       - OwnerKey.swift
       - Session.swift
       - Shutter.swift
+      - P256.swift
       - Varm.swift
       - Provision.swift
       - Login.swift
