@@ -74,7 +74,7 @@ final class ProtocolTests: XCTestCase {
         }
         XCTAssertEqual(plainMul(3, 5), 15)
         // 2G must match the textbook point doubling (7cf27b18… is its x coordinate)
-        let two = F.mulG([2, 0, 0, 0, 0, 0, 0, 0])
+        let two = P256ECDSA.mulG([2, 0, 0, 0, 0, 0, 0, 0])
         XCTAssertEqual(F.data(F.fromMont(two.x, F.p, F.n0p)).hexFull,
                        "7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978")
     }
