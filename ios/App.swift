@@ -140,16 +140,17 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     private func saveToPhotos(_ data: Data) {
-        PHPhotoLibrary.requestAuthorization { status in
+        PHPhotoLibrary.requestAuthorization { [weak self] status in
             guard status == .authorized || status == .limited else {
-                self.note("没有相册权限，照片只在 app 内")
+                Task { @MainActor in self?.note("没有相册权限，照片只在 app 内") }
                 return
             }
             PHPhotoLibrary.shared().performChanges {
                 let req = PHAssetCreationRequest.forAsset()
                 req.addResource(with: .photo, data: data, options: nil)
             } completionHandler: { ok, err in
-                self.note(ok ? "已存到相册" : "存相册失败：\(err?.localizedDescription ?? "?")")
+                let msg = ok ? "已存到相册" : "存相册失败：\(err?.localizedDescription ?? "?")"
+                Task { @MainActor in self?.note(msg) }
             }
         }
     }
