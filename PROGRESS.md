@@ -63,3 +63,15 @@
 `ios/Resources/varm_template.bin` 取自 Visor（github.com/macedonga/visor，AGPL-3.0）的 `core/assistant/src/main/resources/`，
 用作 ev53 的回答模板（按字节拼串，避免重编码改变整数宽度）。`ios/Resources/settings.tsv`、`ios/Resources/settings_ui.json`
 同样来自 Visor 的设置表。若要把本 app 分发，需遵守 AGPL-3.0（开源或另取授权）。
+## v0.17.0 (2026-11-23) — 密钥与签名修正
+
+真机 trust 之前一定失败，原因是三处字节级错误，全部在 CI 里有测试守着：
+
+1. `OwnerMaterial.publicKeyXy` 有时只有 63 字节：CryptoKit 的 `rawRepresentation` 不保证把 x/y 补零到 32 字节，而眼镜要 SHA-256(64 字节) 并据此做 ECDH。改为从 DER 取固定宽度的 65 字节再去掉 0x04。
+2. trust 的签名之前走 `P256.Signing.PrivateKey.signature(for:)`，它会把 binding **再哈希一次**；眼镜验的是 NONEwithECDSA（对 32 字节摘要原文签名），必然回 0x1044 INVALID_SIGNATURE。
+3. `Provisioner.pkcs8` 的 AlgorithmIdentifier 长度少 1 字节（`30 13` 却装了 20 字节内容），导致导出的 PKCS#8 本身不合法。
+
+### 已知问题
+
+- 假眼镜（`ios/Tests/FakeGlasses.swift`）还不够忠实：setup 链路会挂住，trusted 链路停在首帧，两个回环用例暂时 `XCTSkip`。
+- Security 在本机/模拟器拒绝导入独立 EC 私钥（`OSStatus -50`，raw / pkcs8 / sec1 / keychain 四种容器都试过），所以 `signRaw` 目前只能在真机上验证是否可用；真机如果回 0x1044，下一步就是自己实现 P-256 的 ECDSA（用 CryptoKit 只做 k*G 的 x 坐标）。
