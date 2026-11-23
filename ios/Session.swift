@@ -31,27 +31,14 @@ final class SDUStream: NSObject, StreamDelegate {
         input = channel.inputStream
         output = channel.outputStream
         super.init()
-        input.delegate = self
-        output.delegate = self
-        input.schedule(in: .main, forMode: .common)
-        output.schedule(in: .main, forMode: .common)
-        input.open()
-        output.open()
+        input?.delegate = self
+        output?.delegate = self
+        input?.schedule(in: .main, forMode: .common)
+        output?.schedule(in: .main, forMode: .common)
+        input?.open()
+        output?.open()
     }
 
-    /// Test hook: drive the same reassembly machine from any byte-stream pair, so the
-    /// whole handshake can be exercised with no glasses in the room (`boundPair()`).
-    init(input: InputStream, output: OutputStream) {
-        self.input = input
-        self.output = output
-        super.init()
-        input.delegate = self
-        output.delegate = self
-        input.schedule(in: .main, forMode: .common)
-        output.schedule(in: .main, forMode: .common)
-        input.open()
-        output.open()
-    }
 
     /// Two cross-wired bound pairs: what one side writes the other reads. Both ends are
     /// scheduled on the main run loop, so a test that waits on the main queue delivers
