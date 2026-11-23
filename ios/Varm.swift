@@ -145,10 +145,12 @@ enum VarmSplice {
     }
 
     /// Where the value that starts at `start` ends, without recording spans.
+    /// Booleans carry no bytes, so `end == start` is the normal answer for them — treating
+    /// that as a failure stopped `setBool` at the first `true`/`false` it walked past.
     private static func valueEnd(_ b: Data, _ start: Int, _ t: UInt8) -> Int? {
         var sink: [Span] = []
         let end = scanValue(b, start, t, &sink)
-        return end > start ? end : nil
+        return end >= start ? end : nil
     }
 }
 

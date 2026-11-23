@@ -141,7 +141,7 @@ final class ProtocolTests: XCTestCase {
                                  expectsAnswer: false, followUp: true)
         let outer = try ThriftCompact.loads(body)
         XCTAssertEqual(outer[1] as? Data, Data("turn-1".utf8))
-        XCTAssertEqual(outer[2] as? Int, 1000)
+        XCTAssertEqual(outer[2] as? Int64, 1000)
         let inner = try XCTUnwrap(outer[4] as? [Int: Any])
         XCTAssertEqual(inner[1] as? Data, Data("前面没有台阶。".utf8))
         XCTAssertEqual(inner[3] as? Bool, false)
