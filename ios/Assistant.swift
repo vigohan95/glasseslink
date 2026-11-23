@@ -246,14 +246,24 @@ final class Assistant {
 
     // MARK: answering
 
-    /// Ends a turn the way a server does: text in ev60, which the glasses speak themselves.
-    func complete(interaction: String, text: String, followUp: Bool = false) {
-        let result = ThriftWriter().string(1, text).i32(2, 1).bool(3, false).bool(4, false)
-            .bool(7, false).bool(8, false).bool(11, followUp).done()
-        let body = ThriftWriter().string(1, interaction).i32(2, 1000).string(3, "")
-            .structField(4, result).done()
+    /// Ends a turn the way a server does: ev53 carries the answer as a VARM, then ev60 with
+    /// the text — that pair is what makes the glasses speak it in their own voice. Sending
+    /// ev60 alone (or ev360) leaves the turn silent.
+    func complete(interaction: String, text: String, transcript: String = "", followUp: Bool = false) {
+        let asks = Varm.asks.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+        if let varm = Varm.build(interaction: interaction, transcript: transcript, text: text, onGlasses: true) {
+            send(53, varm)
+        } else {
+            log("assistant: varm_template.bin missing, the answer will not be spoken")
+        }
+        let expectAnswer = followUp && asks
+        send(60, Varm.complete(interaction: interaction, text: text,
+                               expectsAnswer: expectAnswer, followUp: followUp && !text.isEmpty))
+        log("assistant: answered \(interaction) (\(text.count) chars, spoken by the glasses)")
+    }
+
+    private func send(_ event: Int, _ body: Data) {
         try? session.sendOnService("assistant-m0", service: Int(Assistant.service),
-                                   type: UInt16(MT.netEvent), payload: netEvent(360, body))
-        log("assistant: answered \(interaction)")
+                                   type: UInt16(MT.netEvent), payload: netEvent(event, body))
     }
 }

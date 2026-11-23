@@ -15,6 +15,7 @@ targets:
       - OwnerKey.swift
       - Session.swift
       - Shutter.swift
+    - Varm.swift
       - Provision.swift
       - Login.swift
       - Drive.swift
@@ -29,6 +30,7 @@ targets:
       - SettingsSchema.swift
       - Resources/settings_ui.json
       - Resources/settings.tsv
+    - Resources/varm_template.bin
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.local.glasseslink
@@ -41,8 +43,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "0.14"
-        CFBundleVersion: "14"
+        CFBundleShortVersionString: "0.15"
+        CFBundleVersion: "15"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
