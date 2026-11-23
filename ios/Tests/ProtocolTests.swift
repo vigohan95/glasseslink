@@ -77,6 +77,17 @@ final class ProtocolTests: XCTestCase {
         let two = P256ECDSA.mulG([2, 0, 0, 0, 0, 0, 0, 0])
         XCTAssertEqual(F.data(F.fromMont(two.x, F.p, F.n0p)).hexFull,
                        "7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978")
+        // k*G for the nonce pinned in tools/p256_ref.py
+        let k = F.words(Data(hex: "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30"))
+        let kg = P256ECDSA.mulG(k)
+        XCTAssertEqual(F.data(F.fromMont(kg.x, F.p, F.n0p)).hexFull,
+                       "4c6336e3b8b3de771b613a1c7a1734834cd69c1a4f5ffecb240c63bc0ddb1574")
+        XCTAssertEqual(F.data(F.fromMont(kg.y, F.p, F.n0p)).hexFull,
+                       "f6896c5d14ca44e0037791c2300333259a71b901e5258575d107e5b8ac48b424")
+        // and the scalar inverse the signing step depends on
+        let oneN = F.toMont(F.one, F.n, F.n0n, F.r2n)
+        XCTAssertEqual(F.data(F.fromMont(F.invN(oneN), F.n, F.n0n)).hexFull,
+                       "0000000000000000000000000000000000000000000000000000000000000001")
     }
     func testVarintRoundTrip() throws {
         for value: UInt64 in [0, 1, 127, 128, 300, 16_384, 1 << 32, UInt64.max >> 1] {
