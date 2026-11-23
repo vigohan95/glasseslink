@@ -15,7 +15,7 @@ targets:
       - OwnerKey.swift
       - Session.swift
       - Shutter.swift
-    - Varm.swift
+      - Varm.swift
       - Provision.swift
       - Login.swift
       - Drive.swift
@@ -30,7 +30,7 @@ targets:
       - SettingsSchema.swift
       - Resources/settings_ui.json
       - Resources/settings.tsv
-    - Resources/varm_template.bin
+      - Resources/varm_template.bin
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.local.glasseslink
