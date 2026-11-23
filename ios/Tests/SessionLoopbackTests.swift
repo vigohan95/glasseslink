@@ -17,15 +17,19 @@ final class SessionLoopbackTests: XCTestCase {
                                             timestampNS: 1_700_000_000_000_000_000,
                                             assets: [("asset-a", 2, 2_730_026)])
         let payload = Data((0 ..< 5120).map { UInt8($0 % 256) })
+        print("[loop] A owner+pair+record built")
         let peer = FakeGlasses(stream: glassStream, records: [record],
                                file: ("Visor_20261123_110000.jpg", payload),
                                log: { NSLog("glass: %@", $0) })
         peer.start()
+        print("[loop] B peer started")
 
         let session = Session(stream: phoneStream, owner: owner,
                               log: { NSLog("phone: %@", $0) })
+        print("[loop] C session built, handshaking")
 
         try session.handshake(timeout: 15)
+        print("[loop] D handshake returned")
 
         let caps = try session.captureList(timeout: 15)
         XCTAssertEqual(caps.count, 1)
