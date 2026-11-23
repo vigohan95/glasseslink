@@ -26,9 +26,28 @@ struct OwnerMaterial {
 
     static func generate() -> OwnerMaterial {
         let key = P256.Signing.PrivateKey()
-        let raw = key.rawRepresentation
-        let pub = key.publicKey.rawRepresentation          // 65 bytes, 0x04||x||y
-        return OwnerMaterial(scalar: raw, publicKeyXy: Data(pub.dropFirst()))
+        return OwnerMaterial(scalar: key.rawRepresentation, publicKeyXy: xy(of: key.publicKey))
+    }
+
+    /// `x||y`, exactly 64 bytes, no 0x04 prefix.
+    ///
+    /// CryptoKit's `rawRepresentation` is *not* guaranteed to be padded: when the x or y
+    /// coordinate happens to start with a zero byte it can come back 63 bytes long, and
+    /// dropping the prefix naively then yields 62/63 bytes. The glasses hash this blob
+    /// (svc36 field 1) and use it for ECDH, so a short buffer breaks trust in a way that
+    /// looks like an unrelated signature error. The DER form always carries fixed-width
+    /// integers, which is why it is preferred here.
+    static func xy(of key: P256.Signing.PublicKey) -> Data {
+        let der = key.derRepresentation
+        if der.count >= 65, der[der.count - 65] == 0x04 {
+            return Data(der.suffix(64))
+        }
+        var raw = Data(key.rawRepresentation)
+        if raw.count == 65, raw[0] == 0x04 { raw = Data(raw.dropFirst()) }
+        if raw.count < 64 {
+            raw = Data(repeating: 0, count: 64 - raw.count) + raw
+        }
+        return Data(raw.suffix(64))
     }
 
     init(scalar: Data, publicKeyXy: Data? = nil) {
@@ -38,7 +57,7 @@ struct OwnerMaterial {
             self.publicKeyXy = xy
         } else {
             let k = try! P256.Signing.PrivateKey(rawRepresentation: scalar)
-            self.publicKeyXy = Data(k.publicKey.rawRepresentation.dropFirst())
+            self.publicKeyXy = OwnerMaterial.xy(of: k.publicKey)
         }
     }
 
@@ -48,28 +67,19 @@ struct OwnerMaterial {
     func sharedSecret(peerPubkeyXy: Data) throws -> Data {
         precondition(peerPubkeyXy.count == 64, "peer key is x||y, 64 bytes")
         let priv = try P256.KeyAgreement.PrivateKey(rawRepresentation: scalar)
-        let peer = try P256.KeyAgreement.PublicKey(rawRepresentation: publicKey65.withUnsafeBytes { _ in
-            Data([0x04]) + peerPubkeyXy
-        })
+        let peer = try P256.KeyAgreement.PublicKey(rawRepresentation: Data([0x04]) + peerPubkeyXy)
         let secret = try priv.sharedSecretFromKeyAgreement(with: peer)
         return secret.withUnsafeBytes { Data($0) }
     }
 
-    /// NONEwithECDSA over an already-hashed 32-byte digest, output as raw r||s.
-    /// CryptoKit only exposes "hash then sign", so we build the digest key and use
-    /// the low-level ECDSA path via Security when the digest must be signed as-is.
+    /// ECDSA over an already-hashed 32-byte digest (NONEwithECDSA), returned as raw r||s.
+    ///
+    /// CryptoKit has no prehashed entry point: `P256.Signing.PrivateKey.signature(for:)`
+    /// hashes its input again, and signing SHA-256(binding) is precisely what the glasses
+    /// reject with 0x1044 INVALID_SIGNATURE. Security's `.ecdsaSignatureDigestX962SHA256`
+    /// consumes the digest verbatim, which is the operation svc36 asks for.
     func signRaw(digest: Data) throws -> Data {
         precondition(digest.count == 32, "binding digest is SHA-256")
-        let priv = try P256.Signing.PrivateKey(rawRepresentation: scalar)
-        // CryptoKit will hash again, so feed it the digest wrapped in a pre-hashed
-        // container: ECDSASignature over a fixed 32-byte message is what the glasses
-        // verify, and DER->raw conversion is the only lossy step.
-        let sig = try priv.signature(for: digest)
-        return Self.derToRaw(sig.derRepresentation)
-    }
-
-    /// Same operation expressed through Security so the digest is signed verbatim.
-    func signDigestVerbatim(_ digest: Data) throws -> Data {
         var error: Unmanaged<CFError>?
         let attrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
                                     kSecAttrKeyClass as String: kSecAttrKeyClassPrivate]
@@ -80,7 +90,9 @@ struct OwnerMaterial {
                                               digest as CFData, &error) else {
             throw LinkError.io("SecKeyCreateSignature: \(error?.takeRetainedValue().localizedDescription ?? "?")")
         }
-        return Self.derToRaw(sig as Data)
+        let raw = Self.derToRaw(sig as Data)
+        guard raw.count == 64 else { throw LinkError.io("signature is not 64 bytes") }
+        return raw
     }
 
     // MARK: DER helpers

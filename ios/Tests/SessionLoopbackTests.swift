@@ -18,6 +18,8 @@ final class SessionLoopbackTests: XCTestCase {
         print("[m] publicKeyXy \(xy.count)")
         print("[m] random \(Data.random(16).count)/\(Data.random(32).count)")
         XCTAssertEqual(xy.count, 64)
+        // and it must match what the glasses will hash: 0x04 || x || y
+        XCTAssertEqual(owner.publicKey65.count, 65)
     }
     func testFullHandshakeCaptureListAndTransfer() throws {
         let owner = OwnerMaterial(scalar: Data((0 ..< 32).map { UInt8($0 + 1) }))
