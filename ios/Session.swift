@@ -221,6 +221,7 @@ final class Session {
     private var channels: [UInt16: String] = [:]
     private var idChannel: UInt16?
     private var idFirst = true
+    private var statusFirst = true
     private var peerPubkey = Data()
     private var binding = Data()
     var streamUUID = Data.uuid4()
@@ -645,6 +646,37 @@ final class Session {
         }
         let after = try driveObjects(namespace: namespace, timeout: timeout)
         return after.contains { $0.uri == key && $0.data == value }
+    }
+
+    // MARK: svc28 device state
+
+    private func statusChannel() -> UInt16 { channel(named: "status") ?? allocChannel("status") }
+
+    /// Subscribes (or re-asks on the existing channel) and merges pushes until the snapshot has
+    /// battery and storage, or the timeout runs out.
+    func subscribeStatus(timeout: TimeInterval = 4) throws -> GlassesState {
+        let ch = statusChannel()
+        var tags: [Data] = []
+        if statusFirst {
+            tags.append(DataX.tag(1, UInt16(Status.service), last: false))
+            statusFirst = false
+        }
+        tags.append(DataX.tag(2, Status.mtInit, last: true))
+        try sendAny(DataX.message(ch, tags: tags, payload: Status.subscribePayload()))
+
+        var state = GlassesState()
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 { break }
+            let m = try recvMessage(timeout: left)
+            if m.channel != ch { continue }
+            guard let type = m.type, Status.isStateType(type) else { continue }
+            Status.merge(m.payload, into: &state)
+            if state.batteryPercent != nil && state.storageFreeMb != nil { break }
+        }
+        emit("status: \(state.lines.joined(separator: " / "))")
+        return state
     }
 
     func close() { stream.close() }

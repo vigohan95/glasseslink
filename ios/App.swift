@@ -48,6 +48,9 @@ final class Glasses: NSObject, ObservableObject {
     @Published var modelName = UserDefaults.standard.string(forKey: "modelName") ?? "gemma3:4b"
     @Published var settings: [String: String] = [:]
     @Published var settingsLoading = false
+    @Published var status = GlassesState()
+    @Published var captures: [Capture] = []
+    @Published var lastVideo: Data?
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
@@ -153,6 +156,55 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: capture
 
+    func loadCaptures() {
+        guard let sess = session else { note("先连接"); return }
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                let caps = try sess.captureList()
+                captures = caps.sorted { ($0.timestampNS ?? 0) > ($1.timestampNS ?? 0) }
+                note("清单 \(caps.count) 条")
+            } catch {
+                note("读清单失败：\(error)")
+            }
+        }
+    }
+
+    /// Pulls one capture's best asset: the still for a photo, the first video asset otherwise.
+    func fetch(_ captureItem: Capture, saveToLibrary: Bool) {
+        guard let sess = session else { note("先连接"); return }
+        let asset = captureItem.isPhoto
+            ? (captureItem.stills.first ?? captureItem.assets.first)
+            : (captureItem.assets.first { $0.type == 1 } ?? captureItem.assets.first)
+        guard let asset else {
+            note("这条没有可传的资产")
+            return
+        }
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                note("拉取 \(captureItem.handle) / \(asset.uuid)（\(asset.size)B）")
+                try sess.requestAsset(handle: captureItem.handle, assetID: asset.uuid)
+                guard let transfer = try sess.receiveFile(timeout: 300) else {
+                    note("没收到文件（对端没发起传输）")
+                    return
+                }
+                note("收到 \(transfer.name) \(transfer.size)B")
+                if transfer.data.prefix(2) == Data([0xFF, 0xD8]) {
+                    lastPhoto = transfer.data
+                    if saveToLibrary { saveToPhotos(transfer.data) }
+                } else {
+                    lastVideo = transfer.data
+                    note("视频已收到，用「分享视频」导出")
+                }
+            } catch {
+                note("取文件失败：\(error)")
+            }
+        }
+    }
+
     func capture() {
         guard let sess = session else { note("先连接"); return }
         busy = true
@@ -161,6 +213,7 @@ final class Glasses: NSObject, ObservableObject {
             do {
                 let caps = try sess.captureList()
                 note("清单 \(caps.count) 条")
+                captures = caps.sorted { ($0.timestampNS ?? 0) > ($1.timestampNS ?? 0) }
                 guard let newest = caps.filter({ $0.isPhoto })
                         .max(by: { ($0.timestampNS ?? 0) < ($1.timestampNS ?? 0) }),
                       let still = newest.stills.first else {
@@ -179,6 +232,30 @@ final class Glasses: NSObject, ObservableObject {
             } catch {
                 note("取图失败：\(error)")
             }
+        }
+    }
+
+    func refreshStatus() {
+        guard let sess = session else { note("先连接"); return }
+        Task {
+            do {
+                let s = try sess.subscribeStatus()
+                status = s
+                if s.lines.isEmpty { note("状态：眼镜没回设备状态") }
+            } catch {
+                note("状态读取失败：\(error)")
+            }
+        }
+    }
+
+    func shareVideo() {
+        guard let data = lastVideo else { note("还没有视频"); return }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("capture.mp4")
+        do {
+            try data.write(to: url)
+            share = ShareBox(url: url)
+        } catch {
+            note("写临时文件失败：\(error)")
         }
     }
 
@@ -458,12 +535,44 @@ struct ContentView: View {
                     Button("导出 owner-export.json") { g.shareOwner() }
                 }
 
-                Section("3 · 拍照 / 取图") {
-                    Button(g.busy ? "处理中…" : "拉取最新一张照片") { g.capture() }
-                        .disabled(!g.connected || g.busy)
+                Section("3 · 相册 / 拍照") {
+                    HStack {
+                        Button(g.busy ? "处理中…" : "刷新清单") { g.loadCaptures() }
+                            .disabled(!g.connected || g.busy)
+                        Spacer()
+                        Button(g.busy ? "处理中…" : "拉最新照片") { g.capture() }
+                            .disabled(!g.connected || g.busy)
+                    }
+                    ForEach(g.captures, id: \.handle) { item in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(item.isPhoto ? "照片" : "视频") · \(item.assets.count) 个资产")
+                                Text(item.handle).font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                if let ns = item.timestampNS {
+                                    Text(Date(timeIntervalSince1970: Double(ns) / 1e9)
+                                        .formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Button("取回") { g.fetch(item, saveToLibrary: item.isPhoto) }
+                                .disabled(g.busy)
+                        }
+                    }
                     if let d = g.lastPhoto, let img = UIImage(data: d) {
                         Image(uiImage: img).resizable().scaledToFit().frame(maxHeight: 220)
                     }
+                    if g.lastVideo != nil {
+                        Button("分享视频") { g.shareVideo() }
+                    }
+                }
+
+                Section("设备状态") {
+                    ForEach(g.status.lines, id: \.self) { line in
+                        Text(line).font(.footnote)
+                    }
+                    Button("刷新状态") { g.refreshStatus() }.disabled(!g.connected)
                 }
 
                 Section("4 · 问自己的模型") {

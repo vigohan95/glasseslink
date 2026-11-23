@@ -19,6 +19,7 @@ targets:
       - Drive.swift
       - SettingsCatalog.swift
       - SettingsView.swift
+      - Status.swift
       - Resources/settings_ui.json
     settings:
       base:
@@ -32,8 +33,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "0.3"
-        CFBundleVersion: "3"
+        CFBundleShortVersionString: "0.4"
+        CFBundleVersion: "4"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
