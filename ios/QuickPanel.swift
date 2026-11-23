@@ -56,6 +56,46 @@ struct QuickPanel: View {
                 Text("点了会立刻写进眼镜并读回校验；读不到值时显示「关」。完整 370 项在「眼镜设置」里。")
             }
 
+            Section("音量与指示灯") {
+                Slider(
+                    value: Binding(
+                        get: { Double(g.settings["notification_volume"] ?? "") ?? 90 },
+                        set: { g.settings["notification_volume"] = String(Int($0.rounded())) }
+                    ),
+                    in: 0...100,
+                    step: 5
+                ) {
+                    Text("提示音量")
+                } minimumValueLabel: {
+                    Image(systemName: "speaker")
+                } maximumValueLabel: {
+                    Image(systemName: "speaker.wave.3")
+                } onEditingChanged: { editing in
+                    if !editing {
+                        g.writeSetting("notification_volume", g.settings["notification_volume"] ?? "90")
+                    }
+                }
+                Text("当前 \(g.settings["notification_volume"] ?? "—")（0–100，松手即写入眼镜）")
+                    .font(.caption2).foregroundStyle(.secondary)
+
+                Slider(
+                    value: Binding(
+                        get: { Double(g.settings["notification_led_brightness"] ?? "") ?? 3 },
+                        set: { g.settings["notification_led_brightness"] = String(Int($0.rounded())) }
+                    ),
+                    in: 0...5,
+                    step: 1
+                ) {
+                    Text("指示灯亮度")
+                } onEditingChanged: { editing in
+                    if !editing {
+                        g.writeSetting("notification_led_brightness", g.settings["notification_led_brightness"] ?? "3")
+                    }
+                }
+                Text("当前 \(g.settings["notification_led_brightness"] ?? "—")（0–5）")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
             Section("语音") {
                 ForEach(["assistant_voice_id", "live_caption_voice_id"], id: \.self) { key in
                     HStack {
@@ -66,6 +106,8 @@ struct QuickPanel: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                Text("音色是形如 en_US.58 的编号；要换语言得先在眼镜上装对应语言包。")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
         }
         .navigationTitle("快捷")
