@@ -117,7 +117,7 @@ struct OwnerMaterial {
     /// between SDK builds: a bare scalar works on some, PKCS#8 on others, and a keychain
     /// import is the last resort. Each candidate is tried once and the winner is cached,
     /// so a mismatch shows up as one log line instead of a silent 0x1044 on the glasses.
-    private static var importStyle: String?
+    static var importStyle: String?
 
     private func secPrivateKey() throws -> SecKey {
         let base: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
