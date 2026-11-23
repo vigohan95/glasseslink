@@ -294,7 +294,12 @@ enum Provisioner {
         let bitString = Data([0x00]) + pub                        // unused-bits byte + key
         inner += Data([0xA1]) + tlvLen(bitString.count + 2) + Data([0x03]) + tlvLen(bitString.count) + bitString
         let innerSeq = Data([0x30]) + tlvLen(inner.count) + inner
-        let algId = Data([0x30, 0x13]) + Data(oidP256) + Data([0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07])
+        // AlgorithmIdentifier ::= SEQUENCE { OID ecPublicKey (1.2.840.10045.2.1), OID prime256v1 }
+        // The first OID is 9 bytes and the second 10, so the SEQUENCE holds 19 bytes: a
+        // single wrong length byte here makes SecKeyCreateWithData fail with OSStatus -50.
+        let algId = Data([0x30, 0x13,
+                          0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01,
+                          0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07])
         let outer = Data([0x02, 0x01, 0x00]) + algId + Data([0x04]) + tlvLen(innerSeq.count) + innerSeq
         return Data([0x30]) + tlvLen(outer.count) + outer
     }
