@@ -80,7 +80,7 @@ final class ThriftWriter {
 
     /// A nested struct already produced by another writer.
     @discardableResult
-    func struct(_ fid: Int, _ body: Data) -> ThriftWriter {
+    func structField(_ fid: Int, _ body: Data) -> ThriftWriter {
         header(fid, TC.structure)
         buf.append(body)
         return self
@@ -256,7 +256,7 @@ extension Dictionary where Key == Int, Value == Any {
         (self[fid] as? Bool) ?? false
     }
 
-    func struct(_ fid: Int) -> [Int: Any] {
+    func structField(_ fid: Int) -> [Int: Any] {
         (self[fid] as? [Int: Any]) ?? [:]
     }
 

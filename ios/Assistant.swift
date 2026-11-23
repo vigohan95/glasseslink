@@ -245,7 +245,7 @@ final class Assistant {
         let result = ThriftWriter().string(1, text).i32(2, 1).bool(3, false).bool(4, false)
             .bool(7, false).bool(8, false).bool(11, followUp).done()
         let body = ThriftWriter().string(1, interaction).i32(2, 1000).string(3, "")
-            .struct(4, result).done()
+            .structField(4, result).done()
         try? session.sendOnService("assistant-m0", service: Int(Assistant.service),
                                    type: UInt16(MT.netEvent), payload: netEvent(360, body))
         log("assistant: answered \(interaction)")
