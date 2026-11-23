@@ -64,18 +64,36 @@ struct OwnerMaterial {
     // MARK: crypto
 
     /// ECDH with the glasses' 64-byte x||y key. Returns the 32-byte x coordinate.
+    ///
+    /// Done through Security rather than CryptoKit: `P256.KeyAgreement.PublicKey` refuses
+    /// the uncompressed point we build from x||y on some SDKs (it validates strictly and
+    /// reports `incorrectParameterSize`), while `SecKeyCreateWithData` accepts exactly the
+    /// 0x04||x||y blob the glasses send, and `SecKeyCopyKeyExchangeResult` returns x(S) —
+    /// the same 32 bytes AirShield feeds into its HKDF.
     func sharedSecret(peerPubkeyXy: Data) throws -> Data {
         precondition(peerPubkeyXy.count == 64, "peer key is x||y, 64 bytes")
-        let priv = try P256.KeyAgreement.PrivateKey(rawRepresentation: scalar)
-        let peer: P256.KeyAgreement.PublicKey
-        do {
-            peer = try P256.KeyAgreement.PublicKey(rawRepresentation: Data([0x04]) + peerPubkeyXy)
-        } catch {
-            throw LinkError.unexpected("glasses key is not a P-256 point (len=\(peerPubkeyXy.count), "
-                + "head=\(peerPubkeyXy.prefix(4).hexShort)): \(error)")
+        var error: Unmanaged<CFError>?
+        let privAttrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                                        kSecAttrKeyClass as String: kSecAttrKeyClassPrivate]
+        guard let priv = SecKeyCreateWithData(scalar as CFData, privAttrs as CFDictionary, &error) else {
+            throw LinkError.io("own key: \(error?.takeRetainedValue().localizedDescription ?? "?")")
         }
-        let secret = try priv.sharedSecretFromKeyAgreement(with: peer)
-        return secret.withUnsafeBytes { Data($0) }
+        let pubAttrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                                       kSecAttrKeyClass as String: kSecAttrKeyClassPublic]
+        let point = Data([0x04]) + peerPubkeyXy
+        guard let peer = SecKeyCreateWithData(point as CFData, pubAttrs as CFDictionary, &error) else {
+            throw LinkError.unexpected("glasses key is not a P-256 point "
+                + "(len=\(peerPubkeyXy.count), head=\(peerPubkeyXy.prefix(4).hexShort)): "
+                + "\(error?.takeRetainedValue().localizedDescription ?? "?")")
+        }
+        let params: [String: Any] = [SecKeyKeyExchangeParameter.requestedSize.rawValue as String: 32]
+        guard let secret = SecKeyCopyKeyExchangeResult(priv, .ecdhKeyExchangeStandard, peer,
+                                                       params as CFDictionary, &error) else {
+            throw LinkError.io("ECDH failed: \(error?.takeRetainedValue().localizedDescription ?? "?")")
+        }
+        let out = secret as Data
+        guard out.count == 32 else { throw LinkError.io("shared secret is \(out.count) bytes") }
+        return out
     }
 
     /// ECDSA over an already-hashed 32-byte digest (NONEwithECDSA), returned as raw r||s.
