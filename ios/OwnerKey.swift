@@ -93,24 +93,23 @@ struct OwnerMaterial {
     /// keys imported from `owner-export.json`. Callers use this to skip the trust exchange
     /// instead of sending a signature the glasses would reject with 0x1044.
     var canSignPrehashed: Bool {
-        (try? secPrivateKey()) != nil
+        // Signing is pure CryptoKit again, so every platform can do it; the probe stays so
+        // callers keep working if that ever changes.
+        (try? signRaw(digest: Data(repeating: 0, count: 32))) != nil
     }
 
     /// ECDSA over an already-hashed 32-byte digest (NONEwithECDSA), returned as raw r||s.
     ///
-    /// CryptoKit has no prehashed entry point: `P256.Signing.PrivateKey.signature(for:)`
-    /// hashes its input again, and signing SHA-256(binding) is precisely what the glasses
-    /// reject with 0x1044 INVALID_SIGNATURE. Security's `.ecdsaSignatureDigestX962SHA256`
-    /// consumes the digest verbatim, which is the operation svc36 asks for.
+    /// The glasses verify svc36 with `NONEwithECDSA`, i.e. the channel binding *is* the
+    /// digest. Handing CryptoKit a `Data` makes it hash first (`signature(for: Data)` is
+    /// ECDSA-with-SHA256 over the message), which yields SHA-256(binding) and is exactly
+    /// what the glasses answer with 0x1044 INVALID_SIGNATURE. The `SHA256Digest` overload
+    /// signs the digest verbatim, so the binding is wrapped in one before signing.
     func signRaw(digest: Data) throws -> Data {
         precondition(digest.count == 32, "binding digest is SHA-256")
-        let key = try secPrivateKey()
-        var error: Unmanaged<CFError>?
-        guard let sig = SecKeyCreateSignature(key, .ecdsaSignatureDigestX962SHA256,
-                                              digest as CFData, &error) else {
-            throw LinkError.io("SecKeyCreateSignature: \(error?.takeRetainedValue().localizedDescription ?? "?")")
-        }
-        let raw = Self.derToRaw(sig as Data)
+        let key = try P256.Signing.PrivateKey(rawRepresentation: scalar)
+        let sig = try key.signature(for: SHA256Digest(rawRepresentation: digest))
+        let raw = Self.derToRaw(sig.derRepresentation)
         guard raw.count == 64 else { throw LinkError.io("signature is not 64 bytes") }
         return raw
     }

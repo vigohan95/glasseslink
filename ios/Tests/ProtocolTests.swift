@@ -19,6 +19,20 @@ final class ProtocolTests: XCTestCase {
 
     // MARK: - varint
 
+    /// The glasses verify svc36 with NONEwithECDSA, so the channel binding must be signed
+    /// verbatim. tools/p256_ref.py is the executable spec: it produces r||s for the same
+    /// digest with a fixed nonce and checks it with `cryptography`'s prehashed verifier.
+    func testSignsTheDigestVerbatim() throws {
+        let owner = OwnerMaterial(scalar: Data((1 ... 32).map { UInt8($0) }))
+        let digest = Data((0 ..< 32).map { UInt8($0) })
+        let sig = try owner.signRaw(digest: digest)
+        XCTAssertEqual(sig.count, 64)
+        let pub = try P256.Signing.PublicKey(rawRepresentation: Data([0x04]) + owner.publicKeyXy)
+        let parsed = try P256.Signing.ECDSASignature(rawRepresentation: sig)
+        XCTAssertTrue(pub.isValidSignature(parsed, for: SHA256Digest(rawRepresentation: digest)))
+        let low = sig[64 - 1]
+        XCTAssertTrue(low <= 0x80, "s is not the low half; the glasses normalise to it")
+    }
     func testVarintRoundTrip() throws {
         for value: UInt64 in [0, 1, 127, 128, 300, 16_384, 1 << 32, UInt64.max >> 1] {
             let encoded = Varint.encode(value)

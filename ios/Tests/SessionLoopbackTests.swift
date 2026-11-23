@@ -36,9 +36,7 @@ final class SessionLoopbackTests: XCTestCase {
     }
     func testFullHandshakeCaptureListAndTransfer() throws {
         let owner = OwnerMaterial(scalar: Data((0 ..< 32).map { UInt8($0 + 1) }))
-        try XCTSkipUnless(owner.canSignPrehashed,
-                          "Security will not import a standalone EC key here, so the trust "
-                          + "exchange cannot be exercised on this machine")
+
         let (phoneStream, glassStream) = SDUStream.loopbackPair()
 
         let record = FlatBuild.captureRecord(handle: "cap-1", kind: 3073,
