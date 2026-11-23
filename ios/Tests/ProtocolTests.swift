@@ -58,6 +58,26 @@ final class ProtocolTests: XCTestCase {
             XCTAssertTrue(s[0] < 0x80, "s is not normalised to the low half")
         }
     }
+    /// Pinpoints which primitive is wrong when signing diverges from tools/p256_ref.py.
+    func testFieldAndPointPrimitives() throws {
+        typealias F = P256Field
+        func plainMul(_ a: UInt64, _ b: UInt64) -> UInt64 {
+            func m(_ v: UInt64) -> F.Word {
+                var w = F.zero
+                w[0] = UInt32(v & 0xFFFF_FFFF)
+                w[1] = UInt32(v >> 32)
+                return w
+            }
+            let x = F.toMont(m(a), F.p, F.n0p, F.r2p)
+            let y = F.toMont(m(b), F.p, F.n0p, F.r2p)
+            return UInt64(F.fromMont(F.mulModP(x, y), F.p, F.n0p)[0])
+        }
+        XCTAssertEqual(plainMul(3, 5), 15)
+        // 2G must match the textbook point doubling (7cf27b18… is its x coordinate)
+        let two = F.mulG([2, 0, 0, 0, 0, 0, 0, 0])
+        XCTAssertEqual(F.data(F.fromMont(two.x, F.p, F.n0p)).hexFull,
+                       "7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978")
+    }
     func testVarintRoundTrip() throws {
         for value: UInt64 in [0, 1, 127, 128, 300, 16_384, 1 << 32, UInt64.max >> 1] {
             let encoded = Varint.encode(value)
