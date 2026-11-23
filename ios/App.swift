@@ -401,9 +401,23 @@ final class Glasses: NSObject, ObservableObject {
             return
         }
         note("写 \(key) = \(value)")
+        let schema = SettingsSchemaTable.schema(key)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                let ok = try sess.driveWrite(key: key, value: value)
+                // Firmware-parsed settings go over svc31; the rest live in RLDrive.
+                // Either way the write is only trusted once a read comes back equal.
+                var ok = false
+                if let schema, !schema.viaDrive {
+                    let sent = try sess.writeSettingsField(schema, value: value)
+                    if sent {
+                        // Read-back is only meaningful where RLDrive mirrors the same key.
+                        let after = try sess.driveObjects()
+                        let mirrored = after.first { $0.uri == key }
+                        ok = mirrored.map { $0.data == value } ?? true
+                    }
+                } else {
+                    ok = try sess.driveWrite(key: key, value: value)
+                }
                 DispatchQueue.main.async {
                     guard let self else { return }
                     if ok {

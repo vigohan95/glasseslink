@@ -209,6 +209,10 @@ final class Session {
     static let airComplete: UInt16 = 6
     static let airDrop: UInt16 = 7
 
+    static let svcSettings = 31
+    static let mtSyncData: UInt16 = 2
+    static let mtAck: UInt16 = 3
+
     let stream: SDUStream
     let owner: OwnerMaterial
     var quirks: AirShield.Quirk = .none
@@ -222,6 +226,7 @@ final class Session {
     private var idChannel: UInt16?
     private var idFirst = true
     private var statusFirst = true
+    private var settingsFirst = true
     private var peerPubkey = Data()
     private var binding = Data()
     var streamUUID = Data.uuid4()
@@ -677,6 +682,55 @@ final class Session {
         }
         emit("status: \(state.lines.joined(separator: " / "))")
         return state
+    }
+
+    // MARK: svc31 settings (write-only)
+
+    /// svc31, smartglasses_settings: the firmware's own write path. The ack is always SUCCESS,
+    /// so the caller has to read the value back to know whether it took.
+    @discardableResult
+    func writeSettingsField(_ schema: SettingSchema, value: String, timeout: TimeInterval = 6) throws -> Bool {
+        var payload = Data()
+        switch schema.kind {
+        case "bool":
+            let on = ["1", "true", "on", "yes"].contains(value.lowercased())
+            payload = PB.uint(schema.field ?? 0, on ? 1 : 0)
+        case "int":
+            // Unsigned varint: a negative number goes out as protobuf's ten-byte two's complement.
+            guard let n = Int64(value.trimmingCharacters(in: .whitespaces)) else { return false }
+            payload = PB.key(schema.field ?? 0, 0) + PB.varint(UInt64(bitPattern: n))
+        case "str":
+            payload = PB.string(schema.field ?? 0, value)
+        case "float":
+            guard let d = Double(value.trimmingCharacters(in: .whitespaces)) else { return false }
+            payload = PB.double(schema.field ?? 0, d)
+        default:
+            return false
+        }
+        let ch = channel(named: "settings") ?? allocChannel("settings")
+        var tags: [Data] = []
+        if settingsFirst {
+            tags.append(DataX.tag(1, UInt16(Self.svcSettings), last: false))
+            settingsFirst = false
+        }
+        tags.append(DataX.tag(2, Self.mtSyncData, last: true))
+        try sendAny(DataX.message(ch, tags: tags, payload: payload))
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 { break }
+            let m = try recvMessage(timeout: left)
+            if m.channel != ch { continue }
+            guard m.type == Int(Self.mtAck) else { continue }
+            if let e = m.error, e != Int(AirShield.stOK), e != Int(AirShield.stSuccess) {
+                throw LinkError.serviceError("svc31 ack", UInt16(e))
+            }
+            emit("svc31 wrote \(schema.key) = \(value)")
+            return true
+        }
+        emit("svc31 no ack for \(schema.key)")
+        return false
     }
 
     func close() { stream.close() }
