@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b0d10">
+<title>Glasses Bridge</title>
+<style>
+  :root{--bg:#0b0d10;--card:#15191f;--line:#242b34;--txt:#e8edf3;--dim:#8b97a6;--acc:#4da3ff;--ok:#35d07f;--bad:#ff5a5f}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif;padding:16px calc(16px + env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left))}
+  h1{font-size:20px;margin:4px 0 12px;letter-spacing:.2px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--bad);margin-right:6px;vertical-align:1px}
+  .dot.on{background:var(--ok)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+  .row{display:flex;gap:10px}
+  button{flex:1;appearance:none;border:1px solid var(--line);background:#1d232c;color:var(--txt);font-size:16px;font-weight:600;padding:14px 10px;border-radius:12px}
+  button:active{transform:scale(.985);background:#232b36}
+  button.primary{background:var(--acc);border-color:var(--acc);color:#04121f}
+  button:disabled{opacity:.45}
+  input{width:100%;background:#0f1319;border:1px solid var(--line);border-radius:12px;color:var(--txt);padding:13px;font-size:16px}
+  img{width:100%;border-radius:12px;display:block;background:#000;margin-top:12px}
+  pre{white-space:pre-wrap;word-break:break-word;margin:12px 0 0;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--txt)}
+  .dim{color:var(--dim);font-size:13px}
+  .kv{display:flex;justify-content:space-between;font-size:14px;padding:3px 0;border-bottom:1px dashed #1e242c}
+  .kv:last-child{border:0}
+  .kv b{font-weight:600}
+  .tag{font-size:12px;color:var(--dim)}
+</style>
+</head>
+<body>
+<h1><span id="dot" class="dot"></span>Glasses Bridge</h1>
+
+<div class="card">
+  <div class="kv"><span>door</span><b id="door">-</b></div>
+  <div class="kv"><span>glasses</span><b id="gl">-</b></div>
+  <div class="kv"><span>battery</span><b id="bat">-</b></div>
+  <div class="kv"><span>model</span><b id="mdl">-</b></div>
+  <div class="tag" id="hint">手机上打开本页即可，无需 Meta app。</div>
+</div>
+
+<div class="row" style="margin-bottom:12px">
+  <button id="btnShot" class="primary">拍一张</button>
+  <button id="btnStatus">刷新状态</button>
+</div>
+
+<div class="card">
+  <input id="q" placeholder="问它一句：这是什么？前面有台阶吗？" autocomplete="off">
+  <div class="row" style="margin-top:10px">
+    <button id="btnAsk" class="primary">看图问答</button>
+    <button id="btnAskTxt">纯文字</button>
+  </div>
+  <pre id="ans"></pre>
+</div>
+
+<div class="card">
+  <div class="tag" id="capInfo">还没有照片</div>
+  <img id="shot" alt="" hidden>
+</div>
+
+<pre id="log" class="dim"></pre>
+
+<script>
+const KEY = new URLSearchParams(location.search).get('k') || localStorage.getItem('bridge_key') || '';
+if (KEY) localStorage.setItem('bridge_key', KEY);
+const q = s => document.querySelector(s);
+const log = (m) => { q('#log').textContent = `[${new Date().toLocaleTimeString()}] ${m}\n` + q('#log').textContent.split('\n').slice(0,8).join('\n'); };
+
+async function api(path, body){
+  const url = path + (KEY ? (path.includes('?')?'&':'?') + 'k=' + encodeURIComponent(KEY) : '');
+  const opt = body === undefined ? {cache:'no-store'} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)};
+  const r = await fetch(url, opt);
+  const j = await r.json().catch(()=>({error:'bad json'}));
+  if(!r.ok || j.error) throw new Error(j.error || ('HTTP '+r.status));
+  return j;
+}
+
+function showImg(mime, b64){
+  q('#shot').src = `data:${mime};base64,${b64}`;
+  q('#shot').hidden = false;
+}
+
+async function status(){
+  q('#dot').className = 'dot';
+  try{
+    const s = await api('/api/status');
+    const ok = s.visor_ok && s.glasses && !s.glasses.error;
+    q('#dot').className = 'dot' + (ok ? ' on' : '');
+    q('#door').textContent = s.door || '-';
+    q('#gl').textContent = ok ? ((s.glasses.model||'glasses') + ' / ' + (s.glasses.link||'')) : (s.visor_error || 'offline');
+    q('#bat').textContent = ok ? (s.glasses.battery ?? '-') + '%' : '-';
+    q('#mdl').textContent = (s.provider||'') + ' · ' + (s.model||'');
+  }catch(e){ q('#door').textContent = 'unreachable'; q('#gl').textContent = e.message; log('status: '+e.message); }
+}
+
+async function shot(){
+  q('#btnShot').disabled = true;
+  try{
+    const c = await api('/api/capture', {mode:'auto'});
+    showImg(c.mime, c.data);
+    const kb = Math.round(c.data.length * 0.75 / 1024);
+    q('#capInfo').textContent = `${c.source} · ${c.mime} · ${kb} KB` + (c.id ? ' · '+c.id : '');
+    log('capture ok: ' + c.source);
+  }catch(e){ log('capture failed: '+e.message); q('#ans').textContent = '拍摄失败：'+e.message; }
+  finally{ q('#btnShot').disabled = false; }
+}
+
+async function ask(withPhoto){
+  const question = q('#q').value.trim() || '你看到了什么？';
+  q('#btnAsk').disabled = q('#btnAskTxt').disabled = true;
+  q('#ans').textContent = '思考中…';
+  try{
+    const r = await api('/api/ask', {question, capture:withPhoto, mode:'auto'});
+    q('#ans').textContent = r.answer + `\n\n— ${r.model} · ${r.ms}ms`;
+  }catch(e){ q('#ans').textContent = '失败：'+e.message; log('ask: '+e.message); }
+  finally{ q('#btnAsk').disabled = q('#btnAskTxt').disabled = false; }
+}
+
+q('#btnStatus').onclick = status;
+q('#btnShot').onclick = shot;
+q('#btnAsk').onclick = () => ask(true);
+q('#btnAskTxt').onclick = () => ask(false);
+status();
+</script>
+</body>
+</html>

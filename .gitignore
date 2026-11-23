@@ -1,0 +1,13 @@
+apk/
+shots/
+sub/
+identity/
+owner-export/
+tools/platform-tools/
+tools/tmp/
+__pycache__/
+*.pyc
+config.json
+*.log
+*.zip
+.DS_Store

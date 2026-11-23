@@ -1,0 +1,41 @@
+name: ios
+
+on:
+  push:
+    paths: ["ios/**", ".github/workflows/ios.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14          # Apple silicon runner; free minutes on public repos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: cd ios && xcodegen generate
+
+      - name: Build unsigned
+        run: |
+          cd ios
+          xcodebuild \
+            -project GlassesLink.xcodeproj \
+            -scheme GlassesLink \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
+      - name: Package ipa
+        run: |
+          mkdir -p out/Payload
+          cp -R ios/build/Build/Products/Release-iphoneos/GlassesLink.app out/Payload/
+          cd out && zip -qry GlassesLink.ipa Payload && ls -lh GlassesLink.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GlassesLink-ipa
+          path: out/GlassesLink.ipa
+          retention-days: 14

@@ -1,0 +1,39 @@
+name: GlassesLink
+options:
+  bundleIdPrefix: dev.local
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+targets:
+  GlassesLink:
+    type: application
+    platform: iOS
+    sources:
+      - App.swift
+      - AirShield.swift
+      - OwnerKey.swift
+      - Session.swift
+      - Provision.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.local.glasseslink
+        PRODUCT_NAME: GlassesLink
+        TARGETED_DEVICE_FAMILY: 1
+        SWIFT_VERSION: "5.9"
+        CODE_SIGNING_ALLOWED: NO
+        ENABLE_BITCODE: NO
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: GlassesLink
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arm64]
+        NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
+        NSLocalNetworkUsageDescription: 访问局域网内的桥接服务。
+        NSPhotoLibraryAddUsageDescription: 把眼镜拍的照片存到你的相册。
+        NSPhotoLibraryUsageDescription: 选择并查看眼镜拍的照片。
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
