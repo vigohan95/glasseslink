@@ -9,6 +9,16 @@ import XCTest
 @testable import GlassesLink
 
 final class SessionLoopbackTests: XCTestCase {
+    /// Cheap canary: these two calls happen at the top of `Session.handshake`, so if the
+    /// loopback test hangs before its first frame, one of them is the reason.
+    func testOwnerMaterialBasics() throws {
+        let owner = OwnerMaterial(scalar: Data((0 ..< 32).map { UInt8($0 + 1) }))
+        print("[m] scalar ok")
+        let xy = owner.publicKeyXy
+        print("[m] publicKeyXy \(xy.count)")
+        print("[m] random \(Data.random(16).count)/\(Data.random(32).count)")
+        XCTAssertEqual(xy.count, 64)
+    }
     func testFullHandshakeCaptureListAndTransfer() throws {
         let owner = OwnerMaterial(scalar: Data((0 ..< 32).map { UInt8($0 + 1) }))
         let (phoneStream, glassStream) = SDUStream.loopbackPair()
