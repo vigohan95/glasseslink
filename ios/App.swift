@@ -1,18 +1,33 @@
-// App.swift — the whole point: an iPhone that talks to the glasses by itself.
+// App.swift — the iPhone talks to the glasses by itself.
 //
 //   scan → connect → L2CAP(PSM 128) → AirShield handshake
-//        → (first run) become owner via svc36 + Meta   → afterwards: trust
-//        → capture list → pull the newest photo over the encrypted link
+//        → (once) become owner via svc36 + Meta   → afterwards: trust
+//        → capture list → pull newest photo over the encrypted link
 //        → ask your own model about it (any OpenAI-compatible endpoint)
 
 import SwiftUI
 import CoreBluetooth
-import AuthenticationServices
 import Photos
+import UIKit
 
 @main
 struct GlassesApp: App {
     var body: some Scene { WindowGroup { ContentView() } }
+}
+
+// MARK: - share sheet plumbing
+
+struct ShareBox: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+struct ActivityView: UIViewControllerRepresentable {
+    let url: URL
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+    func updateUIViewController(_ c: UIActivityViewController, context: Context) {}
 }
 
 // MARK: - link controller
@@ -27,6 +42,7 @@ final class Glasses: NSObject, ObservableObject {
     @Published var glassesLine = "未连接"
     @Published var lastPhoto: Data?
     @Published var answer = ""
+    @Published var share: ShareBox?
 
     @Published var modelBaseURL = UserDefaults.standard.string(forKey: "modelBaseURL") ?? "http://192.168.3.90:11434/v1"
     @Published var modelName = UserDefaults.standard.string(forKey: "modelName") ?? "gemma3:4b"
@@ -38,8 +54,13 @@ final class Glasses: NSObject, ObservableObject {
     private var session: Session?
     private var owner: OwnerMaterial?
 
-    /// Ray-Ban Meta Gen 2 exposes the link on L2CAP PSM 0x80.
+    /// Ray-Ban Meta Gen 2 exposes its link on L2CAP PSM 0x80.
     let psm: CBL2CAPPSM = 0x80
+
+    var logURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("glasses.log")
+    }
 
     override init() {
         super.init()
@@ -53,12 +74,22 @@ final class Glasses: NSObject, ObservableObject {
         } else {
             ownerLine = "owner key: 没有——先点「成为主人」"
         }
+        note("启动。owner=\(owner == nil ? "无" : "有")")
     }
+
+    // MARK: logging (kept on disk so it can be shared from the phone)
 
     func note(_ s: String) {
         let line = "\(Self.ts()) \(s)"
         log.insert(line, at: 0)
-        if log.count > 400 { log.removeLast() }
+        if log.count > 500 { log.removeLast() }
+        if let d = (line + "\n").data(using: .utf8) {
+            if let h = try? FileHandle(forWritingTo: logURL) {
+                h.seekToEndOfFile(); h.write(d); try? h.close()
+            } else {
+                try? d.write(to: logURL)
+            }
+        }
         print(line)
     }
 
@@ -77,7 +108,9 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     func connect(_ id: UUID) {
-        guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else { return }
+        guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
+            note("找不到这台设备（先扫描）"); return
+        }
         central.stopScan()
         peripheral = p
         p.delegate = self
@@ -93,7 +126,7 @@ final class Glasses: NSObject, ObservableObject {
         s.onLog = { [weak self] in self?.note($0) }
         stream = s
         guard let own = owner else {
-            note("没有 owner key：先跑一次「成为主人」（它会用全新 key）")
+            note("没有 owner key：这条链路只能用来跑「成为主人」")
             return
         }
         let sess = Session(stream: s, owner: own, log: { [weak self] in self?.note($0) })
@@ -102,12 +135,19 @@ final class Glasses: NSObject, ObservableObject {
             try sess.handshake(trust: trust)
             connected = true
             if trust { UserDefaults.standard.set(true, forKey: "isOwner") }
-            glassesLine = "已连上 (trust=\(trust))"
-            note("✅ 链路建立完成")
+            glassesLine = "已连上 · trust=\(trust) · serial \(sess.peerSerial)"
+            note("✅ 握手完成")
         } catch {
             note("❌ 握手中断：\(error)")
+            glassesLine = "握手失败：\(error)"
         }
     }
+
+    /// Connect without proving ownership — used before the first provisioning.
+    func connectSetup() { Task { await bringUp(trust: false) } }
+
+    /// Normal connect: prove we hold the owner key.
+    func connectTrusted() { Task { await bringUp(trust: true) } }
 
     // MARK: capture
 
@@ -115,11 +155,12 @@ final class Glasses: NSObject, ObservableObject {
         guard let sess = session else { note("先连接"); return }
         busy = true
         Task {
-            defer { Task { @MainActor in self.busy = false } }
+            defer { busy = false }
             do {
                 let caps = try sess.captureList()
                 note("清单 \(caps.count) 条")
-                guard let newest = caps.filter({ $0.isPhoto }).max(by: { ($0.timestampNS ?? 0) < ($1.timestampNS ?? 0) }),
+                guard let newest = caps.filter({ $0.isPhoto })
+                        .max(by: { ($0.timestampNS ?? 0) < ($1.timestampNS ?? 0) }),
                       let still = newest.stills.first else {
                     note("清单里没有照片资产")
                     return
@@ -127,11 +168,11 @@ final class Glasses: NSObject, ObservableObject {
                 note("拉取 \(newest.handle) / \(still.uuid) (\(still.size)B)")
                 try sess.requestAsset(handle: newest.handle, assetID: still.uuid)
                 if let t = try sess.receiveFile() {
-                    await MainActor.run {
-                        self.lastPhoto = t.data
-                        self.note("收到 \(t.name) \(t.size)B")
-                    }
+                    lastPhoto = t.data
+                    note("收到 \(t.name) \(t.size)B")
                     saveToPhotos(t.data)
+                } else {
+                    note("没收到文件（对端没发起传输）")
                 }
             } catch {
                 note("取图失败：\(error)")
@@ -163,12 +204,12 @@ final class Glasses: NSObject, ObservableObject {
         UserDefaults.standard.set(modelName, forKey: "modelName")
         busy = true
         Task {
-            defer { Task { @MainActor in self.busy = false } }
+            defer { busy = false }
             do {
                 let text = try await ModelClient(baseURL: modelBaseURL, model: modelName,
                                                  log: { [weak self] in self?.note($0) })
                     .ask(question: question, jpeg: photo)
-                await MainActor.run { self.answer = text }
+                answer = text
             } catch {
                 note("模型调用失败：\(error)")
             }
@@ -178,30 +219,47 @@ final class Glasses: NSObject, ObservableObject {
     // MARK: provisioning (no Android, no PC)
 
     func becomeOwner(userToken: String) {
-        guard let sess = session else { note("先连接眼镜（首次会以 setup 链路连上）"); return }
+        guard let sess = session else {
+            note("先点「连接（setup 链路）」，再登录")
+            return
+        }
         let key = owner ?? OwnerMaterial.generate()
         owner = key
         ownerLine = "owner key: 新建 \(key.publicKeyXy.hexShort)"
         busy = true
         Task {
-            defer { Task { @MainActor in self.busy = false } }
+            defer { busy = false }
             do {
                 let bundle = try await Provisioner.becomeOwner(session: sess, owner: key,
                                                                userToken: userToken,
                                                                log: { [weak self] in self?.note($0) })
-                await MainActor.run {
-                    UserDefaults.standard.set(true, forKey: "isOwner")
-                    self.ownerLine = "owner key: 已注册，serial \(bundle.serial)"
-                    self.note("✅ 这台 iPhone 现在是主人了。断开重连一次，就会走 trust 链路")
-                }
+                UserDefaults.standard.set(true, forKey: "isOwner")
+                ownerLine = "owner key: 已注册 · serial \(bundle.serial)"
+                note("✅ 这台 iPhone 现在是主人。断开重连一次走 trust 链路")
+                shareOwner()
             } catch {
                 note("❌ 改 owner 失败：\(error)")
             }
         }
     }
+
+    // MARK: export
+
+    func shareOwner() {
+        let url = OwnerMaterial.defaultURL
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            note("还没有 owner-export.json（provision 成功后才会有）")
+            return
+        }
+        share = ShareBox(url: url)
+    }
+
+    func shareLog() {
+        share = ShareBox(url: logURL)
+    }
 }
 
-// MARK: - CBCentralManagerDelegate
+// MARK: - CoreBluetooth
 
 extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func centralManagerDidUpdateState(_ c: CBCentralManager) {
@@ -256,7 +314,6 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             }
             self.channel = ch
             self.note("L2CAP up psm=0x\(String(ch.psm, radix: 16))")
-            // First run: no owner yet → setup link (no trust) so we can provision.
             let hasOwner = self.owner != nil && UserDefaults.standard.bool(forKey: "isOwner")
             await self.bringUp(trust: hasOwner)
         }
@@ -270,35 +327,13 @@ struct ModelClient {
     let model: String
     var log: (String) -> Void = { _ in }
 
-    struct Message: Codable { let role: String; let content: AnyCodable }
-    struct AnyCodable: Codable {
-        let value: Any
-        init(_ v: Any) { value = v }
-        init(from d: Decoder) throws { value = "" }   // not needed for requests
-        func encode(to e: Encoder) throws {
-            var c = e.singleValueContainer()
-            if let s = value as? String { try c.encode(s) }
-            else if let a = value as? [AnyCodable] { try c.encode(a) }
-            else { try c.encode("\(value)") }
-        }
-    }
-    struct Body: Codable {
-        struct Part: Codable { let type: String; let text: String?; let image_url: Img? }
-        struct Img: Codable { let url: String }
-        let model: String
-        let messages: [[String: AnyCodable]]
-        let max_tokens: Int
-    }
-    struct Resp: Codable {
-        struct Choice: Codable { let message: [String: AnyCodable]? }
-        let choices: [Choice]?
-    }
-
     func ask(question: String, jpeg: Data) async throws -> String {
         guard var comps = URLComponents(string: baseURL) else { throw LinkError.io("bad base URL") }
         comps.path = (comps.path.hasSuffix("/") ? comps.path : comps.path + "/") + "chat/completions"
-        var req = URLRequest(url: comps.url!)
+        guard let url = comps.url else { throw LinkError.io("bad base URL") }
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"
+        req.timeoutInterval = 180
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(UserDefaults.standard.string(forKey: "modelKey") ?? "none")",
                      forHTTPHeaderField: "Authorization")
@@ -315,7 +350,7 @@ struct ModelClient {
             ]],
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        log("POST \(comps.url!.absoluteString) model=\(model) img=\(jpeg.count)B")
+        log("POST \(url.absoluteString) model=\(model) img=\(jpeg.count)B")
         let (data, resp) = try await URLSession.shared.data(for: req)
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard status / 100 == 2,
@@ -334,8 +369,7 @@ struct ModelClient {
 struct ContentView: View {
     @StateObject private var g = Glasses()
     @State private var question = "我面前有什么？有台阶或障碍物吗？"
-    @State private var loginSession: ASWebAuthenticationSession?
-    @State private var pendingProvision = false
+    @State private var showLogin = false
 
     var body: some View {
         NavigationStack {
@@ -345,26 +379,23 @@ struct ContentView: View {
                     Text(g.glassesLine).font(.footnote).foregroundStyle(.secondary)
                 }
 
-                Section("眼镜") {
+                Section("1 · 连眼镜") {
                     Button("扫描附近眼镜") { g.startScan() }
                     ForEach(g.devices, id: \.id) { d in
                         Button("连接 \(d.name)") { g.connect(d.id) }
                     }
-                    if !g.connected {
-                        Button("以 setup 链路连接（首次 / 改 owner 用）") {
-                            g.startScan()
-                        }
-                    }
+                    Button("重新握手（setup 链路，不验 owner）") { g.connectSetup() }
                 }
 
-                Section("成为主人（一次）") {
-                    Button("用 Meta 账号登录并注册这台 iPhone") { startLogin() }
-                        .disabled(!g.connected && !pendingProvision)
-                    Text("登录在系统浏览器里完成；token 只用来给眼镜签一张 ownership receipt。")
+                Section("2 · 成为主人（只做一次）") {
+                    Button("用 Meta 账号登录并注册这台 iPhone") { showLogin = true }
+                    Text("登录在 app 内完成；token 只用来给眼镜签一张 ownership receipt。"
+                         + "成功后 owner-export.json 会弹出来，务必存到 iCloud。")
                         .font(.caption).foregroundStyle(.secondary)
+                    Button("导出 owner-export.json") { g.shareOwner() }
                 }
 
-                Section("拍照 / 取图") {
+                Section("3 · 拍照 / 取图") {
                     Button(g.busy ? "处理中…" : "拉取最新一张照片") { g.capture() }
                         .disabled(!g.connected || g.busy)
                     if let d = g.lastPhoto, let img = UIImage(data: d) {
@@ -372,57 +403,41 @@ struct ContentView: View {
                     }
                 }
 
-                Section("问自己的模型") {
-                    TextField("base URL", text: $g.modelBaseURL).textInputAutocapitalization(.never).font(.footnote)
+                Section("4 · 问自己的模型") {
+                    TextField("base URL", text: $g.modelBaseURL)
+                        .textInputAutocapitalization(.never).font(.footnote)
                     TextField("model", text: $g.modelName).font(.footnote)
                     TextField("问题", text: $question, axis: .vertical).lineLimit(1 ... 3)
                     Button("看图问答") { g.ask(question) }.disabled(g.lastPhoto == nil || g.busy)
-                    if !g.answer.isEmpty {
-                        Text(g.answer).font(.callout)
-                    }
+                    if !g.answer.isEmpty { Text(g.answer).font(.callout) }
                 }
 
                 Section("日志") {
+                    Button("导出日志文件") { g.shareLog() }
                     ForEach(Array(g.log.enumerated()), id: \.offset) { _, line in
                         Text(line).font(.system(size: 11, design: .monospaced))
                     }
                 }
             }
             .navigationTitle("Glasses")
-        }
-    }
-
-    private func startLogin() {
-        let state = UUID().uuidString
-        let url = Meta.authorize(state: state)
-        let s = ASWebAuthenticationSession(url: url, callbackURLScheme: "https") { callback, err in
-            guard let cb = callback, let code = Meta.code(from: cb) else {
-                g.note("登录取消：\(err?.localizedDescription ?? "无回调")")
-                return
+            .sheet(isPresented: $showLogin) {
+                LoginWebView(url: Meta.authorize(state: UUID().uuidString),
+                             onCode: { code in
+                                 showLogin = false
+                                 g.note("拿到 code，交换 token…")
+                                 Task {
+                                     do {
+                                         let token = try await MetaClient(log: { g.note($0) })
+                                             .exchangeCode(code)
+                                         g.becomeOwner(userToken: token)
+                                     } catch {
+                                         g.note("token 交换失败：\(error)")
+                                     }
+                                 }
+                             },
+                             onCancel: { showLogin = false })
             }
-            g.note("拿到 code，交换 token…")
-            Task {
-                do {
-                    let token = try await MetaClient(log: { g.note($0) }).exchangeCode(code)
-                    g.becomeOwner(userToken: token)
-                } catch {
-                    g.note("token 交换失败：\(error)")
-                }
-            }
+            .sheet(item: $g.share) { box in ActivityView(url: box.url) }
         }
-        s.presentationContextProvider = WebAuthContext.shared
-        s.prefersEphemeralWebBrowserSession = false
-        loginSession = s
-        s.start()
-    }
-}
-
-final class WebAuthContext: NSObject, ASWebAuthenticationPresentationContextProviding {
-    static let shared = WebAuthContext()
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first { $0.isKeyWindow } ?? ASPresentationAnchor()
     }
 }

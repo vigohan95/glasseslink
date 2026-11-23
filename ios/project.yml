@@ -15,6 +15,7 @@ targets:
       - OwnerKey.swift
       - Session.swift
       - Provision.swift
+      - Login.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.local.glasseslink
