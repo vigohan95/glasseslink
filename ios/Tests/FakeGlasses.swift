@@ -63,7 +63,7 @@ final class FakeGlasses {
     // MARK: - thread
 
     func start() {
-        let t = Thread { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             do {
                 try self.runHandshake()
@@ -73,8 +73,6 @@ final class FakeGlasses {
                 self.log("fake glasses stopped: \(error)")
             }
         }
-        t.name = "fake-glasses"
-        t.start()
     }
 
     // MARK: - handshake
