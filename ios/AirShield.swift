@@ -152,7 +152,6 @@ enum PB {
     static func key(_ field: Int, _ wire: Int) -> Data { varint(UInt64(field << 3 | wire)) }
     static func uint(_ field: Int, _ v: UInt64) -> Data { key(field, 0) + varint(v) }
     static func bytes(_ field: Int, _ d: Data) -> Data { key(field, 2) + varint(UInt64(d.count)) + d }
-    static func string(_ field: Int, _ s: String) -> Data { bytes(field, Data(s.utf8)) }
     static func double(_ field: Int, _ d: Double) -> Data {
         key(field, 1) + Data(withUnsafeBytes(of: d.bitPattern.littleEndian) { Data($0) })
     }
