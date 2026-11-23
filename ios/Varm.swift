@@ -156,8 +156,14 @@ enum VarmSplice {
 enum Varm {
     /// The template ships inside Visor (`core/assistant/src/main/resources/varm_template.bin`).
     private static let template: Data? = {
-        guard let url = Bundle.main.url(forResource: "varm_template", withExtension: "bin") else { return nil }
-        return try? Data(contentsOf: url)
+        let bundles = [Bundle.main, Bundle(for: VarmBundleToken.self)]
+        for bundle in bundles {
+            if let url = bundle.url(forResource: "varm_template", withExtension: "bin"),
+               let data = try? Data(contentsOf: url) {
+                return data
+            }
+        }
+        return nil
     }()
 
     static var available: Bool { template != nil }
@@ -231,3 +237,7 @@ enum Varm {
     /// Visor only asks the glasses to listen again when the answer reads like a question.
     static let asks = try! NSRegularExpression(pattern: "\\?|？|吗|呢|要不要|是不是", options: [])
 }
+
+/// Gives `Bundle(for:)` a type inside the app module, so `Varm` can find its template
+/// in a unit-test host too.
+final class VarmBundleToken {}

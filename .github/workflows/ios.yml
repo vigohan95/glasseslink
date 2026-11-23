@@ -17,6 +17,18 @@ jobs:
       - name: Generate project
         run: cd ios && xcodegen generate
 
+      - name: Unit tests (protocol golden vectors)
+        run: |
+          cd ios
+          DEVICE=$(xcrun simctl list devices available | grep -Eo 'iPhone [0-9]+( Pro)?' | head -1)
+          echo "simulator: $DEVICE"
+          xcodebuild test \
+            -project GlassesLink.xcodeproj \
+            -scheme GlassesLink \
+            -destination "platform=iOS Simulator,name=$DEVICE" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
       - name: Build unsigned
         run: |
           cd ios
