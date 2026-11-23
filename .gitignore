@@ -5,6 +5,10 @@ identity/
 owner-export/
 tools/platform-tools/
 tools/tmp/
+tools/android/
+tools/tmp/
+visor-src/
+out/
 __pycache__/
 *.pyc
 config.json

@@ -46,6 +46,8 @@ final class Glasses: NSObject, ObservableObject {
 
     @Published var modelBaseURL = UserDefaults.standard.string(forKey: "modelBaseURL") ?? "http://192.168.3.90:11434/v1"
     @Published var modelName = UserDefaults.standard.string(forKey: "modelName") ?? "gemma3:4b"
+    @Published var settings: [String: String] = [:]
+    @Published var settingsLoading = false
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
@@ -257,6 +259,66 @@ final class Glasses: NSObject, ObservableObject {
     func shareLog() {
         share = ShareBox(url: logURL)
     }
+
+    // MARK: settings (svc33)
+
+    /// Reads the whole settings namespace once and keeps it keyed by setting name.
+    func loadSettings() {
+        guard let sess = session, connected else {
+            note("先连接眼镜，再读设置")
+            return
+        }
+        settingsLoading = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let objects = try sess.driveObjects()
+                var map: [String: String] = [:]
+                for object in objects where object.type == Drive.kv && !object.deleted {
+                    map[object.uri] = object.data
+                }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.settings = map
+                    self.settingsLoading = false
+                    self.note("设置：读到 \(map.count) 项")
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.settingsLoading = false
+                    self.note("设置读取失败：\(error)")
+                }
+            }
+        }
+    }
+
+    /// Writes one setting and only reports success if the read-back agrees.
+    func writeSetting(_ key: String, _ value: String) {
+        guard let sess = session, connected else {
+            note("先连接眼镜，再改设置")
+            return
+        }
+        note("写 \(key) = \(value)")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let ok = try sess.driveWrite(key: key, value: value)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if ok {
+                        self.settings[key] = value
+                        self.note("\(key) 已生效")
+                    } else {
+                        self.note("\(key) 写进去了但读回不一致（固件可能拒收）")
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.note("写 \(key) 失败：\(error)")
+                }
+            }
+        }
+    }
 }
 
 // MARK: - CoreBluetooth
@@ -370,6 +432,7 @@ struct ContentView: View {
     @StateObject private var g = Glasses()
     @State private var question = "我面前有什么？有台阶或障碍物吗？"
     @State private var showLogin = false
+    @State private var showSettings = false
 
     var body: some View {
         NavigationStack {
@@ -412,6 +475,13 @@ struct ContentView: View {
                     if !g.answer.isEmpty { Text(g.answer).font(.callout) }
                 }
 
+                Section("5 · 眼镜设置（\(SettingsCatalog.all.count) 项）") {
+                    Button("打开设置") { showSettings = true }
+                        .disabled(!g.connected)
+                    Text(g.settingsLoading ? "读取中…" : "已读到 \(g.settings.count) 项")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
                 Section("日志") {
                     Button("导出日志文件") { g.shareLog() }
                     ForEach(Array(g.log.enumerated()), id: \.offset) { _, line in
@@ -438,6 +508,7 @@ struct ContentView: View {
                              onCancel: { showLogin = false })
             }
             .sheet(item: $g.share) { box in ActivityView(url: box.url) }
+            .sheet(isPresented: $showSettings) { SettingsView(g: g) }
         }
     }
 }

@@ -588,5 +588,64 @@ final class Session {
         return (b << 16) | a
     }
 
+    // MARK: svc33 RLDrive — the settings store
+
+    /// Every object the glasses keep in `namespace`; settings live in `Drive.deviceSettings`.
+    /// Round 0 asks for the whole namespace, so one round is normally enough.
+    func driveObjects(namespace: String = Drive.deviceSettings,
+                      types: [String] = Drive.defaultTypes,
+                      timeout: TimeInterval = 8) throws -> [Drive.Object] {
+        let ch = channel(named: "drive") ?? allocChannel("drive")
+        let requestID = UUID().uuidString.lowercased()
+        let sync = Drive.build(namespace: namespace, requestID: requestID, round: 0, types: types)
+        try sendAny(DataX.message(ch, tags: [DataX.tag(1, UInt16(Drive.service), last: false),
+                                             DataX.tag(2, Drive.syncMessage, last: true)], payload: sync))
+        let assembler = Drive.Assembler()
+        var collected: [Drive.Object] = []
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 { break }
+            let m = try recvMessage(timeout: left)
+            if m.channel != ch { continue }
+            guard m.type == Int(Drive.syncMessage) else { continue }
+            guard let whole = assembler.add(m.payload), let reply = Drive.decode(whole) else { continue }
+            collected += reply.objects
+            if reply.terminated { break }
+        }
+        emit("drive \(namespace): \(collected.count) objects")
+        return collected
+    }
+
+    /// Writes one setting the way another replica would: present a newer version of the object.
+    /// The ack proves nothing on this service, so the value is read back before reporting success.
+    @discardableResult
+    func driveWrite(key: String, value: String, namespace: String = Drive.deviceSettings,
+                    timeout: TimeInterval = 8) throws -> Bool {
+        let ch = channel(named: "drive") ?? allocChannel("drive")
+        let known = try driveObjects(namespace: namespace, timeout: timeout)
+        var versions: Drive.Versions = [:]
+        for object in known {
+            versions[object.type, default: [:]][Drive.localWriter] = (versions[object.type]?[Drive.localWriter] ?? 0) + 1
+        }
+        let requestID = UUID().uuidString.lowercased()
+        let object = Drive.Object(uri: key, type: Drive.kv, data: value, deleted: false, raw: Data())
+        let sync = Drive.build(namespace: namespace, requestID: requestID, round: 1,
+                               known: versions, types: [Drive.kv], objects: [object])
+        try sendAny(DataX.message(ch, tags: [DataX.tag(1, UInt16(Drive.service), last: false),
+                                             DataX.tag(2, Drive.syncMessage, last: true)], payload: sync))
+        let assembler = Drive.Assembler()
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 { break }
+            let m = try recvMessage(timeout: left)
+            if m.channel != ch || m.type != Int(Drive.syncMessage) { continue }
+            if let whole = assembler.add(m.payload), let reply = Drive.decode(whole), reply.terminated { break }
+        }
+        let after = try driveObjects(namespace: namespace, timeout: timeout)
+        return after.contains { $0.uri == key && $0.data == value }
+    }
+
     func close() { stream.close() }
 }
