@@ -159,20 +159,31 @@ struct OwnerMaterial {
 
     private static func keychainImport(_ owner: OwnerMaterial, attrs: [String: Any]) -> SecKey? {
         let tag = "dev.local.glasseslink.imported".data(using: .utf8)!
-        SecItemDelete([kSecClass as String: kSecClassKey, kSecAttrApplicationTag as String: tag] as CFDictionary)
-        var add = attrs
-        add[kSecClass as String] = kSecClassKey
-        add[kSecAttrApplicationTag as String] = tag
-        add[kSecValueData as String] = Provisioner.pkcs8(from: owner)
-        add[kSecAttrIsPermanent as String] = false
-        guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { return nil }
-        let query: [String: Any] = [kSecClass as String: kSecClassKey,
-                                    kSecAttrApplicationTag as String: tag,
-                                    kSecReturnRef as String: true]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let item else { return nil }
-        return (item as! SecKey)
+        let pkcs8 = Provisioner.pkcs8(from: owner)
+        let variants: [[String: Any]] = [
+            [kSecUseDataProtectionKeychain as String: true,
+             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock],
+            [kSecUseDataProtectionKeychain as String: true],
+            [:],
+        ]
+        for extra in variants {
+            SecItemDelete([kSecClass as String: kSecClassKey,
+                           kSecAttrApplicationTag as String: tag] as CFDictionary)
+            var add = attrs
+            add[kSecClass as String] = kSecClassKey
+            add[kSecAttrApplicationTag as String] = tag
+            add[kSecValueData as String] = pkcs8
+            for (k, v) in extra { add[k] = v }
+            guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { continue }
+            let query: [String: Any] = [kSecClass as String: kSecClassKey,
+                                        kSecAttrApplicationTag as String: tag,
+                                        kSecReturnRef as String: true]
+            var item: CFTypeRef?
+            if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let item {
+                return (item as! SecKey)
+            }
+        }
+        return nil
     }
 
     // MARK: DER helpers
