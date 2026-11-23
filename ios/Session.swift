@@ -370,6 +370,56 @@ final class Session {
         emit("link up")
     }
 
+    // MARK: long-lived service channels (streaming)
+
+    /// One channel per named service. The service id is only sent on the first message of a
+    /// channel; after that the glasses remember it.
+    private var serviceChannels: [String: UInt16] = [:]
+
+    func serviceChannel(_ name: String, service: Int) -> UInt16 {
+        if let ch = serviceChannels[name] { return ch }
+        let ch = allocChannel(name)
+        serviceChannels[name] = ch
+        return ch
+    }
+
+    /// Fire-and-forget on a named service: no waiting, so a push-heavy stream can keep sending.
+    func sendOnService(_ name: String, service: Int, type: UInt16, payload: Data = Data()) throws {
+        let ch = serviceChannel(name, service: service)
+        var tags: [Data] = []
+        if !servicesNamed.contains(ch) {
+            tags.append(DataX.tag(1, UInt16(service), last: false))
+            servicesNamed.insert(ch)
+        }
+        tags.append(DataX.tag(2, type, last: true))
+        try sendAny(DataX.message(ch, tags: tags, payload: payload))
+    }
+
+    private var servicesNamed: Set<UInt16> = []
+
+    /// The next message from any channel, for a reader loop that owns the link.
+    func nextMessage(timeout: TimeInterval) throws -> DataX.Message {
+        try recvMessage(timeout: timeout)
+    }
+
+    /// Sends and waits for the answer of one type on the same channel.
+    func askOnService(_ name: String, service: Int, type: UInt16, payload: Data = Data(),
+                      answerType: UInt16, timeout: TimeInterval = 6) throws -> Data {
+        let ch = serviceChannel(name, service: service)
+        try sendOnService(name, service: service, type: type, payload: payload)
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 { throw LinkError.unexpected("no answer to svc\(service)/type\(type)") }
+            let m = try recvMessage(timeout: left)
+            if m.channel != ch { continue }
+            if let e = m.error, e != Int(AirShield.stOK), e != Int(AirShield.stSuccess) {
+                throw LinkError.serviceError("svc\(service)/type\(type)", UInt16(e))
+            }
+            if m.type == Int(answerType) { return m.payload }
+        }
+    }
+
     // MARK: generic request
 
     @discardableResult

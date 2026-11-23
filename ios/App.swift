@@ -52,6 +52,9 @@ final class Glasses: NSObject, ObservableObject {
     @Published var status = GlassesState()
     @Published var captures: [Capture] = []
     @Published var lastVideo: Data?
+    @Published var live: LiveStream?
+    @Published var liveLine = "—"
+    private var liveTicker: Timer?
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
@@ -247,6 +250,46 @@ final class Glasses: NSObject, ObservableObject {
                 note("状态读取失败：\(error)")
             }
         }
+    }
+
+    // MARK: live
+
+    func startLive() {
+        guard let sess = session else { note("先连接"); return }
+        guard live == nil else { return }
+        let l = LiveStream(session: sess)
+        l.log = { [weak self] line in self?.note("live: \(line)") }
+        l.onPhase = { [weak self] phase in
+            self?.note("live phase: \(phase.rawValue)")
+            if phase == .failed { self?.liveLine = "失败" }
+        }
+        l.onPhoto = { [weak self] photo in
+            guard let self else { return }
+            if let img = UIImage(data: photo.data) {
+                self.lastPhoto = photo.data
+                self.saveToPhotos(photo.data)
+                self.note("live 快照 \(photo.data.count)B 已存相册")
+                _ = img
+            } else {
+                self.note("live 快照 \(photo.data.count)B，系统解不了（\(photo.isHeic ? "HEIC" : "未知")）")
+            }
+        }
+        live = l
+        l.start()
+        // One second of stats into the overlay line; the stream itself runs on its own thread.
+        liveTicker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, let l = self.live else { return }
+            self.liveLine = "\(l.phase.rawValue) \(l.framesPerSecond)fps \(l.kbitPerSecond)kbit/s "
+                + "\(l.frames)帧" + (l.decodedSize.map { " \(Int($0.width))x\(Int($0.height))" } ?? "")
+        }
+    }
+
+    func stopLive() {
+        liveTicker?.invalidate()
+        liveTicker = nil
+        live?.stop()
+        live = nil
+        liveLine = "—"
     }
 
     func shareVideo() {
@@ -550,6 +593,7 @@ struct ContentView: View {
     @State private var showLogin = false
     @State private var showSettings = false
     @State private var showImport = false
+    @State private var showLive = false
 
     var body: some View {
         NavigationStack {
@@ -616,7 +660,16 @@ struct ContentView: View {
                     Button("刷新状态") { g.refreshStatus() }.disabled(!g.connected)
                 }
 
-                Section("4 · 问自己的模型") {
+                Section("4 · Live 取景") {
+                    Button(g.live == nil ? "打开取景" : "取景中…") { showLive = true }
+                        .disabled(!g.connected)
+                    if let size = g.live?.decodedSize {
+                        Text("\(Int(size.width))×\(Int(size.height))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("5 · 问自己的模型") {
                     TextField("base URL", text: $g.modelBaseURL)
                         .textInputAutocapitalization(.never).font(.footnote)
                     TextField("model", text: $g.modelName).font(.footnote)
@@ -625,7 +678,7 @@ struct ContentView: View {
                     if !g.answer.isEmpty { Text(g.answer).font(.callout) }
                 }
 
-                Section("5 · 眼镜设置（\(SettingsCatalog.all.count) 项）") {
+                Section("6 · 眼镜设置（\(SettingsCatalog.all.count) 项）") {
                     Button("打开设置") { showSettings = true }
                         .disabled(!g.connected)
                     Text(g.settingsLoading ? "读取中…" : "已读到 \(g.settings.count) 项")
@@ -659,6 +712,7 @@ struct ContentView: View {
             }
             .sheet(item: $g.share) { box in ActivityView(url: box.url) }
             .sheet(isPresented: $showSettings) { SettingsView(g: g) }
+            .sheet(isPresented: $showLive) { LiveView(g: g) }
             .fileImporter(isPresented: $showImport, allowedContentTypes: [.json]) { result in
                 switch result {
                 case .success(let url): g.importOwner(from: url)
