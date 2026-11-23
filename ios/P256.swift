@@ -224,7 +224,11 @@ enum P256ECDSA {
     static func double(_ p1: Point) -> Point {
         typealias F = P256Field
         if p1.infinity { return p1 }
-        let num = F.addMod(F.mulModP([3, 0, 0, 0, 0, 0, 0, 0], F.mulModP(p1.x, p1.x)), F.a, F.p)
+        // 3 and A must enter the Montgomery domain like every other operand: mixing a
+        // plain limb vector with a Montgomery one is off by a factor of R.
+        let three = F.toMont([3, 0, 0, 0, 0, 0, 0, 0], F.p, F.n0p, F.r2p)
+        let aMont = F.toMont(F.a, F.p, F.n0p, F.r2p)
+        let num = F.addMod(F.mulModP(three, F.mulModP(p1.x, p1.x)), aMont, F.p)
         let den = F.invP(F.addMod(p1.y, p1.y, F.p))
         let lam = F.mulModP(num, den)
         let x3 = F.subMod(F.mulModP(lam, lam), F.addMod(p1.x, p1.x, F.p), F.p)
