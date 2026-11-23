@@ -31,6 +31,8 @@
 
 ## 待做
 
+1. 助手语音转写（EV 52 finalTranscription）与 TTS 回播（388/389 + streamAudio 5003）
+
 1. owner 迁移：安装打过补丁的 Visor → 导出 `visor-owner-*.json` → `tools/owner_to_ios.py` → 放进 app Documents。
 2. 真机跑握手，按 `Documents/glasses.log` 修偏差（svc36 字段、svc18 flatbuffer 槽位）。
 3. Live 取景真机验证（BLE 档；iOS 无 Wi-Fi Direct，上不了 1080p）。
