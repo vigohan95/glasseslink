@@ -113,22 +113,40 @@ struct OwnerMaterial {
 
     /// Security wants PKCS#8 (a bare 32-byte scalar is rejected with OSStatus -50), so
     /// hand it the same DER the exported bundle carries.
+    /// Security's EC private-key import is picky, and the accepted container differs
+    /// between SDK builds: a bare scalar works on some, PKCS#8 on others, and a keychain
+    /// import is the last resort. Each candidate is tried once and the winner is cached,
+    /// so a mismatch shows up as one log line instead of a silent 0x1044 on the glasses.
+    private static var importStyle: String?
+
     private func secPrivateKey() throws -> SecKey {
-        var error: Unmanaged<CFError>?
-        let attrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
-                                    kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
-                                    kSecAttrKeySizeInBits as String: 256]
-        guard let key = SecKeyCreateWithData(Provisioner.pkcs8(from: self) as CFData,
-                                             attrs as CFDictionary, &error) else {
-            // Fall back to the SEC1 ECPrivateKey form: some SDK builds only accept that.
-            if let key = Self.secKey(sec1: self) { return key }
-            throw LinkError.io("SecKeyCreateWithData: \(error?.takeRetainedValue().localizedDescription ?? "?")")
+        let base: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                                   kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+                                   kSecAttrKeySizeInBits as String: 256]
+        let candidates: [(String, Data)] = [
+            ("raw", scalar),
+            ("pkcs8", Provisioner.pkcs8(from: self)),
+            ("sec1", Self.sec1DER(self)),
+        ]
+        if let style = OwnerMaterial.importStyle, let hit = candidates.first(where: { $0.0 == style }) {
+            if let key = SecKeyCreateWithData(hit.1 as CFData, base as CFDictionary, nil) {
+                return key
+            }
         }
-        return key
+        for (name, der) in candidates {
+            if let key = SecKeyCreateWithData(der as CFData, base as CFDictionary, nil) {
+                OwnerMaterial.importStyle = name
+                return key
+            }
+        }
+        if let key = Self.keychainImport(self, attrs: base) {
+            OwnerMaterial.importStyle = "keychain"
+            return key
+        }
+        throw LinkError.io("no EC private-key container accepted (tried raw, pkcs8, sec1, keychain)")
     }
 
-    /// SEC1 `ECPrivateKey` (what OpenSSL writes as `EC PRIVATE KEY`).
-    private static func secKey(sec1 owner: OwnerMaterial) -> SecKey? {
+    private static func sec1DER(_ owner: OwnerMaterial) -> Data {
         let oidP256: [UInt8] = [0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]
         var inner = Data([0x02, 0x01, 0x01])
         inner += Data([0x04, 0x20]) + owner.scalar
@@ -136,11 +154,25 @@ struct OwnerMaterial {
         let bitString = Data([0x00]) + owner.publicKey65
         inner += Data([0xA1]) + Provisioner.tlvLen(bitString.count + 2) + Data([0x03])
             + Provisioner.tlvLen(bitString.count) + bitString
-        let der = Data([0x30]) + Provisioner.tlvLen(inner.count) + inner
-        let attrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
-                                    kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
-                                    kSecAttrKeySizeInBits as String: 256]
-        return SecKeyCreateWithData(der as CFData, attrs as CFDictionary, nil)
+        return Data([0x30]) + Provisioner.tlvLen(inner.count) + inner
+    }
+
+    private static func keychainImport(_ owner: OwnerMaterial, attrs: [String: Any]) -> SecKey? {
+        let tag = "dev.local.glasseslink.imported".data(using: .utf8)!
+        SecItemDelete([kSecClass as String: kSecClassKey, kSecAttrApplicationTag as String: tag] as CFDictionary)
+        var add = attrs
+        add[kSecClass as String] = kSecClassKey
+        add[kSecAttrApplicationTag as String] = tag
+        add[kSecValueData as String] = Provisioner.pkcs8(from: owner)
+        add[kSecAttrIsPermanent as String] = false
+        guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { return nil }
+        let query: [String: Any] = [kSecClass as String: kSecClassKey,
+                                    kSecAttrApplicationTag as String: tag,
+                                    kSecReturnRef as String: true]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let item else { return nil }
+        return (item as! SecKey)
     }
 
     // MARK: DER helpers
