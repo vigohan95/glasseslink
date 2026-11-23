@@ -14,17 +14,19 @@ import CryptoKit
 
 final class FakeGlasses {
     // service / message numbers, spelled out so a protocol change shows up here
-    private static let svcCaptures: UInt16 = 18
-    private static let svcAirship: UInt16 = 20
-    private static let capEnum: UInt16 = 1
-    private static let capRecord: UInt16 = 6
-    private static let capEnd: UInt16 = 2
-    private static let capRequestAsset: UInt16 = 0x83
-    private static let airOffer: UInt16 = 1
-    private static let airCursor: UInt16 = 2
-    private static let airData: UInt16 = 4
-    private static let airComplete: UInt16 = 6
-    private static let airDrop: UInt16 = 7
+    // DataX.Message reports service/type/error as `Int?`, so keep these Int and convert
+    // only where a tag needs a UInt16.
+    private static let svcCaptures = 18
+    private static let svcAirship = 20
+    private static let capEnum = 1
+    private static let capRecord = 6
+    private static let capEnd = 2
+    private static let capRequestAsset = 0x83
+    private static let airOffer = 1
+    private static let airCursor = 2
+    private static let airData = 4
+    private static let airComplete = 6
+    private static let airDrop = 7
 
     private let stream: SDUStream
     private let records: [Data]
@@ -134,7 +136,7 @@ final class FakeGlasses {
         // 5. trust: verify the phone proved it holds the owner key
         let trustMsg = try readSealed(timeout: 20)
         let t = try DataX.parse(trustMsg)
-        guard t.service == AirShield.svcIdentity, t.type == AirShield.idEnableTrust else {
+        guard t.service == AirShield.svcIdentity, t.type == Int(AirShield.idEnableTrust) else {
             throw LinkError.unexpected("expected EnableTrust, got type \(t.type.map(String.init) ?? "-")")
         }
         let body = try PB.parse(t.payload)
@@ -167,7 +169,7 @@ final class FakeGlasses {
 
         let status = try readSealed(timeout: 20)
         let s = try DataX.parse(status)
-        guard s.error == AirShield.stOK else {
+        guard s.error == Int(AirShield.stOK) else {
             throw LinkError.unexpected("phone did not ack EndLinkSetup (error 0x\(String(s.error ?? 0xFFFF, radix: 16)))")
         }
         sawEndLinkStatus = true
@@ -184,17 +186,17 @@ final class FakeGlasses {
                 return                      // the test finished; silence is normal
             }
             let m = try DataX.parse(plain)
-            let svc = m.service.map(UInt16.init), type = m.type
+            let svc = m.service, type = m.type
             if svc == Self.svcCaptures && type == Self.capEnum {
                 for rec in records {
                     try send(DataX.message(m.channel,
-                                           tags: [DataX.tag(1, Self.svcCaptures, last: false),
-                                                  DataX.tag(2, Self.capRecord, last: true)],
+                                           tags: [DataX.tag(1, UInt16(Self.svcCaptures), last: false),
+                                                  DataX.tag(2, UInt16(Self.capRecord), last: true)],
                                            payload: rec))
                 }
                 try send(DataX.message(m.channel,
-                                       tags: [DataX.tag(1, Self.svcCaptures, last: false),
-                                              DataX.tag(2, Self.capEnd, last: true)]))
+                                       tags: [DataX.tag(1, UInt16(Self.svcCaptures), last: false),
+                                              DataX.tag(2, UInt16(Self.capEnd), last: true)]))
                 continue
             }
             if svc == Self.svcCaptures && type == Self.capRequestAsset {
@@ -219,8 +221,8 @@ final class FakeGlasses {
 
         for candidate in UInt16(0x8002) ... UInt16(0x8008) {
             try send(DataX.message(candidate,
-                                   tags: [DataX.tag(1, Self.svcAirship, last: false),
-                                          DataX.tag(2, Self.airOffer, last: true)],
+                                   tags: [DataX.tag(1, UInt16(Self.svcAirship), last: false),
+                                          DataX.tag(2, UInt16(Self.airOffer), last: true)],
                                    payload: offer))
         }
 
@@ -236,14 +238,14 @@ final class FakeGlasses {
         while offset < file.data.count {
             let end = min(offset + 1024, file.data.count)
             try send(DataX.message(channel,
-                                   tags: [DataX.tag(1, Self.svcAirship, last: false),
-                                          DataX.tag(2, Self.airData, last: true)],
+                                   tags: [DataX.tag(1, UInt16(Self.svcAirship), last: false),
+                                          DataX.tag(2, UInt16(Self.airData), last: true)],
                                    payload: file.data.subdata(in: offset ..< end)))
             offset = end
         }
         try send(DataX.message(channel,
-                               tags: [DataX.tag(1, Self.svcAirship, last: false),
-                                      DataX.tag(2, Self.airComplete, last: true)],
+                               tags: [DataX.tag(1, UInt16(Self.svcAirship), last: false),
+                                      DataX.tag(2, UInt16(Self.airComplete), last: true)],
                                payload: PB.uint(1, UInt64(file.data.count)) +
                                         PB.uint(2, UInt64(Session.adler32(file.data)))))
     }
