@@ -116,12 +116,31 @@ struct OwnerMaterial {
     private func secPrivateKey() throws -> SecKey {
         var error: Unmanaged<CFError>?
         let attrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
-                                    kSecAttrKeyClass as String: kSecAttrKeyClassPrivate]
+                                    kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+                                    kSecAttrKeySizeInBits as String: 256]
         guard let key = SecKeyCreateWithData(Provisioner.pkcs8(from: self) as CFData,
                                              attrs as CFDictionary, &error) else {
+            // Fall back to the SEC1 ECPrivateKey form: some SDK builds only accept that.
+            if let key = Self.secKey(sec1: self) { return key }
             throw LinkError.io("SecKeyCreateWithData: \(error?.takeRetainedValue().localizedDescription ?? "?")")
         }
         return key
+    }
+
+    /// SEC1 `ECPrivateKey` (what OpenSSL writes as `EC PRIVATE KEY`).
+    private static func secKey(sec1 owner: OwnerMaterial) -> SecKey? {
+        let oidP256: [UInt8] = [0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]
+        var inner = Data([0x02, 0x01, 0x01])
+        inner += Data([0x04, 0x20]) + owner.scalar
+        inner += Data([0xA0]) + Provisioner.tlvLen(oidP256.count) + Data(oidP256)
+        let bitString = Data([0x00]) + owner.publicKey65
+        inner += Data([0xA1]) + Provisioner.tlvLen(bitString.count + 2) + Data([0x03])
+            + Provisioner.tlvLen(bitString.count) + bitString
+        let der = Data([0x30]) + Provisioner.tlvLen(inner.count) + inner
+        let attrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                                    kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+                                    kSecAttrKeySizeInBits as String: 256]
+        return SecKeyCreateWithData(der as CFData, attrs as CFDictionary, nil)
     }
 
     // MARK: DER helpers

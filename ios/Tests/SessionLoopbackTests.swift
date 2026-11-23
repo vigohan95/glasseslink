@@ -15,6 +15,7 @@ final class SessionLoopbackTests: XCTestCase {
         let a = OwnerMaterial(scalar: Data((0 ..< 32).map { UInt8($0 + 1) }))
         let b = OwnerMaterial(scalar: Data(repeating: 1, count: 32))
         print("[ecdh] a.xy=\(a.publicKeyXy.count) b.xy=\(b.publicKeyXy.count) b.head=\(b.publicKeyXy.prefix(4).hexShort)")
+        print("[ecdh] pkcs8=\(Provisioner.pkcs8(from: a).count) sec1 ok")
         let ab = try a.sharedSecret(peerPubkeyXy: b.publicKeyXy)
         let ba = try b.sharedSecret(peerPubkeyXy: a.publicKeyXy)
         XCTAssertEqual(ab, ba)
