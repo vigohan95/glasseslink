@@ -252,6 +252,44 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
+    // MARK: assistant takeover
+
+    @Published var assistantOn = false
+    private var assistantRef: Assistant?
+
+    /// svc15 registration: after this the glasses' own wake word routes to this app.
+    func startAssistant() {
+        guard let sess = session else { note("先连接"); return }
+        guard assistantRef == nil else { return }
+        let a = Assistant(session: sess)
+        a.log = { [weak self] line in self?.note("asst: \(line)") }
+        a.onTurn = { [weak self] interaction in
+            guard let self else { return }
+            let client = ModelClient(baseURL: self.modelBaseURL, model: self.modelName)
+            Task {
+                let q = "用户刚唤醒智能眼镜并说了一句话。只用一句不超过 20 字的简体中文回应用户。"
+                let text = (try? await client.ask(question: q, jpeg: Data())) ?? "我在。"
+                a.complete(interaction: interaction, text: text)
+            }
+        }
+        do {
+            try a.register()
+            a.startLoop()
+            assistantRef = a
+            assistantOn = true
+            note("助手接管已开启")
+        } catch {
+            note("助手接管失败：\(error)")
+        }
+    }
+
+    func stopAssistant() {
+        assistantRef?.stop()
+        assistantRef = nil
+        assistantOn = false
+        note("助手接管已关闭")
+    }
+
     // MARK: live
 
     func startLive() {
@@ -682,6 +720,15 @@ struct ContentView: View {
                     TextField("问题", text: $question, axis: .vertical).lineLimit(1 ... 3)
                     Button("看图问答") { g.ask(question) }.disabled(g.lastPhoto == nil || g.busy)
                     if !g.answer.isEmpty { Text(g.answer).font(.callout) }
+                }
+
+                Section("5.5 · 助手接管（Hey Meta 走这个 app）") {
+                    Button(g.assistantOn ? "关闭接管" : "开启接管") {
+                        if g.assistantOn { g.stopAssistant() } else { g.startAssistant() }
+                    }
+                    .disabled(!g.connected)
+                    Text("开启后眼镜的唤醒词会路由到这里，由你自己配的模型回答。语音转写还在做，现在是先接住这一轮再回一句话。")
+                        .font(.caption2).foregroundStyle(.secondary)
                 }
 
                 Section("6 · 眼镜设置（\(SettingsCatalog.all.count) 项）") {
