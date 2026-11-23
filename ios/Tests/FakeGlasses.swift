@@ -10,6 +10,7 @@
 
 import Foundation
 import CryptoKit
+@testable import GlassesLink
 
 final class FakeGlasses {
     // service / message numbers, spelled out so a protocol change shows up here
