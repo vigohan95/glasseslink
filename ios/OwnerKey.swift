@@ -72,12 +72,7 @@ struct OwnerMaterial {
     /// the same 32 bytes AirShield feeds into its HKDF.
     func sharedSecret(peerPubkeyXy: Data) throws -> Data {
         precondition(peerPubkeyXy.count == 64, "peer key is x||y, 64 bytes")
-        var error: Unmanaged<CFError>?
-        let privAttrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
-                                        kSecAttrKeyClass as String: kSecAttrKeyClassPrivate]
-        guard let priv = SecKeyCreateWithData(scalar as CFData, privAttrs as CFDictionary, &error) else {
-            throw LinkError.io("own key: \(error?.takeRetainedValue().localizedDescription ?? "?")")
-        }
+        let priv = try secPrivateKey()
         let pubAttrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
                                        kSecAttrKeyClass as String: kSecAttrKeyClassPublic]
         let point = Data([0x04]) + peerPubkeyXy
@@ -104,12 +99,8 @@ struct OwnerMaterial {
     /// consumes the digest verbatim, which is the operation svc36 asks for.
     func signRaw(digest: Data) throws -> Data {
         precondition(digest.count == 32, "binding digest is SHA-256")
+        let key = try secPrivateKey()
         var error: Unmanaged<CFError>?
-        let attrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
-                                    kSecAttrKeyClass as String: kSecAttrKeyClassPrivate]
-        guard let key = SecKeyCreateWithData(scalar as CFData, attrs as CFDictionary, &error) else {
-            throw LinkError.io("SecKeyCreateWithData: \(error?.takeRetainedValue().localizedDescription ?? "?")")
-        }
         guard let sig = SecKeyCreateSignature(key, .ecdsaSignatureDigestX962SHA256,
                                               digest as CFData, &error) else {
             throw LinkError.io("SecKeyCreateSignature: \(error?.takeRetainedValue().localizedDescription ?? "?")")
@@ -117,6 +108,19 @@ struct OwnerMaterial {
         let raw = Self.derToRaw(sig as Data)
         guard raw.count == 64 else { throw LinkError.io("signature is not 64 bytes") }
         return raw
+    }
+
+    /// Security wants PKCS#8 (a bare 32-byte scalar is rejected with OSStatus -50), so
+    /// hand it the same DER the exported bundle carries.
+    private func secPrivateKey() throws -> SecKey {
+        var error: Unmanaged<CFError>?
+        let attrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                                    kSecAttrKeyClass as String: kSecAttrKeyClassPrivate]
+        guard let key = SecKeyCreateWithData(Provisioner.pkcs8(from: self) as CFData,
+                                             attrs as CFDictionary, &error) else {
+            throw LinkError.io("SecKeyCreateWithData: \(error?.takeRetainedValue().localizedDescription ?? "?")")
+        }
+        return key
     }
 
     // MARK: DER helpers
