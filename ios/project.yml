@@ -39,5 +39,9 @@ targets:
         CFBundleVersion: "6"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
-        NSBluetoothAlwaysUsageDescription: 杩炴帴浣犵殑鐪奸暅锛岃蛋鏈湴钃濈墮閾捐矾锛屼笉缁?Meta 浜戙€?        NSLocalNetworkUsageDescription: 璁块棶灞€鍩熺綉鍐呯殑妗ユ帴鏈嶅姟銆?        NSPhotoLibraryAddUsageDescription: 鎶婄溂闀滄媿鐨勭収鐗囧瓨鍒颁綘鐨勭浉鍐屻€?        NSPhotoLibraryUsageDescription: 閫夋嫨骞舵煡鐪嬬溂闀滄媿鐨勭収鐗囥€?        UIFileSharingEnabled: true
+        NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
+        NSLocalNetworkUsageDescription: 访问局域网内的桥接服务。
+        NSPhotoLibraryAddUsageDescription: 把眼镜拍的照片存到你的相册。
+        NSPhotoLibraryUsageDescription: 选择并查看眼镜拍的照片。
+        UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
