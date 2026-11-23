@@ -11,6 +11,9 @@
 | owner 信任（svc36，不用再找 Meta） | 私钥在 `owner-export.json`，`Trust.buildEnableTrust` | 需要先做一次 owner 迁移 |
 | 拍照清单 / 取原图（svc18 + svc20） | `captureList` / `requestAsset` / `receiveFile` | 安卓路径实测 2.7 MB 原图 |
 | 眼镜设置读写（svc33 RLDrive） | `ios/Drive.swift` + `SettingsCatalog/SettingsView` | v0.3.0 内置 370 项设置 |
+| 固件设置写入（svc31） | `ios/SettingsSchema.swift` + `Session.writeSettingsField` | v0.6.0：370 项里 174 项走 svc31 |
+| 设备状态（电量/温度/空间/音量） | `ios/Status.swift`（svc28 订阅） | v0.4.0 |
+| 相册 + 视频导出 | `Glasses.loadCaptures/fetch` | v0.4.0，照片存相册、视频分享 |
 | 自选模型（OpenAI 兼容） | `ModelClient` + 图片内联 | 本机 Ollama 已测通 |
 
 ## 版本
@@ -18,14 +21,17 @@
 - v0.1.0 骨架 + 协议栈
 - v0.2.0 app 内 Meta 登录（WKWebView 拦 `code=`）+ owner 导出分享 + 日志落盘
 - v0.3.0 眼镜设置可读写（370 项，18 组，写后读回校验）
+- v0.4.0 设备状态页（svc28）+ 相册/视频导出
+- v0.5.0 文件导入 owner（`.fileImporter`），换签名后不用重做迁移
+- v0.6.0 固件设置走 svc31（`settings.tsv` 253 个字段，174 个 parsed），读回校验
 
 ## 待做
 
 1. owner 迁移：安装打过补丁的 Visor → 导出 `visor-owner-*.json` → `tools/owner_to_ios.py` → 放进 app Documents。
 2. 真机跑握手，按 `Documents/glasses.log` 修偏差（svc36 字段、svc18 flatbuffer 槽位）。
-3. 相册页：列出 capture handle/类型/大小，选一个传输并保存到相册（含视频）。
-4. 状态页：电量/固件/温度/剩余空间（svc? 或 drive 元数据）。
-5. 音量/语言/拍摄参数的快捷面板（在设置之上做常用项）。
+3. Live 取景（svc51350 SESSION_SETTINGS + H.264；iOS 无 Wi-Fi Direct，只能走 BLE 低码率档）。
+4. 快捷面板：音量/亮度/语言/通知音量（设置页之上的常用项）。
+5. 助手接入：眼镜端"Hey Meta"替代（Visor 的做法是自建 assistant server，走 svc? + TTS）。
 6. 签名分发：超级签名 OTA，或 TestFlight。
 
 ## 目录
