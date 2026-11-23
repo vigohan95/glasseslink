@@ -16,7 +16,9 @@
 | 相册 + 视频导出 | `Glasses.loadCaptures/fetch` | v0.4.0，照片存相册、视频分享 |
 | 自选模型（OpenAI 兼容） | `ModelClient` + 图片内联 | 本机 Ollama 已测通 |
 | Live 取景（svc51350） | `ios/Live.swift` + `LiveView`（HEVC → AVSampleBufferDisplayLayer） | v0.7.0，BLE 档 360×640/15fps |
-| 常用开关 | `ios/QuickPanel.swift`（6 个高频 svc31 项） | v0.8.0 |
+| 常用开关 | `ios/QuickPanel.swift`（6 个高频 svc31 项 + 音量/指示灯滑杆） | v0.8.0 / v0.9.0 |
+| 按快门拍照 / 录像（svc28 SNIntent 2300） | `ios/Shutter.swift` | v0.14.0：`action.robusta.capture`、`AGENTIC_START_RECORDING`、`CLOSE_APP_CAPTURE` |
+| 助手接管（svc15，Hey Meta 走本 app） | `ios/Assistant.swift` + `Thrift.swift` | v0.11.0 注册/转写/回答；v0.15.0 起由眼镜用自己的声音念出答案（ev53 VARM + ev60） |
 
 ## 版本
 
@@ -28,6 +30,13 @@
 - v0.6.0 固件设置走 svc31（`settings.tsv` 253 个字段，174 个 parsed），读回校验
 - v0.7.0 Live 取景：START_APP(3) → SESSION_SETTINGS → CONFIGURE_VIDEO/AUDIO → CONTROL_START，Annex-B 拆帧、HEVC 参数集建设备格式、中途抓拍 HEIC
 - v0.8.0 快捷面板：助手开关 / 唤醒提示音 / 拍摄伴音 / 高画质档 / 快剪拍照
+- v0.9.0 音量 / 指示灯亮度滑杆（svc31 int 字段，松手才写）
+- v0.10.0 助手 svc15 注册 + envelope + ev60
+- v0.11.0 接住 ev52 转写 → 调自选模型 → 回答
+- v0.12.0 直接导入 Visor 导出的 isor-owner-*.json（PEM→PKCS#8 自动转）
+- v0.13.0 后台模式 luetooth-central + 状态恢复自动重连
+- v0.14.0 按眼镜快门拍照 / 开始停止录像（svc28 SNIntent）
+- v0.15.0 眼镜用自己的声音念答案（ev53 VARM 拼串 + ev60）
 
 ## 待做
 
@@ -47,3 +56,9 @@
 - `bridge/` 安卓中转桥（已实测：手机 ↔ 眼镜 ↔ PC ↔ iPhone PWA）
 - `tools/` adb / token / owner 转换脚本
 - `visor-src/` 打过补丁的 Visor 源码（用于一次性导出 owner key）
+
+## 第三方代码说明
+
+`ios/Resources/varm_template.bin` 取自 Visor（github.com/macedonga/visor，AGPL-3.0）的 `core/assistant/src/main/resources/`，
+用作 ev53 的回答模板（按字节拼串，避免重编码改变整数宽度）。`ios/Resources/settings.tsv`、`ios/Resources/settings_ui.json`
+同样来自 Visor 的设置表。若要把本 app 分发，需遵守 AGPL-3.0（开源或另取授权）。
