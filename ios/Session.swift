@@ -36,6 +36,35 @@ final class SDUStream: NSObject, StreamDelegate {
         output.open()
     }
 
+    /// Test hook: drive the same reassembly machine from any byte-stream pair, so the
+    /// whole handshake can be exercised with no glasses in the room (`boundPair()`).
+    init(input: InputStream, output: OutputStream) {
+        self.input = input
+        self.output = output
+        super.init()
+        input.delegate = self
+        output.delegate = self
+        input.schedule(in: .main, forMode: .common)
+        output.schedule(in: .main, forMode: .common)
+        input.open()
+        output.open()
+    }
+
+    /// Two cross-wired bound pairs: what one side writes the other reads. Both ends are
+    /// scheduled on the main run loop, so a test that waits on the main queue delivers
+    /// the stream callbacks exactly as CoreBluetooth would.
+    static func boundPair(bufferSize: Int = 8192) throws -> (a: SDUStream, b: SDUStream) {
+        var aIn: InputStream?, aOut: OutputStream?
+        var bIn: InputStream?, bOut: OutputStream?
+        guard Stream.getStreamsToStream(&aIn, &aOut, bufferSize),
+              Stream.getStreamsToStream(&bIn, &bOut, bufferSize),
+              let ai = aIn, let ao = aOut, let bi = bIn, let bo = bOut else {
+            throw LinkError.io("cannot create a bound stream pair")
+        }
+        // a writes into b's input, b writes into a's input
+        return (SDUStream(input: bi, output: ao), SDUStream(input: ai, output: bo))
+    }
+
     func write(_ data: Data) throws {
         var sent = 0
         let total = data.count
