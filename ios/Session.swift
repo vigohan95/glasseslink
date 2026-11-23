@@ -54,15 +54,22 @@ final class SDUStream: NSObject, StreamDelegate {
     /// scheduled on the main run loop, so a test that waits on the main queue delivers
     /// the stream callbacks exactly as CoreBluetooth would.
     static func boundPair(bufferSize: Int = 8192) throws -> (a: SDUStream, b: SDUStream) {
-        var aIn: InputStream?, aOut: OutputStream?
-        var bIn: InputStream?, bOut: OutputStream?
-        guard Stream.getStreamsToStream(&aIn, &aOut, bufferSize),
-              Stream.getStreamsToStream(&bIn, &bOut, bufferSize),
-              let ai = aIn, let ao = aOut, let bi = bIn, let bo = bOut else {
-            throw LinkError.io("cannot create a bound stream pair")
+        // `Stream.getStreamsToStream` is macOS-only; CFStreamCreateBoundPair is the
+        // portable way to get a pipe whose ends are ordinary NSStreams.
+        func pair() throws -> (read: InputStream, write: OutputStream) {
+            var read: CFReadStream?
+            var write: CFWriteStream?
+            CFStreamCreateBoundPair(nil, &read, &write, CFIndex(bufferSize))
+            guard let r = read, let w = write else {
+                throw LinkError.io("cannot create a bound stream pair")
+            }
+            return (r as InputStream, w as OutputStream)
         }
-        // a writes into b's input, b writes into a's input
-        return (SDUStream(input: bi, output: ao), SDUStream(input: ai, output: bo))
+        let first = try pair()
+        let second = try pair()
+        // what one side writes, the other side reads
+        return (SDUStream(input: second.read, output: first.write),
+                SDUStream(input: first.read, output: second.write))
     }
 
     func write(_ data: Data) throws {
