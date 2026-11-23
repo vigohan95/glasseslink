@@ -15,6 +15,8 @@
 | 设备状态（电量/温度/空间/音量） | `ios/Status.swift`（svc28 订阅） | v0.4.0 |
 | 相册 + 视频导出 | `Glasses.loadCaptures/fetch` | v0.4.0，照片存相册、视频分享 |
 | 自选模型（OpenAI 兼容） | `ModelClient` + 图片内联 | 本机 Ollama 已测通 |
+| Live 取景（svc51350） | `ios/Live.swift` + `LiveView`（HEVC → AVSampleBufferDisplayLayer） | v0.7.0，BLE 档 360×640/15fps |
+| 常用开关 | `ios/QuickPanel.swift`（6 个高频 svc31 项） | v0.8.0 |
 
 ## 版本
 
@@ -24,13 +26,15 @@
 - v0.4.0 设备状态页（svc28）+ 相册/视频导出
 - v0.5.0 文件导入 owner（`.fileImporter`），换签名后不用重做迁移
 - v0.6.0 固件设置走 svc31（`settings.tsv` 253 个字段，174 个 parsed），读回校验
+- v0.7.0 Live 取景：START_APP(3) → SESSION_SETTINGS → CONFIGURE_VIDEO/AUDIO → CONTROL_START，Annex-B 拆帧、HEVC 参数集建设备格式、中途抓拍 HEIC
+- v0.8.0 快捷面板：助手开关 / 唤醒提示音 / 拍摄伴音 / 高画质档 / 快剪拍照
 
 ## 待做
 
 1. owner 迁移：安装打过补丁的 Visor → 导出 `visor-owner-*.json` → `tools/owner_to_ios.py` → 放进 app Documents。
 2. 真机跑握手，按 `Documents/glasses.log` 修偏差（svc36 字段、svc18 flatbuffer 槽位）。
-3. Live 取景（svc51350 SESSION_SETTINGS + H.264；iOS 无 Wi-Fi Direct，只能走 BLE 低码率档）。
-4. 快捷面板：音量/亮度/语言/通知音量（设置页之上的常用项）。
+3. Live 取景真机验证（BLE 档；iOS 无 Wi-Fi Direct，上不了 1080p）。
+4. 亮度/音量直控（状态服务里的音量字段只读，写入路径待逆）。
 5. 助手接入：眼镜端"Hey Meta"替代（Visor 的做法是自建 assistant server，走 svc? + TTS）。
 6. 签名分发：超级签名 OTA，或 TestFlight。
 
