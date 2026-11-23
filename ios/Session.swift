@@ -15,8 +15,11 @@ import CoreBluetooth
 ///   * 0x00..0x3F / 0x80..0xBF  plaintext DataX: 2B length (14 bits) | 2B channel
 /// The two ranges are disjoint, which is what makes one-pass demux possible.
 final class SDUStream: NSObject, StreamDelegate {
-    private let input: InputStream
-    private let output: OutputStream
+    private var input: InputStream?
+    private var output: OutputStream?
+    /// Loopback hook: when set, writes go straight to the peer's buffer and the real
+    /// streams are never touched (see `loopbackPair()`).
+    private var writeHook: ((Data) throws -> Void)?
     private let cond = NSCondition()
     private var buf = Data()
     private var closed = false
@@ -53,27 +56,38 @@ final class SDUStream: NSObject, StreamDelegate {
     /// Two cross-wired bound pairs: what one side writes the other reads. Both ends are
     /// scheduled on the main run loop, so a test that waits on the main queue delivers
     /// the stream callbacks exactly as CoreBluetooth would.
-    static func boundPair(bufferSize: Int = 8192) throws -> (a: SDUStream, b: SDUStream) {
-        // `Stream.getStreamsToStream` is macOS-only; CFStreamCreateBoundPair is the
-        // portable way to get a pipe whose ends are ordinary NSStreams.
-        func pair() throws -> (read: InputStream, write: OutputStream) {
-            var unmanagedRead: Unmanaged<CFReadStream>?
-            var unmanagedWrite: Unmanaged<CFWriteStream>?
-            CFStreamCreateBoundPair(nil, &unmanagedRead, &unmanagedWrite, CFIndex(bufferSize))
-            guard let r = unmanagedRead?.takeRetainedValue(),
-                  let w = unmanagedWrite?.takeRetainedValue() else {
-                throw LinkError.io("cannot create a bound stream pair")
-            }
-            return (r as InputStream, w as OutputStream)
-        }
-        let first = try pair()
-        let second = try pair()
-        // what one side writes, the other side reads
-        return (SDUStream(input: second.read, output: first.write),
-                SDUStream(input: first.read, output: second.write))
+    /// Two cross-wired streams for tests: `a.write` lands in `b`'s buffer and vice versa.
+    /// No run loop, no CoreBluetooth, no simulator privileges — which is what makes the
+    /// handshake testable in CI.
+    static func loopbackPair() -> (a: SDUStream, b: SDUStream) {
+        let a = SDUStream(nullStreams: ())
+        let b = SDUStream(nullStreams: ())
+        a.writeHook = { [weak b] data in b?.feed(data) }
+        b.writeHook = { [weak a] data in a?.feed(data) }
+        return (a, b)
     }
 
+    private init(nullStreams: Void) {
+        super.init()
+    }
+
+    /// Hand bytes to whoever is blocked in `nextFrame`.
+    func feed(_ data: Data) {
+        cond.lock()
+        buf.append(data)
+        cond.broadcast()
+        cond.unlock()
+    }
     func write(_ data: Data) throws {
+        if let hook = writeHook {
+            cond.lock()
+            let isClosed = closed
+            cond.unlock()
+            if isClosed { throw LinkError.io("stream closed") }
+            try hook(data)
+            return
+        }
+        guard let output else { throw LinkError.io("stream closed") }
         var sent = 0
         let total = data.count
         while sent < total {
@@ -92,7 +106,7 @@ final class SDUStream: NSObject, StreamDelegate {
 
     func close() {
         cond.lock(); closed = true; cond.broadcast(); cond.unlock()
-        input.close(); output.close()
+        input?.close(); output?.close()
     }
 
     /// Block until one complete SDU is available.
@@ -134,7 +148,7 @@ final class SDUStream: NSObject, StreamDelegate {
         switch eventCode {
         case .hasBytesAvailable:
             var chunk = [UInt8](repeating: 0, count: 8192)
-            let n = input.read(&chunk, maxLength: chunk.count)
+            let n = input?.read(&chunk, maxLength: chunk.count) ?? -1
             if n > 0 {
                 cond.lock(); buf.append(contentsOf: chunk[0 ..< n]); cond.broadcast(); cond.unlock()
             }
