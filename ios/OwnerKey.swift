@@ -73,6 +73,7 @@ struct OwnerMaterial {
     func sharedSecret(peerPubkeyXy: Data) throws -> Data {
         precondition(peerPubkeyXy.count == 64, "peer key is x||y, 64 bytes")
         let priv = try secPrivateKey()
+        var error: Unmanaged<CFError>?
         let pubAttrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
                                        kSecAttrKeyClass as String: kSecAttrKeyClassPublic]
         let point = Data([0x04]) + peerPubkeyXy
