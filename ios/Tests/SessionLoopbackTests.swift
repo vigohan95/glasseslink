@@ -9,6 +9,17 @@ import XCTest
 @testable import GlassesLink
 
 final class SessionLoopbackTests: XCTestCase {
+    /// The two sides must agree on x(S) for ECDH; this is the same arithmetic the glasses
+    /// do, so a here-failure means the packing helpers are wrong, not the transport.
+    func testEcdhAgreesBothWays() throws {
+        let a = OwnerMaterial(scalar: Data((0 ..< 32).map { UInt8($0 + 1) }))
+        let b = OwnerMaterial(scalar: Data(repeating: 1, count: 32))
+        print("[ecdh] a.xy=\(a.publicKeyXy.count) b.xy=\(b.publicKeyXy.count) b.head=\(b.publicKeyXy.prefix(4).hexShort)")
+        let ab = try a.sharedSecret(peerPubkeyXy: b.publicKeyXy)
+        let ba = try b.sharedSecret(peerPubkeyXy: a.publicKeyXy)
+        XCTAssertEqual(ab, ba)
+        XCTAssertEqual(ab.count, 32)
+    }
     /// Cheap canary: these two calls happen at the top of `Session.handshake`, so if the
     /// loopback test hangs before its first frame, one of them is the reason.
     func testOwnerMaterialBasics() throws {

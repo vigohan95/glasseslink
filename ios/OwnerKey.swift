@@ -67,7 +67,13 @@ struct OwnerMaterial {
     func sharedSecret(peerPubkeyXy: Data) throws -> Data {
         precondition(peerPubkeyXy.count == 64, "peer key is x||y, 64 bytes")
         let priv = try P256.KeyAgreement.PrivateKey(rawRepresentation: scalar)
-        let peer = try P256.KeyAgreement.PublicKey(rawRepresentation: Data([0x04]) + peerPubkeyXy)
+        let peer: P256.KeyAgreement.PublicKey
+        do {
+            peer = try P256.KeyAgreement.PublicKey(rawRepresentation: Data([0x04]) + peerPubkeyXy)
+        } catch {
+            throw LinkError.unexpected("glasses key is not a P-256 point (len=\(peerPubkeyXy.count), "
+                + "head=\(peerPubkeyXy.prefix(4).hexShort)): \(error)")
+        }
         let secret = try priv.sharedSecretFromKeyAgreement(with: peer)
         return secret.withUnsafeBytes { Data($0) }
     }
