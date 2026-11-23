@@ -33,6 +33,12 @@ final class ProtocolTests: XCTestCase {
         let owner = OwnerMaterial(scalar: scalar)
         let sig = try owner.signRaw(digest: digest, nonce: nonce)
         XCTAssertEqual(sig.hexShort, expected)
+        XCTAssertTrue(P256ECDSA.verify(digest: digest, signature: sig,
+                                       publicKeyXy: owner.publicKeyXy))
+        var tampered = sig
+        tampered[tampered.startIndex] ^= 0x01
+        XCTAssertFalse(P256ECDSA.verify(digest: digest, signature: tampered,
+                                        publicKeyXy: owner.publicKeyXy))
         XCTAssertEqual(owner.publicKeyXy.hexShort,
                        "24ac923b7211ddd1da58d1a1bac605dc9060b4da5542c8432f1bd42c45953271"
                        + "6a81b1e71d07038e36f4100fb1d7bc5a0e5df22cbb25cc98c0791c04d3c5ac86")

@@ -280,9 +280,7 @@ final class FakeGlasses {
     }
 
     private func verify(phonePub: Data, signature: Data, digest: Data) throws {
-        let key = try P256.Signing.PublicKey(rawRepresentation: Data([0x04]) + phonePub)
-        let sig = try P256.Signing.ECDSASignature(rawRepresentation: signature)
-        guard key.isValidSignature(sig, for: SHA256Digest(rawRepresentation: digest)) else {
+        guard P256ECDSA.verify(digest: digest, signature: signature, publicKeyXy: phonePub) else {
             throw LinkError.unexpected("trust signature does not verify over the channel binding")
         }
     }

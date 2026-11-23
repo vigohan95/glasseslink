@@ -248,6 +248,43 @@ enum P256ECDSA {
         return result
     }
 
+    /// k * P for an arbitrary point, coordinates in Montgomery form.
+    static func mul(_ k: P256Field.Word, _ point: Point) -> Point {
+        var result = Point(x: P256Field.zero, y: P256Field.zero, infinity: true)
+        var addend = point
+        var i = 0
+        while i < 256 {
+            if (k[i / 32] >> UInt32(i % 32)) & 1 == 1 { result = add(result, addend) }
+            addend = double(addend)
+            i += 1
+        }
+        return result
+    }
+
+    /// NONEwithECDSA verification: `digest` is used verbatim, `publicKeyXy` is 64 bytes.
+    static func verify(digest: Data, signature: Data, publicKeyXy: Data) -> Bool {
+        typealias F = P256Field
+        guard digest.count == 32, signature.count == 64, publicKeyXy.count == 64 else { return false }
+        let r = F.words(signature.prefix(32))
+        let s = F.words(signature.suffix(32))
+        if r.allSatisfy({ $0 == 0 }) || s.allSatisfy({ $0 == 0 }) { return false }
+        if F.cmp(r, F.n) >= 0 || F.cmp(s, F.n) >= 0 { return false }
+
+        let w = F.invN(F.toMont(s, F.n, F.n0n, F.r2n))
+        let z = F.toMont(F.words(digest), F.n, F.n0n, F.r2n)
+        let u1 = F.fromMont(F.mulModN(z, w), F.n, F.n0n)
+        let u2 = F.fromMont(F.mulModN(F.toMont(r, F.n, F.n0n, F.r2n), w), F.n, F.n0n)
+
+        let q = Point(x: F.toMont(F.words(publicKeyXy.prefix(32)), F.p, F.n0p, F.r2p),
+                      y: F.toMont(F.words(publicKeyXy.suffix(32)), F.p, F.n0p, F.r2p),
+                      infinity: false)
+        let point = add(mulG(u1), mul(u2, q))
+        if point.infinity { return false }
+        var x = F.fromMont(point.x, F.p, F.n0p)
+        if F.cmp(x, F.n) >= 0 { x = F.subRaw(x, F.n).0 }
+        return F.cmp(x, r) == 0
+    }
+
     /// ECDSA over `digest` verbatim, returned as raw r||s with s in the low half.
     static func sign(digest: Data, scalar: Data, nonce: Data) throws -> Data {
         typealias F = P256Field
