@@ -57,10 +57,11 @@ final class SDUStream: NSObject, StreamDelegate {
         // `Stream.getStreamsToStream` is macOS-only; CFStreamCreateBoundPair is the
         // portable way to get a pipe whose ends are ordinary NSStreams.
         func pair() throws -> (read: InputStream, write: OutputStream) {
-            var read: CFReadStream?
-            var write: CFWriteStream?
-            CFStreamCreateBoundPair(nil, &read, &write, CFIndex(bufferSize))
-            guard let r = read, let w = write else {
+            var unmanagedRead: Unmanaged<CFReadStream>?
+            var unmanagedWrite: Unmanaged<CFWriteStream>?
+            CFStreamCreateBoundPair(nil, &unmanagedRead, &unmanagedWrite, CFIndex(bufferSize))
+            guard let r = unmanagedRead?.takeRetainedValue(),
+                  let w = unmanagedWrite?.takeRetainedValue() else {
                 throw LinkError.io("cannot create a bound stream pair")
             }
             return (r as InputStream, w as OutputStream)
