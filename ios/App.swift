@@ -73,7 +73,8 @@ final class Glasses: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        central = CBCentralManager(delegate: self, queue: .main)
+        central = CBCentralManager(delegate: self, queue: .main,
+                                   options: [CBCentralManagerOptionRestoreIdentifierKey: "dev.local.glasseslink.central"])
         if let k = OwnerMaterial.loadFromKeychain() {
             owner = k
             ownerLine = "owner key: 已载入 \(k.publicKeyXy.hexShort)"
@@ -123,7 +124,24 @@ final class Glasses: NSObject, ObservableObject {
         central.stopScan()
         peripheral = p
         p.delegate = self
+        UserDefaults.standard.set(id.uuidString, forKey: "lastPeripheral")
         note("连接 \(p.name ?? "?") …")
+        central.connect(p, options: nil)
+    }
+
+    /// The glasses stay paired at the iOS level, so a cold launch can go straight back to
+    /// the same peripheral without scanning — that is what makes "打开就能用" work.
+    func autoReconnect() {
+        guard central.state == .poweredOn else { return }
+        guard let saved = UserDefaults.standard.string(forKey: "lastPeripheral"),
+              let id = UUID(uuidString: saved) else { return }
+        guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
+            note("上次的眼镜现在不在系统里，点「扫描」一次")
+            return
+        }
+        peripheral = p
+        p.delegate = self
+        note("自动连接上次的眼镜 \(p.name ?? saved) …")
         central.connect(p, options: nil)
     }
 
@@ -537,10 +555,29 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func centralManagerDidUpdateState(_ c: CBCentralManager) {
         Task { @MainActor in
             switch c.state {
-            case .poweredOn: note("蓝牙就绪")
+            case .poweredOn:
+                note("蓝牙就绪")
+                autoReconnect()
             case .unauthorized: note("蓝牙权限被拒——检查 Info.plist")
             case .poweredOff: note("蓝牙关闭")
             default: note("central state \(c.state.rawValue)")
+            }
+        }
+    }
+
+    /// iOS relaunches us in the background with the old central; take the peripheral back.
+    nonisolated func centralManager(_ c: CBCentralManager, willRestoreState dict: [String: Any]) {
+        guard let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral])?.first else {
+            return
+        }
+        Task { @MainActor in
+            peripheral = restored
+            restored.delegate = self
+            if restored.state == .connected {
+                note("后台恢复：\(restored.name ?? "眼镜") 仍连着")
+            } else {
+                note("后台恢复：重连 \(restored.name ?? "眼镜") …")
+                c.connect(restored, options: nil)
             }
         }
     }

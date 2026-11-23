@@ -40,13 +40,17 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "0.12"
-        CFBundleVersion: "12"
+        CFBundleShortVersionString: "0.13"
+        CFBundleVersion: "13"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
         NSLocalNetworkUsageDescription: 访问局域网内的桥接服务。
         NSPhotoLibraryAddUsageDescription: 把眼镜拍的照片存到你的相册。
         NSPhotoLibraryUsageDescription: 选择并查看眼镜拍的照片。
+        UIBackgroundModes:
+          - bluetooth-central
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
