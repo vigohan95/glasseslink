@@ -72,24 +72,28 @@ struct OwnerMaterial {
     /// the same 32 bytes AirShield feeds into its HKDF.
     func sharedSecret(peerPubkeyXy: Data) throws -> Data {
         precondition(peerPubkeyXy.count == 64, "peer key is x||y, 64 bytes")
-        let priv = try secPrivateKey()
-        var error: Unmanaged<CFError>?
-        let pubAttrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
-                                       kSecAttrKeyClass as String: kSecAttrKeyClassPublic]
+        let priv = try P256.KeyAgreement.PrivateKey(rawRepresentation: scalar)
         let point = Data([0x04]) + peerPubkeyXy
-        guard let peer = SecKeyCreateWithData(point as CFData, pubAttrs as CFDictionary, &error) else {
-            throw LinkError.unexpected("glasses key is not a P-256 point "
-                + "(len=\(peerPubkeyXy.count), head=\(peerPubkeyXy.prefix(4).hexShort)): "
-                + "\(error?.takeRetainedValue().localizedDescription ?? "?")")
+        var peer: P256.KeyAgreement.PublicKey?
+        // CryptoKit validates the encoding strictly; the x9.63 entry point is the one that
+        // accepts a raw uncompressed point on every SDK we build against.
+        peer = try? P256.KeyAgreement.PublicKey(x963Representation: point)
+        if peer == nil { peer = try? P256.KeyAgreement.PublicKey(rawRepresentation: point) }
+        guard let peer else {
+            throw LinkError.unexpected("glasses key is not a P-256 point (head=\(peerPubkeyXy.prefix(4).hexShort))")
         }
-        let params: [String: Any] = [SecKeyKeyExchangeParameter.requestedSize.rawValue as String: 32]
-        guard let secret = SecKeyCopyKeyExchangeResult(priv, .ecdhKeyExchangeStandard, peer,
-                                                       params as CFDictionary, &error) else {
-            throw LinkError.io("ECDH failed: \(error?.takeRetainedValue().localizedDescription ?? "?")")
-        }
-        let out = secret as Data
-        guard out.count == 32 else { throw LinkError.io("shared secret is \(out.count) bytes") }
-        return out
+        let secret = try priv.sharedSecretFromKeyAgreement(with: peer)
+        return secret.withUnsafeBytes { Data($0) }
+    }
+
+    /// Can this key produce a NONEwithECDSA signature on this OS?
+    ///
+    /// Security refuses every EC private-key container we can build when the key did not
+    /// come from the keychain (`OSStatus -50`), which is the case in the simulator and for
+    /// keys imported from `owner-export.json`. Callers use this to skip the trust exchange
+    /// instead of sending a signature the glasses would reject with 0x1044.
+    var canSignPrehashed: Bool {
+        (try? secPrivateKey()) != nil
     }
 
     /// ECDSA over an already-hashed 32-byte digest (NONEwithECDSA), returned as raw r||s.
