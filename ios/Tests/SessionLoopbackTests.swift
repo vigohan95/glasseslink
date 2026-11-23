@@ -10,7 +10,7 @@ import XCTest
 
 final class SessionLoopbackTests: XCTestCase {
     func testFullHandshakeCaptureListAndTransfer() throws {
-        let owner = OwnerMaterial.generate()
+        let owner = OwnerMaterial(scalar: Data((0 ..< 32).map { UInt8($0 + 1) }))
         let (phoneStream, glassStream) = SDUStream.loopbackPair()
 
         let record = FlatBuild.captureRecord(handle: "cap-1", kind: 3073,
@@ -48,7 +48,7 @@ final class SessionLoopbackTests: XCTestCase {
     /// The provisioning link skips trust entirely: the glasses do not know our key yet,
     /// which is exactly why the owner can be moved onto a new device without Meta.
     func testHandshakeWithoutTrust() throws {
-        let owner = OwnerMaterial.generate()
+        let owner = OwnerMaterial(scalar: Data((0 ..< 32).map { UInt8($0 + 1) }))
         let (phoneStream, glassStream) = SDUStream.loopbackPair()
         let peer = FakeGlasses(stream: glassStream, records: [],
                                file: ("unused", Data()), expectTrust: false,
