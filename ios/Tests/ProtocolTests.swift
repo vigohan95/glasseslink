@@ -118,7 +118,11 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(fields[1]?.first as? Data, Data(Shutter.actionPhoto.utf8))
         let data = fields[2] as? [Data] ?? []
         XCTAssertEqual(data.count, 3, "launch type, referrer and IS_MODAL")
-        let keys = try data.map { String(decoding: (try? PB.parse($0))?[1]?.first as? Data ?? Data(), as: UTF8.self) }
+        let keys = try data.map { payload -> String in
+            let parsed = try PB.parse(payload)
+            guard let raw = parsed[1]?.first as? Data else { return "" }
+            return String(decoding: raw, as: UTF8.self)
+        }
         XCTAssertEqual(keys, [Shutter.keyLaunchType, Shutter.keyReferrer, Shutter.keyIsModal])
     }
 
@@ -136,14 +140,14 @@ final class ProtocolTests: XCTestCase {
         let body = Varm.complete(interaction: "turn-1", text: "前面没有台阶。",
                                  expectsAnswer: false, followUp: true)
         let outer = try ThriftCompact.loads(body)
-        XCTAssertEqual(outer[1]?.first as? Data, Data("turn-1".utf8))
-        XCTAssertEqual(outer[2]?.first as? Int, 1000)
-        let inner = try XCTUnwrap(outer[4]?.first as? [Int: Any])
-        XCTAssertEqual(inner[1]?.first as? Data, Data("前面没有台阶。".utf8))
-        XCTAssertEqual(inner[3]?.first as? Bool, false)
-        XCTAssertEqual(inner[7]?.first as? Bool, false, "streamed=false: the glasses speak it")
-        XCTAssertEqual(inner[8]?.first as? Bool, false)
-        XCTAssertEqual(inner[11]?.first as? Bool, true)
+        XCTAssertEqual(outer[1] as? Data, Data("turn-1".utf8))
+        XCTAssertEqual(outer[2] as? Int, 1000)
+        let inner = try XCTUnwrap(outer[4] as? [Int: Any])
+        XCTAssertEqual(inner[1] as? Data, Data("前面没有台阶。".utf8))
+        XCTAssertEqual(inner[3] as? Bool, false)
+        XCTAssertEqual(inner[7] as? Bool, false, "streamed=false: the glasses speak it")
+        XCTAssertEqual(inner[8] as? Bool, false)
+        XCTAssertEqual(inner[11] as? Bool, true)
     }
 
     func testVarmSpliceReplacesTemplateStrings() throws {
@@ -153,23 +157,23 @@ final class ProtocolTests: XCTestCase {
         let text = "今天二十七度，适合出门。"
         let built = try XCTUnwrap(Varm.build(interaction: "turn-42", transcript: "天气怎么样", text: text))
         let parsed = try ThriftCompact.loads(built)
-        XCTAssertEqual(parsed[8]?.first as? Data, Data("turn-42".utf8))
+        XCTAssertEqual(parsed[8] as? Data, Data("turn-42".utf8))
         // The answer string sits at server[3][0][2][1] in the captured template.
-        let server = try XCTUnwrap(parsed[1]?.first as? [Int: Any])
+        let server = try XCTUnwrap(parsed[1] as? [Int: Any])
         let answers = try XCTUnwrap(server[3] as? [Any])
         let first = try XCTUnwrap(answers.first as? [Int: Any])
         let inner = try XCTUnwrap(first[2] as? [Int: Any])
-        XCTAssertEqual(inner[1]?.first as? Data, Data(text.utf8))
+        XCTAssertEqual(inner[1] as? Data, Data(text.utf8))
         // fields 6 and 14 are cleared so no audio stream is expected after the VARM
-        XCTAssertEqual(parsed[6]?.first as? Bool, false)
-        XCTAssertEqual(parsed[14]?.first as? Bool, false)
+        XCTAssertEqual(parsed[6] as? Bool, false)
+        XCTAssertEqual(parsed[14] as? Bool, false)
     }
 
     func testSetBoolFlipsOnlyTheRequestedField() throws {
         let body = ThriftWriter().string(1, "x").bool(7, false).bool(11, false).done()
         let flipped = VarmSplice.setBool(body, 11, true)
         let parsed = try ThriftCompact.loads(flipped)
-        XCTAssertEqual(parsed[11]?.first as? Bool, true)
-        XCTAssertEqual(parsed[1]?.first as? Data, Data("x".utf8))
+        XCTAssertEqual(parsed[11] as? Bool, true)
+        XCTAssertEqual(parsed[1] as? Data, Data("x".utf8))
     }
 }
