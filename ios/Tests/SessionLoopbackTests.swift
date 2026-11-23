@@ -9,8 +9,11 @@ import XCTest
 
 final class SessionLoopbackTests: XCTestCase {
     func testFullHandshakeCaptureListAndTransfer() throws {
+        NSLog("T0 test start")
         let owner = OwnerMaterial.generate()
+        NSLog("T1 owner generated")
         let (phoneStream, glassStream) = SDUStream.loopbackPair()
+        NSLog("T2 loopback pair ready")
 
         let record = FlatBuild.captureRecord(handle: "cap-1", kind: 3073,
                                             timestampNS: 1_700_000_000_000_000_000,
@@ -21,7 +24,8 @@ final class SessionLoopbackTests: XCTestCase {
                                log: { print("glass: \($0)") })
         peer.start()
 
-        let session = Session(stream: phoneStream, owner: owner, log: { print("phone: \($0)") })
+        let session = Session(stream: phoneStream, owner: owner, log: { NSLog("phone: %@", $0) })
+        NSLog("T3 session built")
 
         // the phone side has to run off the main thread: the stream callbacks are
         // scheduled on the main run loop, which `wait(for:)` keeps spinning.
@@ -30,6 +34,7 @@ final class SessionLoopbackTests: XCTestCase {
         var failure: String?
 
         let worker = Thread {
+            NSLog("T4 worker running")
             do {
                 try session.handshake(timeout: 10)
                 captured["handshake"] = true
@@ -72,14 +77,18 @@ final class SessionLoopbackTests: XCTestCase {
     /// The provisioning link skips trust entirely: the glasses do not know our key yet,
     /// which is exactly why the owner can be moved onto a new device without Meta.
     func testHandshakeWithoutTrust() throws {
+        NSLog("T0 test start")
         let owner = OwnerMaterial.generate()
+        NSLog("T1 owner generated")
         let (phoneStream, glassStream) = SDUStream.loopbackPair()
+        NSLog("T2 loopback pair ready")
         let peer = FakeGlasses(stream: glassStream, records: [],
                                file: ("unused", Data()), expectTrust: false,
                                log: { print("glass: \($0)") })
         peer.start()
 
-        let session = Session(stream: phoneStream, owner: owner, log: { print("phone: \($0)") })
+        let session = Session(stream: phoneStream, owner: owner, log: { NSLog("phone: %@", $0) })
+        NSLog("T3 session built")
         let done = expectation(description: "setup-only handshake")
         var failure: String?
         let worker = Thread {
