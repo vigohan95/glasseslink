@@ -37,6 +37,7 @@
 - v0.13.0 后台模式 luetooth-central + 状态恢复自动重连
 - v0.14.0 按眼镜快门拍照 / 开始停止录像（svc28 SNIntent）
 - v0.15.0 眼镜用自己的声音念答案（ev53 VARM 拼串 + ev60）
+- v0.16.0 协议单测进 CI（ios/Tests/ProtocolTests.swift，golden vector 由 pi/ 生成）；修 setBool 零长度布尔字段提前返回、Int64 类型
 
 ## 待做
 
