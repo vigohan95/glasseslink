@@ -14,6 +14,7 @@ targets:
       - AirShield.swift
       - OwnerKey.swift
       - Session.swift
+      - Shutter.swift
       - Provision.swift
       - Login.swift
       - Drive.swift
@@ -40,8 +41,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "0.13"
-        CFBundleVersion: "13"
+        CFBundleShortVersionString: "0.14"
+        CFBundleVersion: "14"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。

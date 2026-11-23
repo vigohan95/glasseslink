@@ -51,6 +51,7 @@ final class Glasses: NSObject, ObservableObject {
     @Published var settingsLoading = false
     @Published var status = GlassesState()
     @Published var captures: [Capture] = []
+    @Published var recording = false
     @Published var lastVideo: Data?
     @Published var live: LiveStream?
     @Published var liveLine = "—"
@@ -223,6 +224,53 @@ final class Glasses: NSObject, ObservableObject {
                 }
             } catch {
                 note("取文件失败：\(error)")
+            }
+        }
+    }
+
+    /// Press the glasses' shutter, then pull whatever landed. The glasses take a
+    /// second or two to write the file, so this waits before asking for the list.
+    func snap() {
+        guard let sess = session else { note("先连接"); return }
+        busy = true
+        Task {
+            do {
+                try sess.shutterPhoto()
+                note("已按快门，等眼镜写文件…")
+                try? await Task.sleep(nanoseconds: 2_800_000_000)
+                busy = false
+                capture()
+            } catch {
+                busy = false
+                note("快门失败：\(error)")
+            }
+        }
+    }
+
+    /// Start or stop a recording through the same SNIntent path Visor uses.
+    /// On stop it waits for the file and pulls it, like the photo path.
+    func toggleRecording() {
+        guard let sess = session else { note("先连接"); return }
+        let wasRecording = recording
+        busy = true
+        Task {
+            do {
+                if wasRecording {
+                    try sess.stopVideo()
+                    note("已发停止录像，等眼镜收尾…")
+                    try? await Task.sleep(nanoseconds: 3_500_000_000)
+                    recording = false
+                    busy = false
+                    loadCaptures()
+                } else {
+                    try sess.startVideo()
+                    note("已发开始录像")
+                    recording = true
+                    busy = false
+                }
+            } catch {
+                busy = false
+                note("录像控制失败：\(error)")
             }
         }
     }
@@ -717,6 +765,11 @@ struct ContentView: View {
                         Button(g.busy ? "处理中…" : "拉最新照片") { g.capture() }
                             .disabled(!g.connected || g.busy)
                     }
+                    Button(g.busy ? "处理中…" : "按眼镜快门拍一张") { g.snap() }
+                        .disabled(!g.connected || g.busy)
+                    Button(g.recording ? "停止录像" : "开始录像") { g.toggleRecording() }
+                        .disabled(!g.connected || g.busy)
+                        .tint(g.recording ? .red : .accentColor)
                     ForEach(g.captures, id: \.handle) { item in
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
