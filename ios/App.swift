@@ -422,14 +422,17 @@ final class Glasses: NSObject, ObservableObject {
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         do {
             let data = try Data(contentsOf: url)
-            guard let parsed = try? OwnerMaterial.load(from: try writeTemp(data)) else {
-                note("解析失败——确认选的是 owner-export.json")
+            guard let parsed = try? OwnerMaterial.loadAny(from: try writeTemp(data)) else {
+                note("解析失败——要 owner-export.json 或 Visor 导出的 visor-owner-*.json")
                 return
             }
-            try data.write(to: OwnerMaterial.defaultURL, options: .atomic)
+            // Normalise to owner-export.json so the next launch finds it without the original file.
+            let normalised = try JSONEncoder().encode(parsed.1)
+            try normalised.write(to: OwnerMaterial.defaultURL, options: .atomic)
+            try parsed.0.saveToKeychain()
             owner = parsed.0
             ownerLine = "owner key: 已导入 \(parsed.1.serial)"
-            note("已导入 owner-export.json（\(parsed.1.serial)）")
+            note("已导入 \(parsed.1.serial) 的 owner key（来源文件可直接是 Visor 导出的那个）")
         } catch {
             note("导入失败：\(error)")
         }
@@ -777,7 +780,7 @@ struct ContentView: View {
             .sheet(isPresented: $showSettings) { SettingsView(g: g) }
             .sheet(isPresented: $showLive) { LiveView(g: g) }
             .sheet(isPresented: $showQuick) { NavigationStack { QuickPanel(g: g) } }
-            .fileImporter(isPresented: $showImport, allowedContentTypes: [.json]) { result in
+            .fileImporter(isPresented: $showImport, allowedContentTypes: [.json, .data]) { result in
                 switch result {
                 case .success(let url): g.importOwner(from: url)
                 case .failure(let error): g.note("选文件失败：\(error.localizedDescription)")

@@ -190,6 +190,44 @@ struct OwnerMaterial {
         return (OwnerMaterial(scalar: scalar, publicKeyXy: xy.count == 64 ? xy : nil), bundle)
     }
 
+    /// What the patched Visor writes to Downloads: {"serial","source":"visor-export","privateKeyPemB64"}.
+    /// The PEM is base64 of a PKCS#8 "-----BEGIN PRIVATE KEY-----" block.
+    struct VisorExport: Codable {
+        var serial: String
+        var source: String?
+        var privateKeyPemB64: String
+    }
+
+    /// Accepts either our own owner-export.json or a visor-owner-<serial>.json straight
+    /// off the phone, and always normalises to the owner-export.json shape on disk.
+    static func loadAny(from url: URL) throws -> (OwnerMaterial, Bundle) {
+        let data = try Data(contentsOf: url)
+        if let bundle = try? JSONDecoder().decode(Bundle.self, from: data),
+           let der = Data(base64Encoded: bundle.privateKeyPkcs8),
+           let scalar = scalar(fromPKCS8: der) {
+            let xy = Data(base64Encoded: bundle.publicKeyXy) ?? Data()
+            return (OwnerMaterial(scalar: scalar, publicKeyXy: xy.count == 64 ? xy : nil), bundle)
+        }
+        let exported = try JSONDecoder().decode(VisorExport.self, from: data)
+        guard let pemData = Data(base64Encoded: exported.privateKeyPemB64),
+              let pem = String(data: pemData, encoding: .utf8) else {
+            throw LinkError.unexpected("visor export has no readable privateKeyPemB64")
+        }
+        let body = pem.split(separator: "\n")
+            .filter { !$0.hasPrefix("-----") }
+            .joined()
+        guard let der = Data(base64Encoded: body),
+              let scalar = scalar(fromPKCS8: der) else {
+            throw LinkError.unexpected("visor export PEM has no P-256 scalar")
+        }
+        let material = OwnerMaterial(scalar: scalar)
+        let bundle = Bundle(serial: exported.serial,
+                           publicKeyXy: material.publicKeyXy.base64EncodedString(),
+                           privateKeyPkcs8: der.base64EncodedString(),
+                           receipt: nil)
+        return (material, bundle)
+    }
+
     func save(bundle: Bundle) throws {
         let url = Self.defaultURL
         try JSONEncoder().encode(bundle).write(to: url, options: .atomic)
