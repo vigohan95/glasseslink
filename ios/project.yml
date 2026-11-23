@@ -39,6 +39,7 @@ targets:
         SWIFT_VERSION: "5.9"
         CODE_SIGNING_ALLOWED: NO
         ENABLE_BITCODE: NO
+        ENABLE_TESTABILITY: YES
     info:
       path: Info.plist
       properties:
