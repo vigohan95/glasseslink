@@ -32,14 +32,14 @@ final class ProtocolTests: XCTestCase {
             + "03bf8bb6c07d98211266b44f2c126e24cdb99572444e0d01d35b15d04433a4e2"
         let owner = OwnerMaterial(scalar: scalar)
         let sig = try owner.signRaw(digest: digest, nonce: nonce)
-        XCTAssertEqual(sig.hexShort, expected)
+        XCTAssertEqual(sig.hexFull, expected)
         XCTAssertTrue(P256ECDSA.verify(digest: digest, signature: sig,
                                        publicKeyXy: owner.publicKeyXy))
         var tampered = sig
         tampered[tampered.startIndex] ^= 0x01
         XCTAssertFalse(P256ECDSA.verify(digest: digest, signature: tampered,
                                         publicKeyXy: owner.publicKeyXy))
-        XCTAssertEqual(owner.publicKeyXy.hexShort,
+        XCTAssertEqual(owner.publicKeyXy.hexFull,
                        "24ac923b7211ddd1da58d1a1bac605dc9060b4da5542c8432f1bd42c45953271"
                        + "6a81b1e71d07038e36f4100fb1d7bc5a0e5df22cbb25cc98c0791c04d3c5ac86")
     }
@@ -218,6 +218,9 @@ final class ProtocolTests: XCTestCase {
 }
 
 extension Data {
+    /// Full lowercase hex — `hexShort` truncates for log lines and must not be compared.
+    var hexFull: String { map { String(format: "%02x", $0) }.joined() }
+
     init(hex: String) {
         var bytes: [UInt8] = []
         var index = hex.startIndex
