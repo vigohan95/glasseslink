@@ -267,8 +267,18 @@ final class Glasses: NSObject, ObservableObject {
             guard let self else { return }
             let client = ModelClient(baseURL: self.modelBaseURL, model: self.modelName)
             Task {
-                let q = "用户刚唤醒智能眼镜并说了一句话。只用一句不超过 20 字的简体中文回应用户。"
+                let q = "用户刚唤醒智能眼镜。只用一句不超过 20 字的简体中文回应用户。"
                 let text = (try? await client.ask(question: q, jpeg: Data())) ?? "我在。"
+                a.complete(interaction: interaction, text: text)
+            }
+        }
+        // The glasses' own speech recognition finished a sentence: answer it with the model.
+        a.onTranscript = { [weak self] transcript, interaction in
+            guard let self else { return }
+            let client = ModelClient(baseURL: self.modelBaseURL, model: self.modelName)
+            Task {
+                let q = "用户戴着智能眼镜说：“\(transcript)”。用不超过 40 字的简体中文直接回答，不用复述问题。"
+                let text = (try? await client.ask(question: q, jpeg: Data())) ?? "我没听清，再说一遍？"
                 a.complete(interaction: interaction, text: text)
             }
         }

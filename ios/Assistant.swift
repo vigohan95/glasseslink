@@ -64,6 +64,8 @@ final class Assistant {
     var log: (String) -> Void = { _ in }
     /// Called for every turn the glasses start; the app turns it into a model answer.
     var onTurn: ((String) -> Void)?
+    /// (transcript, interaction): the glasses' own ASR finished a sentence.
+    var onTranscript: ((String, String) -> Void)?
     var answer: ((String) -> String)?
 
     init(session: Session) {
@@ -230,7 +232,11 @@ final class Assistant {
             log("assistant: turn \(id) interaction=\(interaction)")
             onTurn?(interaction)
         case EV.finalTranscription:
-            log("assistant: transcription \(inner.text(2))")
+            // ev52 FinalTranscription {1 text, 2 … 8 interaction}: the glasses' own ASR result.
+            let text = inner.text(1)
+            let interaction = inner.text(8)
+            log("assistant: transcription \"\(text)\" sub=\(interaction)")
+            if !text.isEmpty { onTranscript?(text, interaction) }
         case EV.remoteImageCaptureRequest:
             log("assistant: glasses want a photo")
         default:
