@@ -291,7 +291,7 @@ enum Provisioner {
         inner += Data([0x04, 0x20]) + owner.scalar               // privateKey
         inner += Data([0xA0]) + tlvLen(oidP256.count) + Data(oidP256)
         let pub = owner.publicKey65
-        var bitString = Data([0x00]) + pub                        // unused-bits byte + key
+        let bitString = Data([0x00]) + pub                        // unused-bits byte + key
         inner += Data([0xA1]) + tlvLen(bitString.count + 2) + Data([0x03]) + tlvLen(bitString.count) + bitString
         let innerSeq = Data([0x30]) + tlvLen(inner.count) + inner
         let algId = Data([0x30, 0x13]) + Data(oidP256) + Data([0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07])

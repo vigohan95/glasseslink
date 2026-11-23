@@ -38,12 +38,16 @@ final class SDUStream: NSObject, StreamDelegate {
 
     func write(_ data: Data) throws {
         var sent = 0
-        let bytes = [UInt8](data)
-        while sent < bytes.count {
+        let total = data.count
+        while sent < total {
             cond.lock(); defer { cond.unlock() }
             if closed { throw LinkError.io("stream closed") }
-            let n = output.write(bytes[sent...], maxLength: bytes.count - sent)
+            let n: Int = data.withUnsafeBytes { raw in
+                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
+                return output.write(base.advanced(by: sent), maxLength: total - sent)
+            }
             if n > 0 { sent += n; continue }
+            if n < 0 { throw LinkError.io(output.streamError?.localizedDescription ?? "write failed") }
             if let e = output.streamError { throw LinkError.io(e.localizedDescription) }
             cond.wait(until: Date().addingTimeInterval(0.05))
         }
