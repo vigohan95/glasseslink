@@ -22,6 +22,7 @@ targets:
       - Status.swift
       - Live.swift
       - LiveView.swift
+      - QuickPanel.swift
       - SettingsSchema.swift
       - Resources/settings_ui.json
       - Resources/settings.tsv
@@ -37,8 +38,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "0.7"
-        CFBundleVersion: "7"
+        CFBundleShortVersionString: "0.8"
+        CFBundleVersion: "8"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。

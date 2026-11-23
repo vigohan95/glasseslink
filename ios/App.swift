@@ -594,6 +594,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showImport = false
     @State private var showLive = false
+    @State private var showQuick = false
 
     var body: some View {
         NavigationStack {
@@ -660,6 +661,11 @@ struct ContentView: View {
                     Button("刷新状态") { g.refreshStatus() }.disabled(!g.connected)
                 }
 
+                Section("3.5 · 快捷") {
+                    Button("常用开关（助手 / 提示音 / 画质）") { showQuick = true }
+                        .disabled(!g.connected)
+                }
+
                 Section("4 · Live 取景") {
                     Button(g.live == nil ? "打开取景" : "取景中…") { showLive = true }
                         .disabled(!g.connected)
@@ -713,6 +719,7 @@ struct ContentView: View {
             .sheet(item: $g.share) { box in ActivityView(url: box.url) }
             .sheet(isPresented: $showSettings) { SettingsView(g: g) }
             .sheet(isPresented: $showLive) { LiveView(g: g) }
+            .sheet(isPresented: $showQuick) { NavigationStack { QuickPanel(g: g) } }
             .fileImporter(isPresented: $showImport, allowedContentTypes: [.json]) { result in
                 switch result {
                 case .success(let url): g.importOwner(from: url)
