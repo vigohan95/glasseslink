@@ -441,6 +441,9 @@ final class Direction {
     static func cbc(_ input: Data, key: Data, iv: Data, encrypt: Bool) throws -> Data {
         var out = Data(count: input.count + kCCBlockSizeAES128)
         var moved = 0
+        let outCap = out.count
+        let inLen = input.count
+        let keyLen = key.count
         let status = out.withUnsafeMutableBytes { outBuf -> CCCryptorStatus in
             input.withUnsafeBytes { inBuf -> CCCryptorStatus in
                 key.withUnsafeBytes { keyBuf -> CCCryptorStatus in
@@ -448,10 +451,10 @@ final class Direction {
                         // options = 0: CBC without padding (we pad ourselves)
                         CCCrypt(CCOperation(encrypt ? kCCEncrypt : kCCDecrypt),
                                 CCAlgorithm(kCCAlgorithmAES), CCOptions(0),
-                                keyBuf.baseAddress, key.count,
+                                keyBuf.baseAddress, keyLen,
                                 ivBuf.baseAddress,
-                                inBuf.baseAddress, input.count,
-                                outBuf.baseAddress, out.count, &moved)
+                                inBuf.baseAddress, inLen,
+                                outBuf.baseAddress, outCap, &moved)
                     }
                 }
             }
