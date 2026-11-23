@@ -9,6 +9,7 @@ import SwiftUI
 import CoreBluetooth
 import Photos
 import UIKit
+import UniformTypeIdentifiers
 
 @main
 struct GlassesApp: App {
@@ -324,8 +325,32 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: export
 
-    func shareOwner() {
-        let url = OwnerMaterial.defaultURL
+    /// Copies an owner bundle picked in the Files app into Documents, then loads it.
+    func importOwner(from url: URL) {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            let data = try Data(contentsOf: url)
+            guard let parsed = try? OwnerMaterial.load(from: try writeTemp(data)) else {
+                note("解析失败——确认选的是 owner-export.json")
+                return
+            }
+            try data.write(to: OwnerMaterial.defaultURL, options: .atomic)
+            owner = parsed.0
+            ownerLine = "owner key: 已导入 \(parsed.1.serial)"
+            note("已导入 owner-export.json（\(parsed.1.serial)）")
+        } catch {
+            note("导入失败：\(error)")
+        }
+    }
+
+    private func writeTemp(_ data: Data) throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("import-owner.json")
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+
+    func shareOwner() {        let url = OwnerMaterial.defaultURL
         guard FileManager.default.fileExists(atPath: url.path) else {
             note("还没有 owner-export.json（provision 成功后才会有）")
             return
@@ -510,6 +535,7 @@ struct ContentView: View {
     @State private var question = "我面前有什么？有台阶或障碍物吗？"
     @State private var showLogin = false
     @State private var showSettings = false
+    @State private var showImport = false
 
     var body: some View {
         NavigationStack {
@@ -533,6 +559,7 @@ struct ContentView: View {
                          + "成功后 owner-export.json 会弹出来，务必存到 iCloud。")
                         .font(.caption).foregroundStyle(.secondary)
                     Button("导出 owner-export.json") { g.shareOwner() }
+                    Button("从文件 App 导入 owner-export.json") { showImport = true }
                 }
 
                 Section("3 · 相册 / 拍照") {
@@ -618,6 +645,12 @@ struct ContentView: View {
             }
             .sheet(item: $g.share) { box in ActivityView(url: box.url) }
             .sheet(isPresented: $showSettings) { SettingsView(g: g) }
+            .fileImporter(isPresented: $showImport, allowedContentTypes: [.json]) { result in
+                switch result {
+                case .success(let url): g.importOwner(from: url)
+                case .failure(let error): g.note("选文件失败：\(error.localizedDescription)")
+                }
+            }
         }
     }
 }
