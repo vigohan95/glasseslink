@@ -8,6 +8,7 @@
 import SwiftUI
 import AVFoundation
 import CoreBluetooth
+import CryptoKit
 import Photos
 import UIKit
 import UniformTypeIdentifiers
