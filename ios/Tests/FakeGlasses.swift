@@ -78,8 +78,9 @@ final class FakeGlasses {
     // MARK: - handshake
 
     private func runHandshake() throws {
-        // 1. the phone opens with RequestEncryption
+        log("h1 waiting for RequestEncryption")
         let req = try readPlain(timeout: 20)
+        log("h1 got \(req.count)B")
         let first = try DataX.parse(req)
         guard first.channel == DataX.chSetup, first.service == 5, first.type == 1 else {
             throw LinkError.unexpected("expected RequestEncryption, got ch=0x\(String(first.channel, radix: 16))")
@@ -91,14 +92,16 @@ final class FakeGlasses {
         phonePub = pub
         phoneChallenge = challenge
 
+        log("h2 answering with our key")
         // 2. answer with our own key + challenge
         let glassKey = P256.KeyAgreement.PrivateKey()
         owner = OwnerMaterial(scalar: glassKey.rawRepresentation)
         let ourChallenge = Data.random(16)
         try write(try AirShield.requestEncryption(pubkey: owner.publicKeyXy, challenge: ourChallenge))
 
-        // 3. the phone replies with EnableEncryption carrying its seed and IV
+        log("h3 sent ours, waiting for EnableEncryption")
         let en = try readPlain(timeout: 20)
+        log("h3 got \(en.count)B")
         let second = try DataX.parse(en)
         guard second.channel == DataX.chSetupMirror, second.type == 2 else {
             throw LinkError.unexpected("expected EnableEncryption")
@@ -110,6 +113,7 @@ final class FakeGlasses {
         phoneSeed = seed
         phoneIV = iv
 
+        log("h4 announce ours")
         // 4. announce ours, then both sides derive the mirrored schedule
         let ourSeed = Data.random(32)
         let ourIV = Data.random(16)
@@ -129,10 +133,12 @@ final class FakeGlasses {
                                            glassesPubkey: owner.publicKeyXy,
                                            seed: phoneSeed, phonePubkey: phonePub)
 
-        guard expectTrust else { return }     // provisioning link: no trust round at all
+        log("h5 keys derived")
+        guard expectTrust else { log("h5 no-trust, returning"); return }     // provisioning link: no trust round at all
 
-        // 5. trust: verify the phone proved it holds the owner key
+        log("h6 waiting for EnableTrust")
         let trustMsg = try readSealed(timeout: 20)
+        log("h6 got \(trustMsg.count)B")
         let t = try DataX.parse(trustMsg)
         guard t.service == AirShield.svcIdentity, t.type == Int(AirShield.idEnableTrust) else {
             throw LinkError.unexpected("expected EnableTrust, got type \(t.type.map(String.init) ?? "-")")
