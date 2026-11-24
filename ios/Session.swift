@@ -304,6 +304,10 @@ final class Session {
 
     private var send: Direction?
     private var recv: Direction?
+    /// Plausible receive-direction keys, built at handshake time and resolved by the
+    /// first inbound frame (see `recvMessage`).
+    private var rxOptions: [RxCandidate] = []
+    private var rxSolved = false
     private var nextChannel = chLocalFirst
     private var channels: [UInt16: String] = [:]
     private var idChannel: UInt16?
@@ -351,19 +355,81 @@ final class Session {
         }
     }
 
+    struct RxCandidate {
+        let label: String
+        let dir: AirShield.Direction
+    }
+
+    /// Every combination the receive direction could plausibly use on a link where the
+    /// peer never announced its own seed/IV.
+    static func receiveCandidates(shared: Data, ownChallenge: Data, ownSeed: Data,
+                                  peerChallenge: Data, peerSeed: Data,
+                                  ownIV: Data, peerIV: Data, peerBase: UInt32,
+                                  ownBase: UInt32, quirks: AirShield.Quirk,
+                                  multikey: Bool) -> [RxCandidate] {
+        let pairs: [(String, Data, Data)] = [
+            ("seed:own/chal:peer", ownSeed, peerChallenge),
+            ("seed:peer/chal:own", peerChallenge, ownSeed),
+            ("seed:own/chal:own", ownChallenge, ownSeed),
+            ("seed:peer/chal:peer", peerSeed, peerChallenge),
+        ]
+        let ivs: [(String, Data)] = [
+            ("iv:own", ownIV),
+            ("iv:zero", Data(repeating: 0, count: 16)),
+            ("iv:peer", peerIV),
+        ]
+        var seqs: [(String, UInt32)] = [("seq:0", 0), ("seq:ownBase", ownBase)]
+        if peerBase != 0 { seqs.append(("seq:peerBase", peerBase)) }
+
+        var out: [RxCandidate] = []
+        for (pn, nonce, seedValue) in pairs {
+            guard !nonce.isEmpty, !seedValue.isEmpty else { continue }
+            for (ivn, ivValue) in ivs {
+                guard ivValue.count == 16 else { continue }
+                for (sn, seq) in seqs {
+                    guard let k = try? AirShield.deriveKeys(shared: shared, nonce: nonce, seed: seedValue,
+                                                            iv: ivValue, quirks: quirks, multikey: multikey)
+                    else { continue }
+                    out.append(RxCandidate(label: "\(pn) \(ivn) \(sn)",
+                                           dir: AirShield.Direction(k, seq: seq)))
+                }
+            }
+        }
+        return out
+    }
+
+    /// Try each candidate key against one encrypted frame. A wrong key fails the HMAC,
+    /// so at most one candidate can succeed — no guessing in the caller.
+    static func firstWorkingCandidate(_ sdu: Data, options: [RxCandidate])
+        -> (label: String, dir: AirShield.Direction, plain: Data)? {
+        for option in options {
+            if let plain = try? option.dir.open(sdu) {
+                return (option.label, option.dir, plain)
+            }
+        }
+        return nil
+    }
+
     private func recvMessage(timeout: TimeInterval) throws -> DataX.Message {
         while true {
             let sdu = try stream.nextFrame(timeout: timeout)
-            let plain: Data
+            var plain: Data
             if let r = recv {
-                do {
-                    plain = try r.open(sdu)
-                } catch {
-                    // A decrypt failure is the single most common real-device symptom,
-                    // so keep the raw bytes: they tell us whether the keys disagree or
-                    // the framing is off by a byte.
-                    emit("decrypt FAILED (\(error))", sdu, inbound: true)
-                    throw error
+                if let opened = try? r.open(sdu) {
+                    plain = opened
+                } else if !rxSolved, let hit = Self.firstWorkingCandidate(sdu, options: rxOptions) {
+                    // The frame nominate its own key: its HMAC verifies under exactly one
+                    // combination, and from then on the session keeps that one.
+                    recv = hit.dir
+                    rxSolved = true
+                    plain = hit.plain
+                    emit("rx key = \(hit.label)", nil, inbound: true)
+                } else {
+                    // A decrypt failure is the single most common real-device symptom, so
+                    // keep the raw bytes: they tell us whether the keys disagree or the
+                    // framing is off by a byte.
+                    emit("decrypt FAILED (bad MAC on \(sdu.count)B)", sdu, inbound: true)
+                    throw LinkError.badMAC
                 }
             } else {
                 plain = sdu
@@ -468,6 +534,18 @@ final class Session {
         send = keys.send
         recv = keys.recv
         send?.seq = baseSeq
+
+        // Gen 2 never sends EnableEncryption of its own, so the "peer seed / peer IV" the
+        // book says to use for the receive direction does not exist on this link. That
+        // leaves three real unknowns (which 32-byte value plays the nonce, which IV the
+        // glasses start from, where its sequence begins). Instead of guessing once and
+        // failing with bad MAC forever, prepare the plausible combinations; the first
+        // frame the glasses send decides — its HMAC verifies under exactly one of them.
+        rxOptions = Self.receiveCandidates(shared: shared, ownChallenge: challenge, ownSeed: seed,
+                                           peerChallenge: req.challenge, peerSeed: en.seed,
+                                           ownIV: iv, peerIV: en.iv, peerBase: en.base,
+                                           ownBase: baseSeq, quirks: quirks, multikey: multikey)
+        emit("rx candidates: \(rxOptions.count)")
         peerPubkey = req.pub
         binding = AirShield.channelBinding(glassesChallenge: req.challenge, glassesPubkey: req.pub,
                                            seed: seed, phonePubkey: pub)
