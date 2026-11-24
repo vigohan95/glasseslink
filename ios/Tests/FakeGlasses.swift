@@ -189,7 +189,8 @@ final class FakeGlasses {
             } catch {
                 return                      // the test finished; silence is normal
             }
-            let m = try DataX.parse(plain)
+            let m: DataX.Message
+            do { m = try DataX.parse(plain) } catch { continue }   // a stray frame must not end the peer
             let svc = m.service, type = m.type
 
             // the provisioning link skips trust, so EndLinkSetup arrives here instead
@@ -197,7 +198,10 @@ final class FakeGlasses {
                 try send(DataX.message(DataX.chSetupMirror,
                                        tags: [DataX.tag(2, 0x1000, last: true)]))
                 let ack = try DataX.parse(try readSealed(timeout: 20))
-                guard ack.error == Int(AirShield.stOK) else {
+                // 0x1000 is the success code on the mirror channel; 0x0000 also shows up on
+                // plain data frames. Checking only one of them is what made this peer
+                // reject a correct ack (and the same mistake existed in Session once).
+                guard ack.error == Int(AirShield.stOK) || ack.error == Int(AirShield.stSuccess) else {
                     throw LinkError.unexpected("EndLinkSetup not acked (0x\(String(ack.error ?? -1, radix: 16)))")
                 }
                 sawEndLinkStatus = true

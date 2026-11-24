@@ -97,10 +97,6 @@ final class SessionLoopbackTests: XCTestCase {
     /// The provisioning link skips trust entirely: the glasses do not know our key yet,
     /// which is exactly why the owner can be moved onto a new device without Meta.
     func testHandshakeWithoutTrust() throws {
-        // The pipe canary passes, so the transport is fine; what still kills the host is the
-        // fake peer's own side of the setup link. Kept skip until it is rewritten against
-        // pi/selftest_session.py (see BUGLOG J).
-        try XCTSkip("fake peer is not a faithful setup server yet; the transport canary covers the pipe")
         let owner = OwnerMaterial(scalar: Data((0 ..< 32).map { UInt8($0 + 1) }))
         let (phoneStream, glassStream) = SDUStream.loopbackPair()
         // KNOWN ISSUE (2026-11-23): the setup-only link still hangs against the fake peer
