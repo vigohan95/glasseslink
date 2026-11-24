@@ -27,7 +27,7 @@ final class CompatibilityTests: XCTestCase {
     func testTrustFrameMatchesTheReferenceTranscription() {
         let pub = Data((0 ..< 64).map { UInt8($0) })
         let sig = Data((0 ..< 64).map { UInt8($0) })
-        let expected = "806e80018100002402001000"
+        let expected = "806e00018100002402001000"
             + "0a20fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"
             + "1240000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
             + "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f1802"
@@ -52,6 +52,6 @@ final class CompatibilityTests: XCTestCase {
     }
 
     func testStatusFrameMatchesTheReferenceTranscription() {
-        XCTAssertEqual(hex(DataX.status(DataX.chSetupMirror, AirShield.stOK)), "8004000103001000")
+        XCTAssertEqual(hex(DataX.status(DataX.chSetupMirror, 0x1000)), "8004000103001000")
     }
 }

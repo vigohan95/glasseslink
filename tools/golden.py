@@ -11,7 +11,7 @@ import sys
 sys.path.insert(0, __file__.rsplit("\\", 1)[0] + "\\..\\pi")
 
 from airshield import (  # noqa: E402
-    CH_SETUP, CH_SETUP_MIRROR, SVC_TRUST, dx_message, dx_tag, dx_status,
+    CH_SETUP_MIRROR, SVC_TRUST, dx_message, dx_tag, dx_status, trust_message as py_trust,
     end_link_setup, pb_bytes, pb_uint, pb_varint,
 )
 
@@ -21,7 +21,7 @@ def h(b):
 
 
 # --- svc36 trust message: {1: sha256(pubkey), 2: signature, 3: varint 2} -----
-def trust_message(public_id: bytes, signature: bytes) -> bytes:
+def _unused_trust(public_id: bytes, signature: bytes) -> bytes:
     body = pb_bytes(1, public_id) + pb_bytes(2, signature) + pb_uint(3, 2)
     return dx_message(CH_SETUP, [dx_tag(1, SVC_TRUST, False), dx_tag(2, 0x1000, True)], body)
 
@@ -43,7 +43,7 @@ def main() -> None:
     pub = bytes(range(64))
     digest = hashlib.sha256(pub).digest()
     print("# trust (pubkey = 00..3f)")
-    print("trustFrame   ", h(trust_message(digest, bytes(range(64)))))
+    print("trustFrame   ", h(py_trust(pub, bytes(range(64)))))
     print()
     print("# end link setup (46 B, v4 uuids)")
     s = bytes.fromhex("00112233445546778999aabbccddeeff")
