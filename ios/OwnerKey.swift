@@ -107,6 +107,16 @@ struct OwnerMaterial {
     /// signs the digest verbatim, so the binding is wrapped in one before signing.
     func signRaw(digest: Data) throws -> Data {
         precondition(digest.count == 32, "binding digest is SHA-256")
+        // Security is the reference implementation when the platform will hand us the
+        // key; only fall back to our own arithmetic when it will not (simulator).
+        if let key = try? secPrivateKey() {
+            var error: Unmanaged<CFError>?
+            if let sig = SecKeyCreateSignature(key, .ecdsaSignatureDigestX962SHA256,
+                                               digest as CFData, &error) {
+                let raw = Self.derToRaw(sig as Data)
+                if raw.count == 64 { return raw }
+            }
+        }
         var nonce = Data(count: 32)
         _ = nonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
         return try signRaw(digest: digest, nonce: nonce)
