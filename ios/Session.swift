@@ -97,24 +97,34 @@ final class SDUStream: NSObject, StreamDelegate {
     }
 
     /// Block until one complete SDU is available.
+    /// Block until one whole SDU is buffered.
+    ///
+    /// Deliberately pumps the current run loop instead of parking on the condition variable:
+    /// the streams are scheduled on the main run loop, so a caller that blocked its own queue
+    /// would starve the very callbacks that feed this buffer (and the in-process loopback used
+    /// by the tests would never make progress either). The condition variable still wakes us
+    /// early when `feed` arrives from another thread.
     func nextFrame(timeout: TimeInterval) throws -> Data {
         let deadline = Date().addingTimeInterval(timeout)
-        cond.lock()
-        defer { cond.unlock() }
         while true {
-            if closed { throw LinkError.io("stream closed\(lastError.map { ": \($0)" } ?? "")") }
-            if let need = Self.frameLength(buf) {
-                if buf.count >= need {
-                    let frame = Data(buf.prefix(need))
-                    buf.removeFirst(need)
-                    return frame
-                }
+            cond.lock()
+            if closed {
+                let why = lastError.map { ": \($0)" } ?? ""
+                cond.unlock()
+                throw LinkError.io("stream closed\(why)")
             }
-            if !cond.wait(until: min(deadline, Date().addingTimeInterval(0.25))) {
-                if Date() >= deadline {
-                    throw LinkError.unexpected("timeout waiting for a frame (folded? out of range?)")
-                }
+            if let need = Self.frameLength(buf), buf.count >= need {
+                let frame = Data(buf.prefix(need))
+                buf.removeFirst(need)
+                cond.unlock()
+                return frame
             }
+            cond.unlock()
+
+            if Date() >= deadline {
+                throw LinkError.unexpected("timeout waiting for a frame (folded? out of range?)")
+            }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
         }
     }
 

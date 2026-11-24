@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 
 API = "https://api.anthropic.com/v1/messages"
-DEFAULT_MODEL = "claude-fable-5-2"
+DEFAULT_MODEL = "claude-opus-4-6"
 
 
 def key() -> str:
