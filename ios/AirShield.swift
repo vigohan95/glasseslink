@@ -344,10 +344,10 @@ enum AirShield {
     }
 
     static func deriveKeys(shared: Data, nonce: Data, seed: Data, iv: Data,
-                           quirks: Quirk, multikey: Bool = false) -> Keys {
+                           quirks: Quirk, multikey: Bool = false) throws -> Keys {
         guard shared.count == 32 else {
-        throw LinkError.unexpected("deriveKeys: shared=\(shared.count)B")
-    }
+            throw LinkError.unexpected("deriveKeys: shared=\(shared.count)B")
+        }
         let saltAES = Data(SHA256.hash(data: nonce + seed))
         let saltHMAC = Data(SHA256.hash(data: seed + nonce + Data("hmac_derive".utf8)))
         let prk = Data(HMAC<SHA256>.authenticationCode(for: shared, using: SymmetricKey(data: saltAES)))
@@ -374,10 +374,10 @@ enum AirShield {
     static func sessionKeys(shared: Data, ownChallenge: Data, ownSeed: Data,
                             peerChallenge: Data, peerSeed: Data,
                             ownIV: Data, peerIV: Data, peerBaseSeq: UInt32,
-                            quirks: Quirk, multikey: Bool = false) -> (send: Direction, recv: Direction) {
-        let s = deriveKeys(shared: shared, nonce: peerChallenge, seed: ownSeed, iv: ownIV,
+                            quirks: Quirk, multikey: Bool = false) throws -> (send: Direction, recv: Direction) {
+        let s = try deriveKeys(shared: shared, nonce: peerChallenge, seed: ownSeed, iv: ownIV,
                            quirks: quirks, multikey: multikey)
-        let r = deriveKeys(shared: shared, nonce: peerSeed, seed: ownChallenge, iv: peerIV,
+        let r = try deriveKeys(shared: shared, nonce: peerSeed, seed: ownChallenge, iv: peerIV,
                            quirks: quirks, multikey: multikey)
         return (Direction(s, seq: 0), Direction(r, seq: peerBaseSeq))
     }

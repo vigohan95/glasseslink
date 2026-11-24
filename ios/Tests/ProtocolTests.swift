@@ -154,9 +154,9 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(AirShieldPad.unpad(hello), Data("hello".utf8))
     }
 
-    func testDeriveKeys() {
+    func testDeriveKeys() throws {
         // pi: derive_keys(bytes(range(32)), bytes(range(16)), bytes(range(32,64)), 40..4f)
-        let keys = AirShield.deriveKeys(shared: bytes(0..<32), nonce: bytes(0..<16),
+        let keys = try AirShield.deriveKeys(shared: bytes(0..<32), nonce: bytes(0..<16),
                                         seed: bytes(32..<64), iv: bytes(0x40..<0x50),
                                         quirks: .none, multikey: false)
         let expected = hex("be4a1ce4657ac7e8b9605751cbe0e3ce5b741863b632edc8661dc7b62ac25497")
@@ -166,12 +166,12 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(keys.macWord, hex("02020000"))
     }
 
-    func testQCS7QuirksChangeMacWord() {
-        let keys = AirShield.deriveKeys(shared: bytes(0..<32), nonce: bytes(0..<16),
+    func testQCS7QuirksChangeMacWord() throws {
+        let keys = try AirShield.deriveKeys(shared: bytes(0..<32), nonce: bytes(0..<16),
                                         seed: bytes(32..<64), iv: bytes(0x40..<0x50),
                                         quirks: .qcs7, multikey: false)
         XCTAssertEqual(keys.macWord, hex("02020001"))
-        let plain = AirShield.deriveKeys(shared: bytes(0..<32), nonce: bytes(0..<16),
+        let plain = try AirShield.deriveKeys(shared: bytes(0..<32), nonce: bytes(0..<16),
                                          seed: bytes(32..<64), iv: bytes(0x40..<0x50),
                                          quirks: .none, multikey: false)
         XCTAssertNotEqual(keys.aes, plain.aes, "quirks change the HKDF info")

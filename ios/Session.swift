@@ -411,7 +411,7 @@ final class Session {
         }
         let baseSeq = UInt32((g[4]?.first as? Int) ?? 0)
 
-        let keys = AirShield.sessionKeys(shared: shared,
+        let keys = try AirShield.sessionKeys(shared: shared,
                                         ownChallenge: challenge, ownSeed: seed,
                                         peerChallenge: peerChallenge, peerSeed: peerSeed,
                                         ownIV: iv, peerIV: peerIV, peerBaseSeq: baseSeq,

@@ -122,9 +122,9 @@ final class FakeGlasses {
 
         let shared = try owner.sharedSecret(peerPubkeyXy: phonePub)
         // our send key == the phone's receive key, and vice versa
-        let sendKeys = AirShield.deriveKeys(shared: shared, nonce: ourSeed, seed: phoneChallenge,
+        let sendKeys = try AirShield.deriveKeys(shared: shared, nonce: ourSeed, seed: phoneChallenge,
                                             iv: ourIV, quirks: .none)
-        let recvKeys = AirShield.deriveKeys(shared: shared, nonce: ourChallenge, seed: phoneSeed,
+        let recvKeys = try AirShield.deriveKeys(shared: shared, nonce: ourChallenge, seed: phoneSeed,
                                             iv: phoneIV, quirks: .none)
         tx = Direction(sendKeys, seq: 0)
         rx = Direction(recvKeys, seq: 0)
