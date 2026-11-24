@@ -314,6 +314,14 @@ final class Glasses: NSObject, ObservableObject {
             trustLine = Glasses.explain(error)
             note("❌ 握手中断：\(error)")
             glassesLine = "握手失败：\(Glasses.explain(error))"
+            // Release the link on failure: otherwise the next tap only reports
+            // "链路已经打开了" and the user is stuck until the app is killed.
+            sess.close()
+            s.close()
+            channel = nil
+            connected = false
+            if let p = peripheral { central.cancelPeripheralConnection(p) }
+            note("已释放这条链路，可以直接再点一次")
         }
     }
 

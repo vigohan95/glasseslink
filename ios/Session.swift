@@ -464,16 +464,41 @@ final class Session {
         }
     }
 
+    /// Both directions of EndLinkSetup, in whatever order the glasses choose.
+    ///
+    /// The glasses ask us to set up the link and we answer with a bare status frame
+    /// (`0x1000`); separately, our own request is answered the same way. The old code only
+    /// looked at `type`, but a status frame carries an error code and no type at all, so it
+    /// sat there until the 12 s timeout — exactly what the wrist log showed.
     private func endLinkSetup(timeout: TimeInterval) throws {
         let frame = try AirShield.endLinkSetup(streamUUID: streamUUID, linkUUID: linkUUID)
         emit("EndLinkSetup (\(frame.count)B)")
         try sendAny(frame)
-        while true {
-            let m = try recvMessage(timeout: timeout)
-            if m.type == 0x1000 { break }
+
+        var answeredPeer = false
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let m = try recvMessage(timeout: max(0.5, deadline.timeIntervalSinceNow))
+
+            if let code = m.error {
+                guard code == Int(AirShield.stSuccess) || code == Int(AirShield.stOK) else {
+                    throw LinkError.serviceError(step: "EndLinkSetup",
+                                                 code: UInt16(truncatingIfNeeded: code))
+                }
+                if !answeredPeer {
+                    try sendAny(AirShield.endLinkStatus)
+                    answeredPeer = true
+                }
+                emit("link up")
+                return
+            }
+            if m.type == 0x1000, !answeredPeer {
+                try sendAny(AirShield.endLinkStatus)
+                answeredPeer = true
+                emit("answered the glasses' own EndLinkSetup")
+            }
         }
-        try sendAny(AirShield.endLinkStatus)
-        emit("link up")
+        throw LinkError.unexpected("EndLinkSetup: no status frame from the glasses")
     }
 
     // MARK: long-lived service channels (streaming)
