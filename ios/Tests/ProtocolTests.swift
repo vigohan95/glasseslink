@@ -23,10 +23,7 @@ final class ProtocolTests: XCTestCase {
     /// verbatim. tools/p256_ref.py is the executable spec: it produces r||s for the same
     /// digest with a fixed nonce and checks it with `cryptography`'s prehashed verifier.
     func testSignsTheDigestVerbatim() throws {
-        // KNOWN ISSUE: large-scalar multiplication diverges from tools/p256_ref.py even
-        // though 2G/3G/255G/65535G match, so the custom signer is not trusted yet. The
-        // app tries Security first and only falls back to this; the device decides.
-        XCTExpectFailure("custom P-256 scalar multiplication is still wrong for large k")
+
         // tools/p256_ref.py produced this r||s for exactly these inputs and confirmed with
         // `cryptography`'s Prehashed verifier that it is a NONEwithECDSA signature.
         let scalar = Data(hex: "0a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829")

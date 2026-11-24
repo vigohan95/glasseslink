@@ -176,8 +176,10 @@ enum P256Field {
     static func words(_ data: Data) -> Word {
         var out = zero
         let bytes = [UInt8](data)
+        // limbs are little-endian (limb 0 holds the least significant four bytes), the same
+        // order the constants above are written in, so the byte index maps straight across.
         for i in 0 ..< min(32, bytes.count) {
-            let idx = 8 - 1 - i / 4
+            let idx = i / 4
             out[idx] |= UInt32(bytes[bytes.count - 1 - i]) << UInt32((i % 4) * 8)
         }
         return out
