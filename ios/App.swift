@@ -1,9 +1,9 @@
-﻿// App.swift 鈥?the iPhone talks to the glasses by itself.
+// App.swift — the iPhone talks to the glasses by itself.
 //
-//   scan 鈫?connect 鈫?L2CAP(PSM 128) 鈫?AirShield handshake
-//        鈫?(once) become owner via svc36 + Meta   鈫?afterwards: trust
-//        鈫?capture list 鈫?pull newest photo over the encrypted link
-//        鈫?ask your own model about it (any OpenAI-compatible endpoint)
+//   scan → connect → L2CAP(PSM 128) → AirShield handshake
+//        → (once) become owner via svc36 + Meta   → afterwards: trust
+//        → capture list → pull newest photo over the encrypted link
+//        → ask your own model about it (any OpenAI-compatible endpoint)
 
 import SwiftUI
 import CoreBluetooth
@@ -39,11 +39,11 @@ final class Glasses: NSObject, ObservableObject {
     @Published var devices: [ScanEntry] = []
     private var scanTimer: Timer?
     private var scanRound = 0
-    private var scanRounds = 4
+    private let scanRounds = 6
     @Published var connected = false
     @Published var busy = false
-    @Published var ownerLine = "owner key: 鏈煡"
-    @Published var glassesLine = "鏈繛鎺?
+    @Published var ownerLine = "owner key: 未知"
+    @Published var glassesLine = "未连接"
     @Published var lastPhoto: Data?
     @Published var answer = ""
     @Published var share: ShareBox?
@@ -57,7 +57,7 @@ final class Glasses: NSObject, ObservableObject {
     @Published var recording = false
     @Published var lastVideo: Data?
     @Published var live: LiveStream?
-    @Published var liveLine = "鈥?
+    @Published var liveLine = "—"
     @Published var selfTestLines: [SelfTest.Line] = []
     @Published var selfTestBad = 0
     @Published var showSelfTest = false
@@ -84,24 +84,24 @@ final class Glasses: NSObject, ObservableObject {
                                    options: [CBCentralManagerOptionRestoreIdentifierKey: "dev.local.glasseslink.central"])
         if let k = OwnerMaterial.loadFromKeychain() {
             owner = k
-            ownerLine = "owner key: 宸茶浇鍏?\(k.publicKeyXy.hexShort)"
+            ownerLine = "owner key: 已载入 \(k.publicKeyXy.hexShort)"
         } else if let (k, b) = try? OwnerMaterial.load(from: OwnerMaterial.defaultURL) {
             owner = k
-            ownerLine = "owner key: 浠庢枃浠跺鍏?\(b.serial)"
+            ownerLine = "owner key: 从文件导入 \(b.serial)"
         } else {
-            ownerLine = "owner key: 娌℃湁鈥斺€斿厛鐐广€屾垚涓轰富浜恒€?
+            ownerLine = "owner key: 没有——先点「成为主人」"
         }
-        note("鍚姩銆俹wner=\(owner == nil ? "鏃? : "鏈?)")
+        note("启动。owner=\(owner == nil ? "无" : "有")")
     }
 
     /// Runs the checks that only this phone can answer (key import, both signing paths,
     /// ECDH) and pushes every line into the log so it can be shared after a failed connect.
     func runSelfTest() {
         let lines = SelfTest.run()
-        note("鈥斺€?鑷寮€濮?鈥斺€?)
-        for l in lines { note("\(l.ok ? "鉁? : "鉁?) \(l.text)") }
+        note("—— 自检开始 ——")
+        for l in lines { note("\(l.ok ? "✓" : "✗") \(l.text)") }
         let bad = lines.filter { !$0.ok }.count
-        note("鈥斺€?鑷缁撴潫锛歕(lines.count) 椤癸紝澶辫触 \(bad) 鈥斺€?)
+        note("—— 自检结束：\(lines.count) 项，失败 \(bad) ——")
         // Also show it as a sheet: the log area is easy to miss on first run.
         selfTestLines = lines
         selfTestBad = bad
@@ -130,19 +130,18 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: scan / connect
 
-    /// Keeping the glasses advertising while you fiddle with them matters more than a tidy
-    /// one-shot scan: the two of you are never in sync, so scan in a few rounds instead.
-    func startScan(rounds: Int = 4) {
-        guard central.state == .poweredOn else { note("钃濈墮涓嶅彲鐢細\(central.state.rawValue)"); return }
+    /// Scanning in rounds instead of once: getting the glasses into pairing mode and starting
+    /// the scan are never in sync, and the glasses only announce themselves for a moment.
+    func startScan() {
+        guard central.state == .poweredOn else { note("蓝牙不可用：\(central.state.rawValue)"); return }
         devices.removeAll()
         scanRound = 0
-        scanRounds = rounds
         beginScanRound()
     }
 
     private func beginScanRound() {
         scanRound += 1
-        note("绗?\(scanRound)/\(scanRounds) 杞壂鎻忥紙姣忚疆 15 绉掞級鈥︾溂闀滄姌鍙犲悗闀挎寜鎷嶆憚閿?5 绉掑埌鎸囩ず鐏棯钃?)
+        note("第 \(scanRound)/\(scanRounds) 轮扫描（每轮 15 秒）…眼镜折叠后长按拍摄键 5 秒到指示灯闪蓝")
         // Duplicates must stay ON: the glasses announce themselves in a short burst and
         // then go quiet, so a scan started a second too early would otherwise never see them.
         central.scanForPeripherals(withServices: nil,
@@ -152,7 +151,7 @@ final class Glasses: NSObject, ObservableObject {
             Task { @MainActor in
                 self.central.stopScan()
                 if self.devices.contains(where: { $0.isGlasses }) {
-                    self.note("鎵惧埌鐪奸暅浜嗭紝鐐瑰垪琛ㄦ渶涓婇潰閭ｆ潯杩炴帴")
+                    self.note("看到眼镜了，点列表最上面那条")
                     return
                 }
                 if self.scanRound < self.scanRounds {
@@ -160,9 +159,10 @@ final class Glasses: NSObject, ObservableObject {
                     return
                 }
                 if self.devices.isEmpty {
-                    self.note("鍥涜疆閮芥病鎵埌浠讳綍璁惧锛氱‘璁よ摑鐗欏紑鐫€銆丟lassesLink 鏈夎摑鐗欐潈闄?)
+                    self.note("六轮都没扫到任何设备：确认蓝牙是开的、GlassesLink 有蓝牙权限")
                 } else {
-                    self.note("鎵埌 \(self.devices.count) 鍙拌澶囦絾閮芥病鏈夌溂闀溿€備袱涓師鍥狅細鈶?閭ｅ彴瀹夊崜杩樿繛鐫€瀹冿紙鍏虫帀瀹夊崜钃濈墮锛夆憽 鐪奸暅娌¤繘閰嶅妯″紡锛堟姌鍙?鈫?闀挎寜鎷嶆憚閿?5 绉?鈫?鎸囩ず鐏棯钃濓級")
+                    let unnamed = self.devices.filter { $0.name == "?" }.count
+                    self.note("扫到 \(self.devices.count) 台设备（其中 \(unnamed) 台没报名字、按厂商号通常是眼镜的）但没有命中眼镜名。两个原因：① 安卓还连着它（关掉安卓蓝牙）② 眼镜没进配对模式（折叠 → 长按拍摄键 5 秒 → 指示灯闪蓝）")
                 }
             }
         }
@@ -170,41 +170,41 @@ final class Glasses: NSObject, ObservableObject {
 
     func connect(_ id: UUID) {
         guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
-            note("鎵句笉鍒拌繖鍙拌澶囷紙鍏堟壂鎻忥級"); return
+            note("找不到这台设备（先扫描）"); return
         }
         central.stopScan()
         peripheral = p
         p.delegate = self
         UserDefaults.standard.set(id.uuidString, forKey: "lastPeripheral")
-        note("杩炴帴 \(p.name ?? "?") 鈥?)
+        note("连接 \(p.name ?? "?") …")
         central.connect(p, options: nil)
     }
 
     /// The glasses stay paired at the iOS level, so a cold launch can go straight back to
-    /// the same peripheral without scanning 鈥?that is what makes "鎵撳紑灏辫兘鐢? work.
+    /// the same peripheral without scanning — that is what makes "打开就能用" work.
     func autoReconnect() {
         guard central.state == .poweredOn else { return }
         guard let saved = UserDefaults.standard.string(forKey: "lastPeripheral"),
               let id = UUID(uuidString: saved) else { return }
         guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
-            note("涓婃鐨勭溂闀滅幇鍦ㄤ笉鍦ㄧ郴缁熼噷锛岀偣銆屾壂鎻忋€嶄竴娆?)
+            note("上次的眼镜现在不在系统里，点「扫描」一次")
             return
         }
         peripheral = p
         p.delegate = self
-        note("鑷姩杩炴帴涓婃鐨勭溂闀?\(p.name ?? saved) 鈥?)
+        note("自动连接上次的眼镜 \(p.name ?? saved) …")
         central.connect(p, options: nil)
     }
 
     // MARK: link bring-up
 
     private func bringUp(trust: Bool) async {
-        guard let ch = channel else { note("娌℃湁 L2CAP 閫氶亾"); return }
+        guard let ch = channel else { note("没有 L2CAP 通道"); return }
         let s = SDUStream(channel: ch)
         s.onLog = { [weak self] in self?.note($0) }
         stream = s
         guard let own = owner else {
-            note("娌℃湁 owner key锛氳繖鏉￠摼璺彧鑳界敤鏉ヨ窇銆屾垚涓轰富浜恒€?)
+            note("没有 owner key：这条链路只能用来跑「成为主人」")
             return
         }
         let sess = Session(stream: s, owner: own, log: { [weak self] in self?.note($0) })
@@ -213,15 +213,15 @@ final class Glasses: NSObject, ObservableObject {
             try sess.handshake(trust: trust)
             connected = true
             if trust { UserDefaults.standard.set(true, forKey: "isOwner") }
-            glassesLine = "宸茶繛涓?路 trust=\(trust) 路 serial \(sess.peerSerial)"
-            note("鉁?鎻℃墜瀹屾垚")
+            glassesLine = "已连上 · trust=\(trust) · serial \(sess.peerSerial)"
+            note("✅ 握手完成")
         } catch {
-            note("鉂?鎻℃墜涓柇锛歕(error)")
-            glassesLine = "鎻℃墜澶辫触锛歕(error)"
+            note("❌ 握手中断：\(error)")
+            glassesLine = "握手失败：\(error)"
         }
     }
 
-    /// Connect without proving ownership 鈥?used before the first provisioning.
+    /// Connect without proving ownership — used before the first provisioning.
     func connectSetup() { Task { await bringUp(trust: false) } }
 
     /// Normal connect: prove we hold the owner key.
@@ -230,50 +230,50 @@ final class Glasses: NSObject, ObservableObject {
     // MARK: capture
 
     func loadCaptures() {
-        guard let sess = session else { note("鍏堣繛鎺?); return }
+        guard let sess = session else { note("先连接"); return }
         busy = true
         Task {
             defer { busy = false }
             do {
                 let caps = try sess.captureList()
                 captures = caps.sorted { ($0.timestampNS ?? 0) > ($1.timestampNS ?? 0) }
-                note("娓呭崟 \(caps.count) 鏉?)
+                note("清单 \(caps.count) 条")
             } catch {
-                note("璇绘竻鍗曞け璐ワ細\(error)")
+                note("读清单失败：\(error)")
             }
         }
     }
 
     /// Pulls one capture's best asset: the still for a photo, the first video asset otherwise.
     func fetch(_ captureItem: Capture, saveToLibrary: Bool) {
-        guard let sess = session else { note("鍏堣繛鎺?); return }
+        guard let sess = session else { note("先连接"); return }
         let asset = captureItem.isPhoto
             ? (captureItem.stills.first ?? captureItem.assets.first)
             : (captureItem.assets.first { $0.type == 1 } ?? captureItem.assets.first)
         guard let asset else {
-            note("杩欐潯娌℃湁鍙紶鐨勮祫浜?)
+            note("这条没有可传的资产")
             return
         }
         busy = true
         Task {
             defer { busy = false }
             do {
-                note("鎷夊彇 \(captureItem.handle) / \(asset.uuid)锛圽(asset.size)B锛?)
+                note("拉取 \(captureItem.handle) / \(asset.uuid)（\(asset.size)B）")
                 try sess.requestAsset(handle: captureItem.handle, assetID: asset.uuid)
                 guard let transfer = try sess.receiveFile(timeout: 300) else {
-                    note("娌℃敹鍒版枃浠讹紙瀵圭娌″彂璧蜂紶杈擄級")
+                    note("没收到文件（对端没发起传输）")
                     return
                 }
-                note("鏀跺埌 \(transfer.name) \(transfer.size)B")
+                note("收到 \(transfer.name) \(transfer.size)B")
                 if transfer.data.prefix(2) == Data([0xFF, 0xD8]) {
                     lastPhoto = transfer.data
                     if saveToLibrary { saveToPhotos(transfer.data) }
                 } else {
                     lastVideo = transfer.data
-                    note("瑙嗛宸叉敹鍒帮紝鐢ㄣ€屽垎浜棰戙€嶅鍑?)
+                    note("视频已收到，用「分享视频」导出")
                 }
             } catch {
-                note("鍙栨枃浠跺け璐ワ細\(error)")
+                note("取文件失败：\(error)")
             }
         }
     }
@@ -281,18 +281,18 @@ final class Glasses: NSObject, ObservableObject {
     /// Press the glasses' shutter, then pull whatever landed. The glasses take a
     /// second or two to write the file, so this waits before asking for the list.
     func snap() {
-        guard let sess = session else { note("鍏堣繛鎺?); return }
+        guard let sess = session else { note("先连接"); return }
         busy = true
         Task {
             do {
                 try sess.shutterPhoto()
-                note("宸叉寜蹇棬锛岀瓑鐪奸暅鍐欐枃浠垛€?)
+                note("已按快门，等眼镜写文件…")
                 try? await Task.sleep(nanoseconds: 2_800_000_000)
                 busy = false
                 capture()
             } catch {
                 busy = false
-                note("蹇棬澶辫触锛歕(error)")
+                note("快门失败：\(error)")
             }
         }
     }
@@ -300,70 +300,70 @@ final class Glasses: NSObject, ObservableObject {
     /// Start or stop a recording through the same SNIntent path Visor uses.
     /// On stop it waits for the file and pulls it, like the photo path.
     func toggleRecording() {
-        guard let sess = session else { note("鍏堣繛鎺?); return }
+        guard let sess = session else { note("先连接"); return }
         let wasRecording = recording
         busy = true
         Task {
             do {
                 if wasRecording {
                     try sess.stopVideo()
-                    note("宸插彂鍋滄褰曞儚锛岀瓑鐪奸暅鏀跺熬鈥?)
+                    note("已发停止录像，等眼镜收尾…")
                     try? await Task.sleep(nanoseconds: 3_500_000_000)
                     recording = false
                     busy = false
                     loadCaptures()
                 } else {
                     try sess.startVideo()
-                    note("宸插彂寮€濮嬪綍鍍?)
+                    note("已发开始录像")
                     recording = true
                     busy = false
                 }
             } catch {
                 busy = false
-                note("褰曞儚鎺у埗澶辫触锛歕(error)")
+                note("录像控制失败：\(error)")
             }
         }
     }
 
     func capture() {
-        guard let sess = session else { note("鍏堣繛鎺?); return }
+        guard let sess = session else { note("先连接"); return }
         busy = true
         Task {
             defer { busy = false }
             do {
                 let caps = try sess.captureList()
-                note("娓呭崟 \(caps.count) 鏉?)
+                note("清单 \(caps.count) 条")
                 captures = caps.sorted { ($0.timestampNS ?? 0) > ($1.timestampNS ?? 0) }
                 guard let newest = caps.filter({ $0.isPhoto })
                         .max(by: { ($0.timestampNS ?? 0) < ($1.timestampNS ?? 0) }),
                       let still = newest.stills.first else {
-                    note("娓呭崟閲屾病鏈夌収鐗囪祫浜?)
+                    note("清单里没有照片资产")
                     return
                 }
-                note("鎷夊彇 \(newest.handle) / \(still.uuid) (\(still.size)B)")
+                note("拉取 \(newest.handle) / \(still.uuid) (\(still.size)B)")
                 try sess.requestAsset(handle: newest.handle, assetID: still.uuid)
                 if let t = try sess.receiveFile() {
                     lastPhoto = t.data
-                    note("鏀跺埌 \(t.name) \(t.size)B")
+                    note("收到 \(t.name) \(t.size)B")
                     saveToPhotos(t.data)
                 } else {
-                    note("娌℃敹鍒版枃浠讹紙瀵圭娌″彂璧蜂紶杈擄級")
+                    note("没收到文件（对端没发起传输）")
                 }
             } catch {
-                note("鍙栧浘澶辫触锛歕(error)")
+                note("取图失败：\(error)")
             }
         }
     }
 
     func refreshStatus() {
-        guard let sess = session else { note("鍏堣繛鎺?); return }
+        guard let sess = session else { note("先连接"); return }
         Task {
             do {
                 let s = try sess.subscribeStatus()
                 status = s
-                if s.lines.isEmpty { note("鐘舵€侊細鐪奸暅娌″洖璁惧鐘舵€?) }
+                if s.lines.isEmpty { note("状态：眼镜没回设备状态") }
             } catch {
-                note("鐘舵€佽鍙栧け璐ワ細\(error)")
+                note("状态读取失败：\(error)")
             }
         }
     }
@@ -375,7 +375,7 @@ final class Glasses: NSObject, ObservableObject {
 
     /// svc15 registration: after this the glasses' own wake word routes to this app.
     func startAssistant() {
-        guard let sess = session else { note("鍏堣繛鎺?); return }
+        guard let sess = session else { note("先连接"); return }
         guard assistantRef == nil else { return }
         let a = Assistant(session: sess)
         a.log = { [weak self] line in self?.note("asst: \(line)") }
@@ -383,8 +383,8 @@ final class Glasses: NSObject, ObservableObject {
             guard let self else { return }
             let client = ModelClient(baseURL: self.modelBaseURL, model: self.modelName)
             Task {
-                let q = "鐢ㄦ埛鍒氬敜閱掓櫤鑳界溂闀溿€傚彧鐢ㄤ竴鍙ヤ笉瓒呰繃 20 瀛楃殑绠€浣撲腑鏂囧洖搴旂敤鎴枫€?
-                let text = (try? await client.ask(question: q, jpeg: Data())) ?? "鎴戝湪銆?
+                let q = "用户刚唤醒智能眼镜。只用一句不超过 20 字的简体中文回应用户。"
+                let text = (try? await client.ask(question: q, jpeg: Data())) ?? "我在。"
                 a.complete(interaction: interaction, text: text)
             }
         }
@@ -393,8 +393,8 @@ final class Glasses: NSObject, ObservableObject {
             guard let self else { return }
             let client = ModelClient(baseURL: self.modelBaseURL, model: self.modelName)
             Task {
-                let q = "鐢ㄦ埛鎴寸潃鏅鸿兘鐪奸暅璇达細鈥淺(transcript)鈥濄€傜敤涓嶈秴杩?40 瀛楃殑绠€浣撲腑鏂囩洿鎺ュ洖绛旓紝涓嶇敤澶嶈堪闂銆?
-                let text = (try? await client.ask(question: q, jpeg: Data())) ?? "鎴戞病鍚竻锛屽啀璇翠竴閬嶏紵"
+                let q = "用户戴着智能眼镜说：“\(transcript)”。用不超过 40 字的简体中文直接回答，不用复述问题。"
+                let text = (try? await client.ask(question: q, jpeg: Data())) ?? "我没听清，再说一遍？"
                 a.complete(interaction: interaction, text: text)
             }
         }
@@ -403,9 +403,9 @@ final class Glasses: NSObject, ObservableObject {
             a.startLoop()
             assistantRef = a
             assistantOn = true
-            note("鍔╂墜鎺ョ宸插紑鍚?)
+            note("助手接管已开启")
         } catch {
-            note("鍔╂墜鎺ョ澶辫触锛歕(error)")
+            note("助手接管失败：\(error)")
         }
     }
 
@@ -413,29 +413,29 @@ final class Glasses: NSObject, ObservableObject {
         assistantRef?.stop()
         assistantRef = nil
         assistantOn = false
-        note("鍔╂墜鎺ョ宸插叧闂?)
+        note("助手接管已关闭")
     }
 
     // MARK: live
 
     func startLive() {
-        guard let sess = session else { note("鍏堣繛鎺?); return }
+        guard let sess = session else { note("先连接"); return }
         guard live == nil else { return }
         let l = LiveStream(session: sess)
         l.log = { [weak self] line in self?.note("live: \(line)") }
         l.onPhase = { [weak self] phase in
             self?.note("live phase: \(phase.rawValue)")
-            if phase == .failed { self?.liveLine = "澶辫触" }
+            if phase == .failed { self?.liveLine = "失败" }
         }
         l.onPhoto = { [weak self] photo in
             guard let self else { return }
             if let img = UIImage(data: photo.data) {
                 self.lastPhoto = photo.data
                 self.saveToPhotos(photo.data)
-                self.note("live 蹇収 \(photo.data.count)B 宸插瓨鐩稿唽")
+                self.note("live 快照 \(photo.data.count)B 已存相册")
                 _ = img
             } else {
-                self.note("live 蹇収 \(photo.data.count)B锛岀郴缁熻В涓嶄簡锛圽(photo.isHeic ? "HEIC" : "鏈煡")锛?)
+                self.note("live 快照 \(photo.data.count)B，系统解不了（\(photo.isHeic ? "HEIC" : "未知")）")
             }
         }
         live = l
@@ -444,7 +444,7 @@ final class Glasses: NSObject, ObservableObject {
         liveTicker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self, let l = self.live else { return }
             self.liveLine = "\(l.phase.rawValue) \(l.framesPerSecond)fps \(l.kbitPerSecond)kbit/s "
-                + "\(l.frames)甯? + (l.decodedSize.map { " \(Int($0.width))x\(Int($0.height))" } ?? "")
+                + "\(l.frames)帧" + (l.decodedSize.map { " \(Int($0.width))x\(Int($0.height))" } ?? "")
         }
     }
 
@@ -453,31 +453,31 @@ final class Glasses: NSObject, ObservableObject {
         liveTicker = nil
         live?.stop()
         live = nil
-        liveLine = "鈥?
+        liveLine = "—"
     }
 
     func shareVideo() {
-        guard let data = lastVideo else { note("杩樻病鏈夎棰?); return }
+        guard let data = lastVideo else { note("还没有视频"); return }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("capture.mp4")
         do {
             try data.write(to: url)
             share = ShareBox(url: url)
         } catch {
-            note("鍐欎复鏃舵枃浠跺け璐ワ細\(error)")
+            note("写临时文件失败：\(error)")
         }
     }
 
     private func saveToPhotos(_ data: Data) {
         PHPhotoLibrary.requestAuthorization { [weak self] status in
             guard status == .authorized || status == .limited else {
-                Task { @MainActor in self?.note("娌℃湁鐩稿唽鏉冮檺锛岀収鐗囧彧鍦?app 鍐?) }
+                Task { @MainActor in self?.note("没有相册权限，照片只在 app 内") }
                 return
             }
             PHPhotoLibrary.shared().performChanges {
                 let req = PHAssetCreationRequest.forAsset()
                 req.addResource(with: .photo, data: data, options: nil)
             } completionHandler: { ok, err in
-                let msg = ok ? "宸插瓨鍒扮浉鍐? : "瀛樼浉鍐屽け璐ワ細\(err?.localizedDescription ?? "?")"
+                let msg = ok ? "已存到相册" : "存相册失败：\(err?.localizedDescription ?? "?")"
                 Task { @MainActor in self?.note(msg) }
             }
         }
@@ -486,7 +486,7 @@ final class Glasses: NSObject, ObservableObject {
     // MARK: ask your own model
 
     func ask(_ question: String) {
-        guard let photo = lastPhoto else { note("鍏堟媿涓€寮?); return }
+        guard let photo = lastPhoto else { note("先拍一张"); return }
         UserDefaults.standard.set(modelBaseURL, forKey: "modelBaseURL")
         UserDefaults.standard.set(modelName, forKey: "modelName")
         busy = true
@@ -498,7 +498,7 @@ final class Glasses: NSObject, ObservableObject {
                     .ask(question: question, jpeg: photo)
                 answer = text
             } catch {
-                note("妯″瀷璋冪敤澶辫触锛歕(error)")
+                note("模型调用失败：\(error)")
             }
         }
     }
@@ -507,12 +507,12 @@ final class Glasses: NSObject, ObservableObject {
 
     func becomeOwner(userToken: String) {
         guard let sess = session else {
-            note("鍏堢偣銆岃繛鎺ワ紙setup 閾捐矾锛夈€嶏紝鍐嶇櫥褰?)
+            note("先点「连接（setup 链路）」，再登录")
             return
         }
         let key = owner ?? OwnerMaterial.generate()
         owner = key
-        ownerLine = "owner key: 鏂板缓 \(key.publicKeyXy.hexShort)"
+        ownerLine = "owner key: 新建 \(key.publicKeyXy.hexShort)"
         busy = true
         Task {
             defer { busy = false }
@@ -521,11 +521,11 @@ final class Glasses: NSObject, ObservableObject {
                                                                userToken: userToken,
                                                                log: { [weak self] in self?.note($0) })
                 UserDefaults.standard.set(true, forKey: "isOwner")
-                ownerLine = "owner key: 宸叉敞鍐?路 serial \(bundle.serial)"
-                note("鉁?杩欏彴 iPhone 鐜板湪鏄富浜恒€傛柇寮€閲嶈繛涓€娆¤蛋 trust 閾捐矾")
+                ownerLine = "owner key: 已注册 · serial \(bundle.serial)"
+                note("✅ 这台 iPhone 现在是主人。断开重连一次走 trust 链路")
                 shareOwner()
             } catch {
-                note("鉂?鏀?owner 澶辫触锛歕(error)")
+                note("❌ 改 owner 失败：\(error)")
             }
         }
     }
@@ -539,7 +539,7 @@ final class Glasses: NSObject, ObservableObject {
         do {
             let data = try Data(contentsOf: url)
             guard let parsed = try? OwnerMaterial.loadAny(from: try writeTemp(data)) else {
-                note("瑙ｆ瀽澶辫触鈥斺€旇 owner-export.json 鎴?Visor 瀵煎嚭鐨?visor-owner-*.json")
+                note("解析失败——要 owner-export.json 或 Visor 导出的 visor-owner-*.json")
                 return
             }
             // Normalise to owner-export.json so the next launch finds it without the original file.
@@ -547,10 +547,10 @@ final class Glasses: NSObject, ObservableObject {
             try normalised.write(to: OwnerMaterial.defaultURL, options: .atomic)
             try parsed.0.saveToKeychain()
             owner = parsed.0
-            ownerLine = "owner key: 宸插鍏?\(parsed.1.serial)"
-            note("宸插鍏?\(parsed.1.serial) 鐨?owner key锛堟潵婧愭枃浠跺彲鐩存帴鏄?Visor 瀵煎嚭鐨勯偅涓級")
+            ownerLine = "owner key: 已导入 \(parsed.1.serial)"
+            note("已导入 \(parsed.1.serial) 的 owner key（来源文件可直接是 Visor 导出的那个）")
         } catch {
-            note("瀵煎叆澶辫触锛歕(error)")
+            note("导入失败：\(error)")
         }
     }
 
@@ -562,7 +562,7 @@ final class Glasses: NSObject, ObservableObject {
 
     func shareOwner() {        let url = OwnerMaterial.defaultURL
         guard FileManager.default.fileExists(atPath: url.path) else {
-            note("杩樻病鏈?owner-export.json锛坧rovision 鎴愬姛鍚庢墠浼氭湁锛?)
+            note("还没有 owner-export.json（provision 成功后才会有）")
             return
         }
         share = ShareBox(url: url)
@@ -575,7 +575,7 @@ final class Glasses: NSObject, ObservableObject {
     /// Copies the log to the pasteboard so it can be pasted into a chat in one step.
     func copyLog() {
         UIPasteboard.general.string = log.reversed().joined(separator: "\n")
-        note("鏃ュ織宸插鍒跺埌鍓创鏉匡紙\(log.count) 琛岋級")
+        note("日志已复制到剪贴板（\(log.count) 行）")
     }
 
     // MARK: settings (svc33)
@@ -583,7 +583,7 @@ final class Glasses: NSObject, ObservableObject {
     /// Reads the whole settings namespace once and keeps it keyed by setting name.
     func loadSettings() {
         guard let sess = session, connected else {
-            note("鍏堣繛鎺ョ溂闀滐紝鍐嶈璁剧疆")
+            note("先连接眼镜，再读设置")
             return
         }
         settingsLoading = true
@@ -598,13 +598,13 @@ final class Glasses: NSObject, ObservableObject {
                     guard let self else { return }
                     self.settings = map
                     self.settingsLoading = false
-                    self.note("璁剧疆锛氳鍒?\(map.count) 椤?)
+                    self.note("设置：读到 \(map.count) 项")
                 }
             } catch {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.settingsLoading = false
-                    self.note("璁剧疆璇诲彇澶辫触锛歕(error)")
+                    self.note("设置读取失败：\(error)")
                 }
             }
         }
@@ -613,10 +613,10 @@ final class Glasses: NSObject, ObservableObject {
     /// Writes one setting and only reports success if the read-back agrees.
     func writeSetting(_ key: String, _ value: String) {
         guard let sess = session, connected else {
-            note("鍏堣繛鎺ョ溂闀滐紝鍐嶆敼璁剧疆")
+            note("先连接眼镜，再改设置")
             return
         }
-        note("鍐?\(key) = \(value)")
+        note("写 \(key) = \(value)")
         let schema = SettingsSchemaTable.schema(key)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
@@ -638,15 +638,15 @@ final class Glasses: NSObject, ObservableObject {
                     guard let self else { return }
                     if ok {
                         self.settings[key] = value
-                        self.note("\(key) 宸茬敓鏁?)
+                        self.note("\(key) 已生效")
                     } else {
-                        self.note("\(key) 鍐欒繘鍘讳簡浣嗚鍥炰笉涓€鑷达紙鍥轰欢鍙兘鎷掓敹锛?)
+                        self.note("\(key) 写进去了但读回不一致（固件可能拒收）")
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.note("鍐?\(key) 澶辫触锛歕(error)")
+                    self.note("写 \(key) 失败：\(error)")
                 }
             }
         }
@@ -660,10 +660,10 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
         Task { @MainActor in
             switch c.state {
             case .poweredOn:
-                note("钃濈墮灏辩华")
+                note("蓝牙就绪")
                 autoReconnect()
-            case .unauthorized: note("钃濈墮鏉冮檺琚嫆鈥斺€旀鏌?Info.plist")
-            case .poweredOff: note("钃濈墮鍏抽棴")
+            case .unauthorized: note("蓝牙权限被拒——检查 Info.plist")
+            case .poweredOff: note("蓝牙关闭")
             default: note("central state \(c.state.rawValue)")
             }
         }
@@ -678,9 +678,9 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             peripheral = restored
             restored.delegate = self
             if restored.state == .connected {
-                note("鍚庡彴鎭㈠锛歕(restored.name ?? "鐪奸暅") 浠嶈繛鐫€")
+                note("后台恢复：\(restored.name ?? "眼镜") 仍连着")
             } else {
-                note("鍚庡彴鎭㈠锛氶噸杩?\(restored.name ?? "鐪奸暅") 鈥?)
+                note("后台恢复：重连 \(restored.name ?? "眼镜") …")
                 c.connect(restored, options: nil)
             }
         }
@@ -688,20 +688,27 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     nonisolated func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
                                     advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? p.name ?? "?"
+        let localName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        let name = localName ?? p.name ?? "?"
         let services = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
-        // The glasses are the only thing here advertising Meta's service (0xfd5f) 鈥?everything
-        // else (car keys, printers) just floods the list and buries them.
+        let mfr = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data
+        // Meta registers company id 0x01AB (little-endian on the wire). The glasses often
+        // advertise without a local name at all, so this is the only reliable marker.
+        let metaMfr = (mfr?.count ?? 0) >= 2
+            && (UInt16(mfr![0]) | (UInt16(mfr![1]) << 8)) == 0x01AB
         let isGlasses = name.localizedCaseInsensitiveContains("meta")
             || name.localizedCaseInsensitiveContains("rb ")
+            || metaMfr
             || services.contains { $0.uuidString.lowercased().hasPrefix("fd5") }
-        let entry = ScanEntry(id: p.identifier, name: name, rssi: RSSI.intValue, isGlasses: isGlasses)
+        let shown = (name == "?" && isGlasses) ? "Meta 眼镜（无名广播）" : name
+        let entry = ScanEntry(id: p.identifier, name: shown, rssi: RSSI.intValue, isGlasses: isGlasses)
         Task { @MainActor in
             if let i = self.devices.firstIndex(where: { $0.id == p.identifier }) {
                 self.devices[i] = entry
             } else {
                 self.devices.append(entry)
-                self.note("鍙戠幇 \(name) rssi=\(RSSI)\(isGlasses ? " 鈫?鍍忕溂闀? : "")")
+                let tag = isGlasses ? " ← 像眼镜" : (metaMfr ? "" : "")
+                self.note("发现 \(shown) rssi=\(RSSI)\(tag)")
             }
             self.devices.sort { a, b in
                 if a.isGlasses != b.isGlasses { return a.isGlasses }
@@ -713,7 +720,7 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     nonisolated func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
         Task { @MainActor in
-            self.note("宸茶繛鎺ワ紝鎵撳紑 L2CAP PSM 0x\(String(self.psm, radix: 16))")
+            self.note("已连接，打开 L2CAP PSM 0x\(String(self.psm, radix: 16))")
             p.discoverServices(nil)
             p.openL2CAPChannel(self.psm)
         }
@@ -722,8 +729,8 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         Task { @MainActor in
             self.connected = false
-            self.glassesLine = "鏂紑"
-            self.note("鏂紑锛歕(error?.localizedDescription ?? "姝ｅ父")")
+            self.glassesLine = "断开"
+            self.note("断开：\(error?.localizedDescription ?? "正常")")
         }
     }
 
@@ -736,7 +743,7 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func peripheral(_ p: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
         Task { @MainActor in
             guard let ch = channel else {
-                self.note("L2CAP 鎵撳紑澶辫触锛歕(error?.localizedDescription ?? "?")")
+                self.note("L2CAP 打开失败：\(error?.localizedDescription ?? "?")")
                 return
             }
             self.channel = ch
@@ -795,7 +802,7 @@ struct ModelClient {
 
 struct ContentView: View {
     @StateObject private var g = Glasses()
-    @State private var question = "鎴戦潰鍓嶆湁浠€涔堬紵鏈夊彴闃舵垨闅滅鐗╁悧锛?
+    @State private var question = "我面前有什么？有台阶或障碍物吗？"
     @State private var showLogin = false
     @State private var showSettings = false
     @State private var showImport = false
@@ -806,13 +813,13 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("鐘舵€?) {
+                Section("状态") {
                     Text(g.ownerLine).font(.footnote)
                     Text(g.glassesLine).font(.footnote).foregroundStyle(.secondary)
                 }
 
-                Section("1 路 杩炵溂闀?) {
-                    Button("鎵弿闄勮繎鐪奸暅") { g.startScan() }
+                Section("1 · 连眼镜") {
+                    Button("扫描附近眼镜") { g.startScan() }
                     ForEach(g.devices, id: \.id) { d in
                         Button {
                             g.connect(d.id)
@@ -827,47 +834,47 @@ struct ContentView: View {
                             }
                         }
                     }
-                    Text("鐪奸暅鎺掑湪鍓嶉潰锛堟湁鐪奸暅鍥炬爣锛夈€傚垪琛ㄩ噷娌℃湁 `RB Meta` 鏃讹細鈶犵溂闀滄姌鍙犲悗闀挎寜鎷嶆憚閿?5 绉掞紝绛夋寚绀虹伅闂摑 鈶℃妸閭ｅ彴瀹夊崜鐨勮摑鐗欏叧鎺夛紝鍚﹀垯鐪奸暅涓嶄細骞挎挱銆?)
+                    Text("眼镜排在前面（有眼镜图标）。列表里没有 `RB Meta` 时：①眼镜折叠后长按拍摄键 5 秒，等指示灯闪蓝 ②把那台安卓的蓝牙关掉，否则眼镜不会广播。")
                         .font(.caption).foregroundStyle(.secondary)
-                    Button("閲嶆柊鎻℃墜锛坰etup 閾捐矾锛屼笉楠?owner锛?) { g.connectSetup() }
-                    Toggle("璇︾粏鏃ュ織锛堟姄瀹屾暣甯э紝鎺掓煡鐢級", isOn: $verboseLog)
+                    Button("重新握手（setup 链路，不验 owner）") { g.connectSetup() }
+                    Toggle("详细日志（抓完整帧，排查用）", isOn: $verboseLog)
                         .onChange(of: verboseLog) { _, on in Session.verbose = on }
-                    Text("鎵撳紑鍚庢瘡甯ф渶澶氳 512 瀛楄妭鍗佸叚杩涘埗锛涜繛涓嶄笂鎴栨帀绾挎椂鎵撳紑锛屽啀銆屽鍒跺叏閮ㄣ€嶅彂鎴戙€?)
+                    Text("打开后每帧最多记 512 字节十六进制；连不上或掉线时打开，再「复制全部」发我。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
-                Section("2 路 鑷锛堜笉鐢ㄨ繛鐪奸暅涔熻兘璺戯級") {
-                    Button("璺戜竴閬嶅瘑閽?/ 绛惧悕 / ECDH 鑷") { g.runSelfTest() }
-                    Text("缁撴灉浼氬啓杩涗笅闈㈢殑鏃ュ織锛涜繛涓嶄笂鐪奸暅鏃跺厛鐪嬭繖閲岋紝鑳藉垎娓呮槸鎵嬫満杩欏瀵嗙爜瀛︾殑闂杩樻槸閾捐矾鐨勯棶棰樸€?)
+                Section("2 · 自检（不用连眼镜也能跑）") {
+                    Button("跑一遍密钥 / 签名 / ECDH 自检") { g.runSelfTest() }
+                    Text("结果会写进下面的日志；连不上眼镜时先看这里，能分清是手机这套密码学的问题还是链路的问题。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
-                Section("3 路 鎴愪负涓讳汉锛堝彧鍋氫竴娆★級") {
-                    Button("鐢?Meta 璐﹀彿鐧诲綍骞舵敞鍐岃繖鍙?iPhone") { showLogin = true }
-                    Text("鐧诲綍鍦?app 鍐呭畬鎴愶紱token 鍙敤鏉ョ粰鐪奸暅绛句竴寮?ownership receipt銆?
-                         + "鎴愬姛鍚?owner-export.json 浼氬脊鍑烘潵锛屽姟蹇呭瓨鍒?iCloud銆?)
+                Section("3 · 成为主人（只做一次）") {
+                    Button("用 Meta 账号登录并注册这台 iPhone") { showLogin = true }
+                    Text("登录在 app 内完成；token 只用来给眼镜签一张 ownership receipt。"
+                         + "成功后 owner-export.json 会弹出来，务必存到 iCloud。")
                         .font(.caption).foregroundStyle(.secondary)
-                    Button("瀵煎嚭 owner-export.json") { g.shareOwner() }
-                    Button("浠庢枃浠?App 瀵煎叆 owner-export.json") { showImport = true }
+                    Button("导出 owner-export.json") { g.shareOwner() }
+                    Button("从文件 App 导入 owner-export.json") { showImport = true }
                 }
 
-                Section("3.5 路 鐩稿唽 / 鎷嶇収") {
+                Section("3.5 · 相册 / 拍照") {
                     HStack {
-                        Button(g.busy ? "澶勭悊涓€? : "鍒锋柊娓呭崟") { g.loadCaptures() }
+                        Button(g.busy ? "处理中…" : "刷新清单") { g.loadCaptures() }
                             .disabled(!g.connected || g.busy)
                         Spacer()
-                        Button(g.busy ? "澶勭悊涓€? : "鎷夋渶鏂扮収鐗?) { g.capture() }
+                        Button(g.busy ? "处理中…" : "拉最新照片") { g.capture() }
                             .disabled(!g.connected || g.busy)
                     }
-                    Button(g.busy ? "澶勭悊涓€? : "鎸夌溂闀滃揩闂ㄦ媿涓€寮?) { g.snap() }
+                    Button(g.busy ? "处理中…" : "按眼镜快门拍一张") { g.snap() }
                         .disabled(!g.connected || g.busy)
-                    Button(g.recording ? "鍋滄褰曞儚" : "寮€濮嬪綍鍍?) { g.toggleRecording() }
+                    Button(g.recording ? "停止录像" : "开始录像") { g.toggleRecording() }
                         .disabled(!g.connected || g.busy)
                         .tint(g.recording ? .red : .accentColor)
                     ForEach(g.captures, id: \.handle) { item in
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("\(item.isPhoto ? "鐓х墖" : "瑙嗛") 路 \(item.assets.count) 涓祫浜?)
+                                Text("\(item.isPhoto ? "照片" : "视频") · \(item.assets.count) 个资产")
                                 Text(item.handle).font(.system(size: 10, design: .monospaced))
                                     .foregroundStyle(.secondary)
                                 if let ns = item.timestampNS {
@@ -877,7 +884,7 @@ struct ContentView: View {
                                 }
                             }
                             Spacer()
-                            Button("鍙栧洖") { g.fetch(item, saveToLibrary: item.isPhoto) }
+                            Button("取回") { g.fetch(item, saveToLibrary: item.isPhoto) }
                                 .disabled(g.busy)
                         }
                     }
@@ -885,61 +892,61 @@ struct ContentView: View {
                         Image(uiImage: img).resizable().scaledToFit().frame(maxHeight: 220)
                     }
                     if g.lastVideo != nil {
-                        Button("鍒嗕韩瑙嗛") { g.shareVideo() }
+                        Button("分享视频") { g.shareVideo() }
                     }
                 }
 
-                Section("璁惧鐘舵€?) {
+                Section("设备状态") {
                     ForEach(g.status.lines, id: \.self) { line in
                         Text(line).font(.footnote)
                     }
-                    Button("鍒锋柊鐘舵€?) { g.refreshStatus() }.disabled(!g.connected)
+                    Button("刷新状态") { g.refreshStatus() }.disabled(!g.connected)
                 }
 
-                Section("3.5 路 蹇嵎") {
-                    Button("甯哥敤寮€鍏筹紙鍔╂墜 / 鎻愮ず闊?/ 鐢昏川锛?) { showQuick = true }
+                Section("3.5 · 快捷") {
+                    Button("常用开关（助手 / 提示音 / 画质）") { showQuick = true }
                         .disabled(!g.connected)
                 }
 
-                Section("4 路 Live 鍙栨櫙") {
-                    Button(g.live == nil ? "鎵撳紑鍙栨櫙" : "鍙栨櫙涓€?) { showLive = true }
+                Section("4 · Live 取景") {
+                    Button(g.live == nil ? "打开取景" : "取景中…") { showLive = true }
                         .disabled(!g.connected)
                     if let size = g.live?.decodedSize {
-                        Text("\(Int(size.width))脳\(Int(size.height))")
+                        Text("\(Int(size.width))×\(Int(size.height))")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
 
-                Section("5 路 闂嚜宸辩殑妯″瀷") {
+                Section("5 · 问自己的模型") {
                     TextField("base URL", text: $g.modelBaseURL)
                         .textInputAutocapitalization(.never).font(.footnote)
                     TextField("model", text: $g.modelName).font(.footnote)
-                    TextField("闂", text: $question, axis: .vertical).lineLimit(1 ... 3)
-                    Button("鐪嬪浘闂瓟") { g.ask(question) }.disabled(g.lastPhoto == nil || g.busy)
+                    TextField("问题", text: $question, axis: .vertical).lineLimit(1 ... 3)
+                    Button("看图问答") { g.ask(question) }.disabled(g.lastPhoto == nil || g.busy)
                     if !g.answer.isEmpty { Text(g.answer).font(.callout) }
                 }
 
-                Section("5.5 路 鍔╂墜鎺ョ锛圚ey Meta 璧拌繖涓?app锛?) {
-                    Button(g.assistantOn ? "鍏抽棴鎺ョ" : "寮€鍚帴绠?) {
+                Section("5.5 · 助手接管（Hey Meta 走这个 app）") {
+                    Button(g.assistantOn ? "关闭接管" : "开启接管") {
                         if g.assistantOn { g.stopAssistant() } else { g.startAssistant() }
                     }
                     .disabled(!g.connected)
-                    Text("寮€鍚悗鐪奸暅鐨勫敜閱掕瘝浼氳矾鐢卞埌杩欓噷锛岀敱浣犺嚜宸遍厤鐨勬ā鍨嬪洖绛斻€傝闊宠浆鍐欒繕鍦ㄥ仛锛岀幇鍦ㄦ槸鍏堟帴浣忚繖涓€杞啀鍥炰竴鍙ヨ瘽銆?)
+                    Text("开启后眼镜的唤醒词会路由到这里，由你自己配的模型回答。语音转写还在做，现在是先接住这一轮再回一句话。")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
 
-                Section("6 路 鐪奸暅璁剧疆锛圽(SettingsCatalog.all.count) 椤癸級") {
-                    Button("鎵撳紑璁剧疆") { showSettings = true }
+                Section("6 · 眼镜设置（\(SettingsCatalog.all.count) 项）") {
+                    Button("打开设置") { showSettings = true }
                         .disabled(!g.connected)
-                    Text(g.settingsLoading ? "璇诲彇涓€? : "宸茶鍒?\(g.settings.count) 椤?)
+                    Text(g.settingsLoading ? "读取中…" : "已读到 \(g.settings.count) 项")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
-                Section("鏃ュ織") {
+                Section("日志") {
                     HStack {
-                        Button("瀵煎嚭鏃ュ織鏂囦欢") { g.shareLog() }
+                        Button("导出日志文件") { g.shareLog() }
                         Spacer()
-                        Button("澶嶅埗鍏ㄩ儴") { g.copyLog() }
+                        Button("复制全部") { g.copyLog() }
                     }
                     ForEach(Array(g.log.enumerated()), id: \.offset) { _, line in
                         Text(line).font(.system(size: 11, design: .monospaced))
@@ -951,14 +958,14 @@ struct ContentView: View {
                 LoginWebView(url: Meta.authorize(state: UUID().uuidString),
                              onCode: { code in
                                  showLogin = false
-                                 g.note("鎷垮埌 code锛屼氦鎹?token鈥?)
+                                 g.note("拿到 code，交换 token…")
                                  Task {
                                      do {
                                          let token = try await MetaClient(log: { g.note($0) })
                                              .exchangeCode(code)
                                          g.becomeOwner(userToken: token)
                                      } catch {
-                                         g.note("token 浜ゆ崲澶辫触锛歕(error)")
+                                         g.note("token 交换失败：\(error)")
                                      }
                                  }
                              },
@@ -972,7 +979,7 @@ struct ContentView: View {
             .fileImporter(isPresented: $showImport, allowedContentTypes: [.json, .data]) { result in
                 switch result {
                 case .success(let url): g.importOwner(from: url)
-                case .failure(let error): g.note("閫夋枃浠跺け璐ワ細\(error.localizedDescription)")
+                case .failure(let error): g.note("选文件失败：\(error.localizedDescription)")
                 }
             }
         }
