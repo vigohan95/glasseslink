@@ -1,0 +1,25 @@
+We are implementing a client (iOS, Swift) for Meta Ray-Ban Gen 2 smart glasses by speaking their BLE link-setup protocol directly (no vendor app). Reference implementation we trust is an Android app (Visor) whose Kotlin we can read. We can also read a byte-exact protocol description.
+
+Observed on real hardware, every attempt, reproducible:
+
+1. We connect (LE L2CAP, PSM 0x80) and send a plaintext RequestEncryption on channel 0x8001, service tag 5, type 1: fields {1: 64B pubkey, 2: 16B challenge, 3: varint 0 (curve), 4: varint 31 (params), 6: quirks (omitted when 0), 7: varint 16 (version)}.
+2. The glasses reply with their own RequestEncryption on channel 0x8001, and this is what its fields actually are on the wire (decoded):
+   f1 = 64B pubkey, f2 = 16B challenge, f3 = varint 0, f4 = varint 31, f5 = 12B key hint, f7 = varint 17. Note: NO f6 (quirks absent), version 17 (we sent 16).
+3. We then send EnableEncryption on channel 0x0001 (mirror), tags {1: service 5, 2: type 2}: fields {1: our 64B pubkey, 2: 32B seed, 3: 16B iv, 4: varint baseSeq, 5: varint 31, 6: quirks if nonzero}.
+4. The glasses send their EnableEncryption. We read it, derive keys, and start sealing.
+5. We compute keys as: tx = HKDF/ECDH(shared, nonce = glassesChallenge, seed = ourSeed, iv = ourIV, quirks = request.quirks); rx = derive(shared, nonce = ourChallenge, seed = glassesSeed, iv = glassesIV, quirks = enable.quirks). MAC word = 02 02 00 (quirks&0xff); HKDF info = "AirShield"+0x01 for quirks=0, and for quirks=1 a 136-byte info ("AirShield" padded to 128 + LE32 32 + LE32 256). Frame = 0x40|stream, 8B MAC over macWord||LE32(seq)||count||ciphertext, 1B count (= blocks-1), then AES-256-CBC ciphertext of the padded payload (custom padding, padLen = 16-(n%16), byte value padLen+0xC0), IV chaining to the previous block.
+6. We then send a sealed EndLinkSetup (46B plaintext body) and get NOTHING back — no frame at all for 12 s. Occasionally we get exactly one frame that fails our MAC check ("bad MAC"), which suggests the glasses did send something but our rx keys are wrong.
+
+Things we noticed in the trusted Kotlin implementation afterwards:
+- It does NOT send EndLinkSetup as part of the handshake. Comment in source: "EndLinkSetup is NOT sent here." Its handler for incoming frames treats frames with streamId != 0 as relay sub-streams; and it counts "DATA frames queued during handshake" (handshakeQueued), i.e. sealed frames can arrive before key setup completes and are queued.
+- It sends a RANDOM per-direction preamble base seq in EnableEncryption field 4 and starts its own tx numbering there (we had hard-coded 0).
+- It reads several frames during handshake and accepts RequestEncryption and EnableEncryption in any order.
+
+Question: given the above, what are the most likely reasons the glasses ignore our sealed EndLinkSetup, and what is the most probable correct sequence after EnableEncryption? Specifically:
+(a) should the phone ever send EndLinkSetup on a fresh link, or only answer the glasses' one?
+(b) does the base seq in EnableEncryption field 4 have to match the seq of our first sealed frame exactly (we now start at that base), and is it the value the glasses use to check our frames?
+(c) is a version mismatch (we advertise 16, they advertise 17) able to make them reject the whole link silently?
+(d) is the mirror channel (0x0001) correct for EnableEncryption, or should it carry the same 0x8001 with a mirror bit?
+(e) any byte-level trap you would check first in our frame layout given "no reply at all" versus "one frame with bad MAC"?
+
+Answer with a ranked list of hypotheses and the single cheapest experiment for each.

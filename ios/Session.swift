@@ -21,7 +21,7 @@ final class SDUStream: NSObject, StreamDelegate {
     /// streams are never touched (see `loopbackPair()`).
     private var writeHook: ((Data) throws -> Void)?
     private let cond = NSCondition()
-    private var buf = Data()
+    private var buf = [UInt8]()
     private var closed = false
     private(set) var lastError: Error?
 
@@ -61,7 +61,7 @@ final class SDUStream: NSObject, StreamDelegate {
     /// Hand bytes to whoever is blocked in `nextFrame`.
     func feed(_ data: Data) {
         cond.lock()
-        buf.append(data)
+        buf.append(contentsOf: data)
         cond.broadcast()
         cond.unlock()
     }
@@ -113,11 +113,21 @@ final class SDUStream: NSObject, StreamDelegate {
                 cond.unlock()
                 throw LinkError.io("stream closed\(why)")
             }
+            if let need = Self.frameLength(buf), need > 4096 {
+                // A mis-read header can claim a 4 KB+ frame. Drop one byte and resync
+                // instead of waiting for megabytes that will never arrive.
+                cond.unlock()
+                emit("resync: header claimed \(need)B, dropping a byte")
+                cond.lock()
+                if !buf.isEmpty { buf.removeFirst() }
+                cond.unlock()
+                continue
+            }
             if let need = Self.frameLength(buf), buf.count >= need {
-                let frame = Data(buf.prefix(need))
+                let frame = Data(buf[0 ..< need])
                 // Re-base the buffer: `removeFirst` only moves `startIndex`, and every
                 // slice-blind index (b[0], b[1], b[9]) would then trap on the next frame.
-                buf = Data(buf.dropFirst(need))
+                buf.removeFirst(need)
                 cond.unlock()
                 return frame
             }
@@ -140,17 +150,21 @@ final class SDUStream: NSObject, StreamDelegate {
     ///
     /// Indexes through `startIndex` on purpose: `Data` slices keep the parent's indices,
     /// so `b[0]` traps (SIGTRAP, signal 5) as soon as the buffer has been trimmed once.
-    static func frameLength(_ b: Data) -> Int? {
-        let base = b.startIndex
+    static func frameLength(_ b: [UInt8]) -> Int? {
         guard b.count >= 1 else { return nil }
-        let b0 = b[base]
+        let b0 = b[0]
         if b0 & 0xC0 == Direction.frameData {          // encrypted DATA frame
             guard b.count >= 10 else { return nil }
-            return 10 + 16 * (Int(b[base + 9]) + 1)
+            return 10 + 16 * (Int(b[9]) + 1)
         }
         guard b.count >= 4 else { return nil }         // plaintext DataX
-        let payloadLen = Int(b0 & 0x3F) << 8 | Int(b[base + 1])
+        let payloadLen = Int(b0 & 0x3F) << 8 | Int(b[1])
         return 4 + payloadLen
+    }
+
+    /// Convenience for tests and for callers that already hold a `Data`.
+    static func frameLength(_ b: Data) -> Int? {
+        frameLength([UInt8](b))
     }
 
     func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
