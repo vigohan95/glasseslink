@@ -81,7 +81,9 @@ enum DataX {
     /// first byte marks "tags present". Encrypted DATA frames use 0x40|stream instead,
     /// and the two ranges never overlap (0x00-0x3F / 0x80-0xBF vs 0x40-0x7F).
     static func header(_ channel: UInt16, _ payloadLen: Int, hasExtension: Bool) -> Data {
-        precondition(payloadLen >= 0 && payloadLen <= 0x3FFF, "payloadLen is 14 bits")
+        // Never assert here: a bad length must surface as a logged protocol error, not a crash
+    // in the middle of a handshake.
+    assert(payloadLen >= 0 && payloadLen <= 0x3FFF, "payloadLen is 14 bits")
         let b0 = (hasExtension ? 0x80 : 0x00) | UInt8((payloadLen >> 8) & 0x3F)
         return Data([b0, UInt8(payloadLen & 0xFF)]) + be16(channel)
     }
@@ -272,9 +274,13 @@ enum AirShield {
 
     /// RequestEncryption — ch 0x8001, service 5, type 1.
     static func requestEncryption(pubkey: Data, challenge: Data,
-                                  hints: [Data] = [], quirks: Quirk = .none) -> Data {
-        precondition(pubkey.count == 64, "wire pubkey is x||y, 64 bytes, no 0x04")
-        precondition(challenge.count == 16)
+                                  hints: [Data] = [], quirks: Quirk = .none) throws -> Data {
+        guard pubkey.count == 64 else {
+            throw LinkError.unexpected("requestEncryption: pubkey=\(pubkey.count)B, want 64 (x||y)")
+        }
+        guard challenge.count == 16 else {
+            throw LinkError.unexpected("requestEncryption: challenge=\(challenge.count)B, want 16")
+        }
         var body = PB.bytes(1, pubkey) + PB.bytes(2, challenge)
         body += PB.uint(3, 0) + PB.uint(4, paramsDefault)
         for h in hints { body += PB.bytes(5, h) }
@@ -287,8 +293,10 @@ enum AirShield {
     /// EnableEncryption — ch 0x0001, type 2. The second tag MUST be last, otherwise
     /// the receiver keeps reading tags and chokes on the payload.
     static func enableEncryption(pubkey: Data, seed: Data, iv: Data,
-                                 baseSeq: UInt32, quirks: Quirk = .none) -> Data {
-        precondition(pubkey.count == 64 && seed.count == 32 && iv.count == 16)
+                                 baseSeq: UInt32, quirks: Quirk = .none) throws -> Data {
+        guard pubkey.count == 64, seed.count == 32, iv.count == 16 else {
+            throw LinkError.unexpected("enableEncryption: pubkey=\(pubkey.count)B seed=\(seed.count)B iv=\(iv.count)B")
+        }
         var body = PB.bytes(1, pubkey) + PB.bytes(2, seed) + PB.bytes(3, iv)
         body += PB.uint(4, UInt64(baseSeq)) + PB.uint(5, paramsDefault)
         if quirks != .none { body += PB.uint(6, quirks.rawValue) }
@@ -311,8 +319,13 @@ enum AirShield {
     static let endLinkStatus = Data([0x80, 0x04, 0x00, 0x01, 0x03, 0x00, 0x10, 0x00])
 
     /// svc36 type 4096: {1: SHA-256(owner pubkey x||y), 2: r||s, 3: capabilities 2}
-    static func trustMessage(ownerPubkey: Data, signatureRaw: Data) -> Data {
-        precondition(signatureRaw.count == 64)
+    static func trustMessage(ownerPubkey: Data, signatureRaw: Data) throws -> Data {
+        guard signatureRaw.count == 64 else {
+            throw LinkError.unexpected("trustMessage: signature=\(signatureRaw.count)B (DER leaking through?)")
+        }
+        guard ownerPubkey.count == 64 else {
+            throw LinkError.unexpected("trustMessage: ownerPubkey=\(ownerPubkey.count)B")
+        }
         let digest = Data(SHA256.hash(data: ownerPubkey))
         let body = PB.bytes(1, digest) + PB.bytes(2, signatureRaw) + PB.uint(3, 2)
         return DataX.message(DataX.chSetupMirror,
@@ -332,7 +345,9 @@ enum AirShield {
 
     static func deriveKeys(shared: Data, nonce: Data, seed: Data, iv: Data,
                            quirks: Quirk, multikey: Bool = false) -> Keys {
-        precondition(shared.count == 32)
+        guard shared.count == 32 else {
+        throw LinkError.unexpected("deriveKeys: shared=\(shared.count)B")
+    }
         let saltAES = Data(SHA256.hash(data: nonce + seed))
         let saltHMAC = Data(SHA256.hash(data: seed + nonce + Data("hmac_derive".utf8)))
         let prk = Data(HMAC<SHA256>.authenticationCode(for: shared, using: SymmetricKey(data: saltAES)))

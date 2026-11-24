@@ -379,7 +379,7 @@ final class Session {
         let seed = Data.random(32)
         let iv = Data.random(16)
 
-        try sendPlain(AirShield.requestEncryption(pubkey: pub, challenge: challenge, quirks: quirks))
+        try sendPlain(try AirShield.requestEncryption(pubkey: pub, challenge: challenge, quirks: quirks))
         let first = try recvMessage(timeout: timeout)
         guard first.channel == DataX.chSetup, first.service == 5, first.type == 1 else {
             throw LinkError.unexpected("expected RequestEncryption, got ch=0x\(String(first.channel, radix: 16))")
@@ -395,7 +395,7 @@ final class Session {
         let shared = try owner.sharedSecret(peerPubkeyXy: peerPub)
         emit("ecdh ok, shared=\(shared.hexShort) quirks=\(quirks)")
 
-        try stream.write(AirShield.enableEncryption(pubkey: pub, seed: seed, iv: iv,
+        try stream.write(try AirShield.enableEncryption(pubkey: pub, seed: seed, iv: iv,
                                                     baseSeq: 0, quirks: quirks))
         emit("EnableEncryption sent")
 
@@ -430,7 +430,7 @@ final class Session {
     private func doTrust(timeout: TimeInterval) throws {
         let sig = try owner.signRaw(digest: binding)
         emit("trust: binding=\(binding.hexShort) sig=\(sig.hexShort) key=\(owner.publicKeyXy.hexShort)")
-        try sendAny(AirShield.trustMessage(ownerPubkey: owner.publicKeyXy, signatureRaw: sig))
+        try sendAny(try AirShield.trustMessage(ownerPubkey: owner.publicKeyXy, signatureRaw: sig))
         // 1) the glasses' own ENABLE_TRUST (0x1001), 2) a status frame on the mirror channel
         while true {
             let m = try recvMessage(timeout: timeout)

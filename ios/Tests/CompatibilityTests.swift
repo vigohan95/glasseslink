@@ -31,7 +31,7 @@ final class CompatibilityTests: XCTestCase {
             + "0a20fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"
             + "1240000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
             + "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f1802"
-        XCTAssertEqual(hex(AirShield.trustMessage(ownerPubkey: pub, signatureRaw: sig)), expected)
+        XCTAssertEqual(try hex(AirShield.trustMessage(ownerPubkey: pub, signatureRaw: sig)), expected)
     }
 
     /// EndLinkSetup is exactly 46 bytes and the two UUIDs must be RFC 4122 v4.
