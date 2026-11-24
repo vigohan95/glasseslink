@@ -38,6 +38,13 @@ struct ActivityView: UIViewControllerRepresentable {
 
 @MainActor
 final class Glasses: NSObject, ObservableObject {
+    /// Where the one-time setup flow is, kept at the root so nothing can tear it down.
+    enum Route: String, Identifiable {
+        case ownerSetup, importOwner, becomeOwner, login
+        var id: String { rawValue }
+    }
+    @Published var route: Route?
+
     @Published var log: [String] = []
     @Published var devices: [ScanEntry] = []
     private var scanTimer: Timer?
@@ -841,6 +848,7 @@ final class Glasses: NSObject, ObservableObject {
             owner = parsed.0
             ownerLine = "owner key: 已导入 \(parsed.1.serial)"
             note("已导入 \(parsed.1.serial) 的 owner key（来源文件可直接是 Visor 导出的那个）")
+            route = nil
         } catch {
             note("导入失败：\(error)")
         }

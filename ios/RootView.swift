@@ -19,6 +19,27 @@ struct RootView: View {
                 .tabItem { Label("设备", systemImage: "eyeglasses") }
         }
         .tint(.cyan)
+        // One-time setup lives at the root, not inside a NavigationLink.
+        // A sheet presented from a pushed destination dies the moment `g` publishes
+        // (the stack rebuilds and the presenter goes away) — which is why the login
+        // page flashed open and closed. Routed from here it survives.
+        .sheet(item: $g.route) { route in
+            NavigationStack {
+                switch route {
+                case .ownerSetup: OwnerSetupView(g: g)
+                case .importOwner: ImportOwnerView(g: g)
+                case .becomeOwner: BecomeOwnerView(g: g)
+                case .login:
+                    LoginWebView(url: Meta.authorize(state: UUID().uuidString),
+                                 onCode: { code in
+                                     g.route = nil
+                                     g.becomeOwner(userToken: code)
+                                 },
+                                 onCancel: { g.route = nil })
+                        .ignoresSafeArea()
+                }
+            }
+        }
     }
 }
 
@@ -493,7 +514,7 @@ struct DeviceTabBody: View {
             }
             Section("主人身份") {
                 Text(g.trustLine).font(.footnote)
-                NavigationLink("一次性设置（导入或注册钥匙）") { OwnerSetupView(g: g) }
+                Button("一次性设置（导入或注册钥匙）") { g.route = .ownerSetup }
             }
             if !g.connected {
                 Section("附近的眼镜") {
@@ -528,7 +549,7 @@ struct DeviceTabBody: View {
                 }
             }
             Section("一次性设置") {
-                NavigationLink("成为这副眼镜的主人") { OwnerSetupView(g: g) }
+                Button("成为这副眼镜的主人") { g.route = .ownerSetup }
             }
             Section("高级") {
                 Button { showDiagnostics = true } label: {
@@ -557,8 +578,8 @@ struct OwnerSetupView: View {
                     .font(.footnote)
             }
             Section("两种做法") {
-                NavigationLink("① 用上次导出的钥匙文件导入") { ImportOwnerView(g: g) }
-                NavigationLink("② 现在向 Meta 注册（需要登录一次）") { BecomeOwnerView(g: g) }
+                Button("① 用上次导出的钥匙文件导入") { g.route = .importOwner }
+                Button("② 现在向 Meta 注册（需要登录一次）") { g.route = .becomeOwner }
             }
             Section("说明") {
                 Text("换手机、换签名证书、删掉 app 之前，先把 owner-export.json 存到「文件」里；丢了它就得重新做这一步。")
@@ -592,25 +613,27 @@ struct ImportOwnerView: View {
 
 struct BecomeOwnerView: View {
     @ObservedObject var g: Glasses
-    @State private var signingIn = false
 
     var body: some View {
         List {
             Section {
-                Button("开始注册流程") { signingIn = true }
+                Button("开始注册流程") { g.route = .login }
                 Text(g.ownerLine).font(.caption).foregroundStyle(.secondary)
             }
             Section("会看到什么") {
                 Text("① Meta 登录页（只这一次）\n② 眼镜连按拍摄键 3–5 次确认\n③ 成功后立刻导出 owner-export.json")
                     .font(.footnote)
             }
+            Section("不想再碰 Meta？") {
+                Text("回到上一页选「① 用上次导出的钥匙文件导入」。那把钥匙在补丁版 Visor 里导出过一次就够了，之后这台 iPhone 不再需要 Meta 账号。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
         }
         .navigationTitle("向 Meta 注册")
-        .sheet(isPresented: $signingIn) {
-            LoginWebView(url: Meta.authorize(state: UUID().uuidString), onCode: { code in
-                signingIn = false
-                g.becomeOwner(userToken: code)
-            }, onCancel: { signingIn = false })
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("返回") { g.route = .ownerSetup }
+            }
         }
     }
 }
