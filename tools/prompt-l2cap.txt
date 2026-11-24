@@ -1,0 +1,9 @@
+Swift/iOS CoreBluetooth question. Building a BLE central that connects to a peripheral which exposes an L2CAP connection-oriented channel (LE CoC) and then talks a custom framed protocol over it.
+
+Answer these, terse, no preamble:
+
+1. After CBCentralManager.connect succeeds, is it safe to call openL2CAPChannel(psm) immediately, or must we wait for didDiscoverServices / a specific characteristic read that publishes the PSM? What does iOS do if the PSM is not yet "published"?
+2. What are the exact delegate callbacks for a successful and a failed open, and what do the common error codes mean?
+3. Once the channel is open, what are the pitfalls of reading from CBL2CAPChannel.inputStream in terms of framing (stream vs message boundaries), and how do people normally implement a frame reader on it?
+4. Is PSM 0x80 (128) special in any way for LE CoC, or just a convention?
+5. Any known issue where a peripheral is connectable but never appears in scanForPeripherals results on iOS, while it does appear on Android?

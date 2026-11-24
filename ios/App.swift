@@ -73,6 +73,12 @@ final class Glasses: NSObject, ObservableObject {
     /// Ray-Ban Meta Gen 2 exposes its link on L2CAP PSM 0x80.
     let psm: CBL2CAPPSM = 0x80
 
+    /// Meta's BLE service. Asking the system for this service is the most reliable way to have
+    /// iOS report a peripheral that only advertises service UUIDs (no local name).
+    static let metaService = "0000FD5F-0000-1000-8000-00805F9B34FB"
+    /// Meta's Bluetooth SIG company identifier, little-endian in the advertisement payload.
+    static let metaVendorID: UInt16 = 0x01AB
+
     var logURL: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("glasses.log")
@@ -144,7 +150,12 @@ final class Glasses: NSObject, ObservableObject {
         note("第 \(scanRound)/\(scanRounds) 轮扫描（每轮 15 秒）…眼镜折叠后长按拍摄键 5 秒到指示灯闪蓝")
         // Duplicates must stay ON: the glasses announce themselves in a short burst and
         // then go quiet, so a scan started a second too early would otherwise never see them.
-        central.scanForPeripherals(withServices: nil,
+        // Every other round filters on Meta's own service UUID: a peripheral that advertises
+        // its services is only reliably reported when you ask for that service.
+        let filtered = (scanRound % 2 == 0)
+        let services: [CBUUID]? = filtered ? [CBUUID(string: Self.metaService)] : nil
+        if filtered { note("这一轮按 Meta 服务 UUID 过滤") }
+        central.scanForPeripherals(withServices: services,
                                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         scanTimer?.invalidate()
         scanTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: false) { _ in
@@ -168,9 +179,37 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
+    /// Everything iOS already knows about, no scanning involved. If the glasses were ever paired
+    /// with this iPhone — or are held by another app right now — they are here, which sidesteps
+    /// "the glasses never advertise" completely.
+    func loadSystemPaired() {
+        guard central.state == .poweredOn else { note("蓝牙不可用：\(central.state.rawValue)"); return }
+        let service = CBUUID(string: Self.metaService)
+        let connected = central.retrieveConnectedPeripherals(withServices: [service])
+        var added = 0
+        for p in connected {
+            let entry = ScanEntry(id: p.identifier, name: p.name ?? "Meta 眼镜（已连接）",
+                                  rssi: 0, isGlasses: true)
+            if let i = devices.firstIndex(where: { $0.id == p.identifier }) { devices[i] = entry }
+            else { devices.insert(entry, at: 0); added += 1 }
+        }
+        for saved in [UserDefaults.standard.string(forKey: "lastPeripheral")].compactMap({ $0 }) {
+            guard let id = UUID(uuidString: saved),
+                  let p = central.retrievePeripherals(withIdentifiers: [id]).first else { continue }
+            let entry = ScanEntry(id: p.identifier, name: p.name ?? "上次连过的设备",
+                                  rssi: 0, isGlasses: p.name?.lowercased().contains("meta") ?? false)
+            if let i = devices.firstIndex(where: { $0.id == p.identifier }) { devices[i] = entry }
+            else { devices.insert(entry, at: 0); added += 1 }
+        }
+        note("系统里已配对/已连接 \(connected.count) 台 Meta 服务设备，新加 \(added) 条")
+        if connected.isEmpty {
+            note("系统里没有已配对的眼镜：这副眼镜从没和这台 iPhone 配过（它现在的主人是那台安卓），所以必须靠它自己广播 + 进配对模式才能被发现")
+        }
+    }
+
     func connect(_ id: UUID) {
         guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
-            note("找不到这台设备（先扫描）"); return
+            note("找不到这台设备（先扫描一次）"); return
         }
         central.stopScan()
         peripheral = p
@@ -819,7 +858,8 @@ struct ContentView: View {
                 }
 
                 Section("1 · 连眼镜") {
-                    Button("扫描附近眼镜") { g.startScan() }
+                    Button("从系统已配对里找（不用扫描）") { g.loadSystemPaired() }
+                    Button("扫描附近眼镜（6 轮）") { g.startScan() }
                     ForEach(g.devices, id: \.id) { d in
                         Button {
                             g.connect(d.id)

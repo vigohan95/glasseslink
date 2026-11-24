@@ -1,0 +1,7 @@
+iOS CoreBluetooth engineering questions. Be terse, no preamble, numbered answers.
+
+1. CBCentralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]) — are peripherals that are connectable but advertise no local name still reported? What fields usually carry their identity?
+2. If a peripheral is already bonded to another host and that host is powered off, does iOS still see its advertisements? What decides whether a peripheral advertises at all?
+3. After CBCentralManager.connect succeeds, can openL2CAPChannel(_:) be called immediately, or must didDiscoverServices complete first? What error appears if the PSM was never published?
+4. CBL2CAPChannel.inputStream is a byte stream: describe the standard pattern for reading length-prefixed frames out of it with StreamDelegate (buffering, partial reads, runloop scheduling).
+5. Common reasons a peripheral visible to an Android scanner is invisible to an iOS scanner in the same room.

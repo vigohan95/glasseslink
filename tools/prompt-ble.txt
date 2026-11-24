@@ -1,0 +1,10 @@
+We drive Meta Ray-Ban Gen 2 smart glasses from our own iOS app (the Meta app is not used; the Android phone that used to own them is now powered off with Bluetooth off). The protocol needs a BLE connection, then an L2CAP CoC on PSM 0x80, then a custom handshake.
+
+Problem: iPhone CoreBluetooth never sees the glasses. We scan for 90 s with withServices: nil and allowDuplicates true; the phone does see about 20 other BLE devices (car keys, printers) at rssi -70..-100. The glasses are put into "pairing mode": arms folded, hold the capture button about 5 s, the LED inside the frame blinks blue. Glasses are 30 cm from the phone. We match on a local name containing "meta" or "rb ", a service UUID with prefix fd5, and manufacturer id 0x01AB.
+
+Give:
+1. the most likely reasons a Meta Ray-Ban Gen 2 stays silent even in pairing mode
+2. an ordered checklist of things to try, each with the expected observable
+3. any iOS-specific gotchas (needing to pair in Settings > Bluetooth first, CBCentralManager state restore, scan-response handling) that would make a connectable-but-unnamed advertisement invisible
+
+Be concrete and terse; no preamble.
