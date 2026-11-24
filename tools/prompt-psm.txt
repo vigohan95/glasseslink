@@ -1,0 +1,5 @@
+iOS CoreBluetooth: after a successful openL2CAPChannel(_:) on a peripheral, a second openL2CAPChannel for the same PSM fails with error "L2CAP PSM already connected". Answer briefly:
+
+1. What is the correct lifecycle to close and reopen an LE CoC channel (stream close order, delegate callbacks)?
+2. Does cancelPeripheralConnection reliably release the PSM, or must the channel streams be closed first?
+3. Any known iOS quirk where the PSM stays occupied for a while after disconnect?

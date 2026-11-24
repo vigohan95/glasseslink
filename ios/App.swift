@@ -782,7 +782,22 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
         Task { @MainActor in
             self.note("已连接，打开 L2CAP PSM 0x\(String(self.psm, radix: 16))")
             p.discoverServices(nil)
-            p.openL2CAPChannel(self.psm)
+            self.openLink(p)
+        }
+    }
+
+    /// CoreBluetooth keeps the PSM marked as occupied for a few seconds after an abrupt drop,
+    /// so "L2CAP PSM already connected" is normal right after a retry. Wait it out and try again
+    /// rather than making the user tap again.
+    private func openLink(_ p: CBPeripheral, attempt: Int = 1) {
+        guard channel == nil else { return }
+        if attempt == 1 { p.openL2CAPChannel(psm); return }
+        Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { _ in
+            Task { @MainActor in
+                guard self.channel == nil else { return }
+                self.note("重试打开 L2CAP（第 \(attempt) 次）")
+                p.openL2CAPChannel(self.psm)
+            }
         }
     }
 
@@ -803,13 +818,25 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func peripheral(_ p: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
         Task { @MainActor in
             guard let ch = channel else {
-                self.note("L2CAP 打开失败：\(error?.localizedDescription ?? "?")")
+                let msg = error?.localizedDescription ?? "?"
+                self.note("L2CAP 打开失败：\(msg)")
+                if msg.lowercased().contains("already connected") {
+                    self.openLink(p, attempt: 2)
+                }
                 return
             }
             self.channel = ch
             self.note("L2CAP up psm=0x\(String(ch.psm, radix: 16))")
             let hasOwner = self.owner != nil && UserDefaults.standard.bool(forKey: "isOwner")
             await self.bringUp(trust: hasOwner)
+        }
+    }
+
+    nonisolated func peripheral(_ p: CBPeripheral, didClose channel: CBL2CAPChannel?,
+                                error: Error?) {
+        Task { @MainActor in
+            self.channel = nil
+            self.note("L2CAP 关闭（\(error?.localizedDescription ?? "正常")）")
         }
     }
 }
