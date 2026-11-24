@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Four screens organised by what you are trying to do — look at media, shoot, talk to the
 /// assistant, or deal with the device — instead of by which protocol service answered.
