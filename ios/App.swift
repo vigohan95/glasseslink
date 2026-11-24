@@ -532,6 +532,12 @@ final class Glasses: NSObject, ObservableObject {
         share = ShareBox(url: logURL)
     }
 
+    /// Copies the log to the pasteboard so it can be pasted into a chat in one step.
+    func copyLog() {
+        UIPasteboard.general.string = log.reversed().joined(separator: "\n")
+        note("日志已复制到剪贴板（\(log.count) 行）")
+    }
+
     // MARK: settings (svc33)
 
     /// Reads the whole settings namespace once and keeps it keyed by setting name.
@@ -857,7 +863,11 @@ struct ContentView: View {
                 }
 
                 Section("日志") {
-                    Button("导出日志文件") { g.shareLog() }
+                    HStack {
+                        Button("导出日志文件") { g.shareLog() }
+                        Spacer()
+                        Button("复制全部") { g.copyLog() }
+                    }
                     ForEach(Array(g.log.enumerated()), id: \.offset) { _, line in
                         Text(line).font(.system(size: 11, design: .monospaced))
                     }
