@@ -41,6 +41,8 @@ final class Glasses: NSObject, ObservableObject {
     private var scanRound = 0
     private let scanRounds = 6
     @Published var connected = false
+    private var connecting = false
+    private var lastConnectAt = Date.distantPast
     @Published var busy = false
     @Published var ownerLine = "owner key: 未知"
     @Published var glassesLine = "未连接"
@@ -212,7 +214,17 @@ final class Glasses: NSObject, ObservableObject {
             note("链路已经打开了，不用再点；要重来先「断开」")
             return
         }
+        // Tapping the row repeatedly used to start a fresh connect storm: several
+        // openL2CAPChannel() calls in a row all fail with "PSM already connected" and the
+        // daemon then holds the channel until the app dies. One attempt at a time only.
+        if connecting {
+            note("上一次连接还没结束，等 2 秒；一直卡就点「断开」再试")
+            return
+        }
+        connecting = true
+        lastConnectAt = Date()
         guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
+            connecting = false
             note("找不到这台设备（先扫描一次）"); return
         }
         central.stopScan()
@@ -280,6 +292,7 @@ final class Glasses: NSObject, ObservableObject {
         channel = nil
         if let p = peripheral { central.cancelPeripheralConnection(p) }
         connected = false
+        connecting = false
         glassesLine = "未连接"
         note("已断开，可以重新点了")
     }
@@ -804,8 +817,17 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         Task { @MainActor in
             self.connected = false
+            self.connecting = false
             self.glassesLine = "断开"
             self.note("断开：\(error?.localizedDescription ?? "正常")")
+        }
+    }
+
+    nonisolated func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
+        Task { @MainActor in
+            self.connected = false
+            self.connecting = false
+            self.note("连接失败：\(error?.localizedDescription ?? "?")")
         }
     }
 
@@ -826,6 +848,7 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
                 return
             }
             self.channel = ch
+            self.connecting = false
             self.note("L2CAP up psm=0x\(String(ch.psm, radix: 16))")
             let hasOwner = self.owner != nil && UserDefaults.standard.bool(forKey: "isOwner")
             await self.bringUp(trust: hasOwner)
