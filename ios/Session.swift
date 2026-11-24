@@ -284,6 +284,14 @@ final class Session {
     static let mtSyncData: UInt16 = 2
     static let mtAck: UInt16 = 3
 
+    /// Firmware update service. Nothing of ours lives here; the phone is normally the
+    /// downloader, so refusing these requests is what actually freezes the firmware.
+    static let svcOta: UInt16 = 29
+
+    /// Set before connecting: say no to every svc29 request instead of proxying it.
+    var blockOTA = true
+    private(set) var otaBlocked = 0
+
     /// Turn on from the UI before connecting: logs up to 60 frames as full hex
     /// instead of the 16-byte prefix, which is what you need when the glasses
     /// reject a trust frame and all you get back is a status code.
@@ -347,6 +355,11 @@ final class Session {
     private func sendPlain(_ data: Data) throws {
         emit("plain", data)
         try stream.write(data)
+    }
+
+    /// A bare status frame (only an error tag) — how a service answers yes/no.
+    func sendStatus(_ channel: UInt16, _ code: UInt16) throws {
+        try sendAny(DataX.status(channel, code))
     }
 
     private func sendAny(_ data: Data) throws {
@@ -453,6 +466,16 @@ final class Session {
             if msg.channel == DataX.chSetup, msg.type == 0x1000 {
                 try sendAny(AirShield.endLinkStatus)
                 emit("answered the glasses' EndLinkSetup")
+                continue
+            }
+
+            // Firmware updates live on svc29; the phone is the one that downloads and feeds
+            // the file. Refusing here (and never proxying a download) is what actually keeps
+            // the firmware frozen — the cloud_ota_enabled setting only asks nicely.
+            if blockOTA, msg.service == Int(Self.svcOta) {
+                otaBlocked += 1
+                emit("已拦截固件升级请求 svc29 type=\(msg.type.map(String.init) ?? "-")（第 \(otaBlocked) 次）")
+                try? sendStatus(msg.channel, 0xC001)
                 continue
             }
             return msg

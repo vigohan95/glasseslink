@@ -46,6 +46,17 @@ final class Glasses: NSObject, ObservableObject {
     @Published var route: Route?
 
     @Published var log: [String] = []
+
+    /// Whether the glasses accepted the key we hold. This is the single question a user has
+    /// ("am I the owner or not?"), so it gets its own state instead of hiding in a log line.
+    enum OwnerState: Equatable {
+        case unknown
+        case unverified          // handshake ran with a temporary key
+        case verified            // trust ok (0x1000)
+        case rejected(UInt16)    // the glasses said no, with the code they gave
+    }
+    @Published var ownerState: OwnerState = .unknown
+
     @Published var devices: [ScanEntry] = []
     /// Which row is currently being connected, so the list can show a spinner instead of a button.
     @Published var connectingID: UUID?
@@ -139,6 +150,13 @@ final class Glasses: NSObject, ObservableObject {
         let build = info?["CFBundleVersion"] as? String ?? "?"
         note("GlassesLink \(short) (\(build)) · iOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
         note("启动。owner=\(owner == nil ? "无" : "有")")
+        switch UserDefaults.standard.string(forKey: "ownerState") ?? "" {
+        case "verified": ownerState = .verified
+        case "unverified": ownerState = .unverified
+        case let s where s.hasPrefix("rejected:"):
+            ownerState = .rejected(UInt16(s.dropFirst("rejected:".count)) ?? 0)
+        default: ownerState = owner == nil ? .unknown : .unverified
+        }
         if let prev = CrashLog.takePrevious() {
             note("—— 上次崩溃现场 ——")
             for line in prev.split(separator: "\n").prefix(40) { note("  \(line)") }
@@ -162,34 +180,67 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: logging (kept on disk so it can be shared from the phone)
 
-    /// Logging has to be safe from any thread: the reader thread emits protocol lines while
-    /// SwiftUI watches log. Touching a @Published array off the main thread is a data race
-    /// that shows up as a random crash in the middle of a handshake.
-    func note(_ s: String) {
-        if Thread.isMainThread {
-            writeNote(s)
-        } else {
-            DispatchQueue.main.async { [weak self] in self?.writeNote(s) }
-        }
-    }
+    private static let stamp: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f
+    }()
 
-    private func writeNote(_ s: String) {
-        let line = "\(Self.ts()) \(s)"
-        log.insert(line, at: 0)
-        if log.count > 500 { log.removeLast() }
-        if let d = (line + "\n").data(using: .utf8) {
-            if let h = try? FileHandle(forWritingTo: logURL) {
-                h.seekToEndOfFile(); h.write(d); try? h.close()
-            } else {
-                try? d.write(to: logURL)
+    /// Everything goes through here. Two rules learned the hard way:
+    ///  * never touch @Published off the main thread (crash), and
+    ///  * never touch @Published once per line either (the UI freezes: dozens of frames a
+    ///    second, each one re-diffing a 500-row array). So lines land in a lock-protected
+    ///    buffer and a 4 Hz timer publishes them in one go.
+    private let logLock = NSLock()
+    private var rawLog: [String] = []
+    private var pendingLog: [String] = []
+    private var logFlush: Timer?
+    private var logHandle: FileHandle?
+
+    func note(_ s: String) {
+        let line = "\(Self.stamp.string(from: Date())) \(s)"
+        logLock.lock()
+        rawLog.append(line)
+        if rawLog.count > 400 { rawLog.removeFirst(rawLog.count - 400) }
+        pendingLog.append(line)
+        logLock.unlock()
+
+        appendToDisk(line)
+        print(line)
+
+        if logFlush == nil {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.logFlush = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
+                    self.flushLog()
+                }
+                self.flushLog()
             }
         }
-        print(line)
     }
 
-    static func ts() -> String {
-        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f.string(from: Date())
+    private func flushLog() {
+        logLock.lock()
+        let buffer = pendingLog
+        pendingLog.removeAll(keepingCapacity: true)
+        let snapshot = rawLog.reversed()
+        logLock.unlock()
+        guard !buffer.isEmpty else { return }
+        log = Array(snapshot)
     }
+
+    private func appendToDisk(_ line: String) {
+        if logHandle == nil {
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            }
+            logHandle = try? FileHandle(forWritingTo: logURL)
+            logHandle?.seekToEndOfFile()
+        }
+        if let d = (line + "\n").data(using: .utf8) {
+            try? logHandle?.write(contentsOf: d)
+        }
+    }
+
+    static func ts() -> String { stamp.string(from: Date()) }
 
     // MARK: scan / connect
 
@@ -339,6 +390,7 @@ final class Glasses: NSObject, ObservableObject {
         guard let own = owner else { note("建不出密钥对"); return }
         let sess = Session(stream: s, owner: own, log: { [weak self] in self?.note($0) })
         sess.forcedQuirks = Glasses.pendingQuirks
+        sess.blockOTA = Glasses.blockOTA
         session = sess
         // A crash inside handshake() would otherwise be repeated by auto-reconnect on every
         // launch, which is exactly the "闪退十几次" loop. We mark the attempt in flight and
@@ -348,15 +400,28 @@ final class Glasses: NSObject, ObservableObject {
         do {
             try sess.handshake(trust: trust)
             connected = true
-            if trust { UserDefaults.standard.set(true, forKey: "isOwner") }
-            trustLine = trust ? "已通过（这台 iPhone 是主人）" : "未验证（临时密钥，仅用于注册）"
-            glassesLine = "已连上 · trust=\(trust) · serial \(sess.peerSerial)"
+            if trust {
+                UserDefaults.standard.set(true, forKey: "isOwner")
+                trustLine = "已验证（这台 iPhone 是主人）"
+                ownerState = .verified
+            } else {
+                trustLine = "未验证（用的是临时密钥）"
+                ownerState = .unverified
+            }
+            glassesLine = "已连上 · serial \(sess.peerSerial)"
             note("✅ 握手完成（quirks=\(sess.quirks)）")
             UserDefaults.standard.set(Int(sess.quirks.rawValue), forKey: "quirkMode")
+            UserDefaults.standard.set(trust ? "verified" : "unverified", forKey: "ownerState")
+            UserDefaults.standard.set(Self.ts(), forKey: "ownerStateAt")
         } catch {
             trustLine = Glasses.explain(error)
             note("❌ 握手中断：\(error)")
             glassesLine = "握手失败：\(Glasses.explain(error))"
+            if case LinkError.trustRejected(let code) = error {
+                ownerState = .rejected(code)
+                UserDefaults.standard.set("rejected:\(code)", forKey: "ownerState")
+                UserDefaults.standard.set(Self.ts(), forKey: "ownerStateAt")
+            }
             // Release the link on failure: otherwise the next tap only reports
             // "链路已经打开了" and the user is stuck until the app is killed.
             sess.close()
@@ -405,6 +470,16 @@ final class Glasses: NSObject, ObservableObject {
     static var pendingQuirks: UInt64? {
         let v = UserDefaults.standard.object(forKey: "quirkMode") as? Int ?? -1
         return v < 0 ? nil : UInt64(v)
+    }
+
+    /// Refuse every svc29 (firmware update) request. Default on: the phone is the only
+    /// thing that can feed an update, so saying no is the real "do not update" switch.
+    static var blockOTA: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: "blockOTA") == nil { return true }
+            return UserDefaults.standard.bool(forKey: "blockOTA")
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "blockOTA") }
     }
 
     /// Tear the link down so the next connect starts from a clean slate. Without this a failed
@@ -1114,8 +1189,13 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
                 self.devices[i] = entry
             } else {
                 self.devices.append(entry)
-                let tag = isGlasses ? " ← 像眼镜" : (metaMfr ? "" : "")
-                self.note("发现 \(shown) rssi=\(RSSI)\(tag)")
+                // Noise control: a busy room has dozens of advertisers, and logging every
+                // one of them (each line = a timestamp + a UI update) is what made scanning
+                // feel like the app had hung. Log the glasses always, others only up to 8.
+                let tag = isGlasses ? " ← 像眼镜" : ""
+                if isGlasses || self.devices.count <= 8 {
+                    self.note("发现 \(shown) rssi=\(RSSI)\(tag)")
+                }
             }
             self.devices.sort { a, b in
                 if a.isGlasses != b.isGlasses { return a.isGlasses }
@@ -1187,8 +1267,11 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             self.connecting = false
             self.connectingID = nil
             self.note("L2CAP up psm=0x\(String(ch.psm, radix: 16))")
-            let hasOwner = self.owner != nil && UserDefaults.standard.bool(forKey: "isOwner")
-            await self.bringUp(trust: hasOwner)
+            // Always ask for trust when we actually hold a key. Gating this on the "isOwner"
+            // flag meant a fresh key never got tested, so the app opened the link and then
+            // quietly did nothing — indistinguishable from "no idea whether I'm the owner".
+            let hasKey = self.owner != nil
+            await self.bringUp(trust: hasKey)
         }
     }
 

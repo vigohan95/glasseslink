@@ -310,6 +310,17 @@ struct ShootTab: View {
                 } else {
                     LiveView(g: g)
                         .frame(maxHeight: .infinity)
+                    if g.ownerState != .verified {
+                        HStack(spacing: 8) {
+                            Image(systemName: "lock.fill").foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("眼镜还没认你为主人，拍照和录像会被拒绝").font(.caption)
+                                Text("先到「设备 → 主人身份」看它为什么拒绝。").font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                        .padding(.horizontal)
+                    }
                     HStack(spacing: 12) {
                         Button {
                             g.snap()
@@ -318,6 +329,7 @@ struct ShootTab: View {
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
+                        .disabled(g.ownerState != .verified)
 
                         Button {
                             g.toggleRecording()
@@ -327,6 +339,7 @@ struct ShootTab: View {
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.bordered)
+                        .disabled(g.ownerState != .verified)
                     }
                     .padding(.horizontal)
                     HStack(spacing: 8) {
@@ -544,8 +557,72 @@ struct DeviceSheet: View {
 }
 
 /// The list body, shared by the tab and the sheet.
-struct DeviceTabBody: View {
+/// One question, one answer: does the glasses accept the key this phone holds?
+struct OwnerBadge: View {
     @ObservedObject var g: Glasses
+
+    private var title: String {
+        switch g.ownerState {
+        case .unknown: return "还不知道（还没连过眼镜）"
+        case .unverified: return "未验证（当前用临时密钥）"
+        case .verified: return "已验证 · 这台 iPhone 是主人"
+        case .rejected(let code): return "被拒绝 · 0x\(String(code, radix: 16).uppercased())"
+        }
+    }
+
+    private var detail: String {
+        switch g.ownerState {
+        case .unknown: return "连一次眼镜就会拿到答案。"
+        case .unverified: return "导入过钥匙却仍显示未验证，说明连接时没有走 trust —— 点下面「重新验证」再看日志。"
+        case .verified: return "拍照、录像、取照片、改设置都已经解锁。"
+        case .rejected(let code):
+            return Glasses.explain(LinkError.trustRejected(code))
+        }
+    }
+
+    private var color: Color {
+        switch g.ownerState {
+        case .verified: return .green
+        case .rejected: return .red
+        case .unverified: return .orange
+        case .unknown: return .secondary
+        }
+    }
+
+    private var symbol: String {
+        switch g.ownerState {
+        case .verified: return "checkmark.seal.fill"
+        case .rejected: return "xmark.seal.fill"
+        case .unverified: return "questionmark.circle"
+        case .unknown: return "circle.dotted"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(title, systemImage: symbol)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(color)
+            Text(detail).font(.caption).foregroundStyle(.secondary)
+            if let at = UserDefaults.standard.string(forKey: "ownerStateAt") {
+                Text("上次验证：\(at)").font(.caption2).foregroundStyle(.secondary)
+            }
+            HStack(spacing: 10) {
+                Button("重新验证") {
+                    g.disconnect()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { g.connectTrusted() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(g.connectingID != nil)
+                Text(g.ownerFingerprint).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+struct DeviceTabBody: View {    @ObservedObject var g: Glasses
     @State private var showSettings = false
     @State private var showQuick = false
     @State private var showDiagnostics = false
@@ -568,8 +645,24 @@ struct DeviceTabBody: View {
                 }
             }
             Section("主人身份") {
-                Text(g.trustLine).font(.footnote)
+                OwnerBadge(g: g)
                 Button("一次性设置（导入或注册钥匙）") { g.route = .ownerSetup }
+            }
+
+            Section {
+                Toggle("拦截固件升级", isOn: Binding(
+                    get: { Glasses.blockOTA },
+                    set: { Glasses.blockOTA = $0 }
+                ))
+                Button("同时让眼镜关掉云端更新（cloud_ota_enabled = false）") {
+                    g.writeSetting("cloud_ota_enabled", value: "false")
+                }
+                .font(.footnote)
+            } header: {
+                Text("固件与隐私")
+            } footer: {
+                Text("眼镜要升级，必须是手机把固件文件喂给它。打开这个开关后，所有升级请求（svc29）都会被拒绝，眼镜就停在当前版本。云端那个设置是礼貌请求，这个开关是真正拦下的那道门。")
+                    .font(.caption2)
             }
             if !g.connected {
                 Section {
