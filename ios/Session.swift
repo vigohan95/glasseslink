@@ -583,7 +583,10 @@ final class Session {
             let m: DataX.Message
             do { m = try recvMessage(timeout: slice) } catch { continue }
             if let e = m.error, m.channel == mirror {
-                if e != Int(AirShield.stOK) {
+                // svc36 answers with 0x1000 (SUCCESS) on the mirror channel; 0x0000 also
+                // appears on plain data frames. Treating only the latter as success is what
+                // made an earlier build report "trust rejected" for a correct answer.
+                if e != Int(AirShield.stOK), e != Int(AirShield.stSuccess) {
                     throw LinkError.trustRejected(UInt16(e))
                 }
                 continue
