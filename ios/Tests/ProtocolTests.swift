@@ -77,7 +77,17 @@ final class ProtocolTests: XCTestCase {
         let two = P256ECDSA.mulG([2, 0, 0, 0, 0, 0, 0, 0])
         XCTAssertEqual(F.data(F.fromMont(two.x, F.p, F.n0p)).hexFull,
                        "7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978")
-        // k*G for the nonce pinned in tools/p256_ref.py
+        // walk a few small multiples: 3G needs the affine add path, 255G needs both
+        for (k, x) in [(3, "5ecbe4d1a6330a44c8f7ef951d4bf165e6c6b721efada985fb41661bc6e7fd6c"),
+                       (15, "f0454dc6971abae7adfb378999888265ae03af92de3a0ef163668c63e59b9d5f"),
+                       (255, "f44b39759a2e6db723a6f90249972dfd08e95380f1fca470eacd1d03e5edf214"),
+                       (65535, "f249104d0e6f8f29e6016277780cda84dc84b83bc3d899dfb736ca0831fbe8cf")] {
+            var kw = F.zero
+            kw[0] = UInt32(k & 0xFFFF_FFFF)
+            kw[1] = UInt32(UInt64(k) >> 32)
+            let p = P256ECDSA.mulG(kw)
+            XCTAssertEqual(F.data(F.fromMont(p.x, F.p, F.n0p)).hexFull, x, "\(k)G.x")
+        }        // k*G for the nonce pinned in tools/p256_ref.py
         let k = F.words(Data(hex: "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30"))
         let kg = P256ECDSA.mulG(k)
         XCTAssertEqual(F.data(F.fromMont(kg.x, F.p, F.n0p)).hexFull,
