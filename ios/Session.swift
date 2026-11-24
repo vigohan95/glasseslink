@@ -118,6 +118,12 @@ final class SDUStream: NSObject, StreamDelegate {
         }
     }
 
+    /// Bytes sitting in the buffer; only meaningful from a single-threaded test.
+    var debugBufferCount: Int {
+        cond.lock(); defer { cond.unlock() }
+        return buf.count
+    }
+
     /// How many bytes the frame at the head of the buffer occupies, if knowable.
     static func frameLength(_ b: Data) -> Int? {
         guard b.count >= 1 else { return nil }

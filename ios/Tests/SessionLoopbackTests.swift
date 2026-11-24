@@ -34,6 +34,18 @@ final class SessionLoopbackTests: XCTestCase {
         // and it must match what the glasses will hash: 0x04 || x || y
         XCTAssertEqual(owner.publicKey65.count, 65)
     }
+    /// The pipe itself, with Session out of the picture: this must fail loudly if
+    /// `writeHook`/`feed`/`nextFrame` disagree about ownership or locking.
+    func testLoopbackPipeDeliversAFrame() throws {
+        let (a, b) = SDUStream.loopbackPair()
+        let frame = Data([0x80, 0x01, 0x00, 0x01])          // 4-byte plaintext DataX
+        try a.write(frame)
+        print("[pipe] wrote \(frame.count)B, a.buf=\(a.debugBufferCount) b.buf=\(b.debugBufferCount)")
+        let got = try b.nextFrame(timeout: 2)
+        print("[pipe] read back \(got.count)B")
+        XCTAssertEqual(got, frame)
+        XCTAssertEqual(b.debugBufferCount, 0)
+    }
     func testFullHandshakeCaptureListAndTransfer() throws {
         // The fake peer still does not complete its side of the link; the signer it uses is
         // now verified, so what remains is the peer's own setup path.
