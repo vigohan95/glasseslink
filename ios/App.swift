@@ -15,6 +15,7 @@ import UniformTypeIdentifiers
 
 @main
 struct GlassesApp: App {
+    init() { CrashLog.install() }
     var body: some Scene { WindowGroup { RootView() } }
 }
 
@@ -107,6 +108,10 @@ final class Glasses: NSObject, ObservableObject {
             ownerLine = "owner key: 没有——先点「成为主人」"
         }
         note("启动。owner=\(owner == nil ? "无" : "有")")
+        if let prev = CrashLog.takePrevious() {
+            note("—— 上次崩溃现场 ——")
+            for line in prev.split(separator: "\n").prefix(40) { note("  \(line)") }
+        }
         loadThumbs()
     }
 
