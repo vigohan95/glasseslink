@@ -297,7 +297,10 @@ final class Session {
     /// and a different MAC word). Gen 2 firmware has been seen to advertise nothing and then
     /// silently drop frames sealed with the plain variant.
     var forcedQuirks: UInt64?
-    var multikey = false
+    // Parameters are 31 on both ends and 31 & 31 & 31 & MULTIKEY(4) != 0, so the two
+    // directions use different AES and HMAC keys. With this false the tag can never
+    // match, which looks exactly like a wrong key.
+    var multikey = true
     var log: (String) -> Void = { _ in }
 
     private var verboseLines = 0
@@ -368,6 +371,7 @@ final class Session {
                                   ownBase: UInt32, quirks: AirShield.Quirk,
                                   multikey: Bool) -> [RxCandidate] {
         let pairs: [(String, Data, Data)] = [
+            ("chal:own/seed:peer", ownChallenge, peerSeed),
             ("seed:own/chal:peer", ownSeed, peerChallenge),
             ("seed:peer/chal:own", peerChallenge, ownSeed),
             ("seed:own/chal:own", ownChallenge, ownSeed),

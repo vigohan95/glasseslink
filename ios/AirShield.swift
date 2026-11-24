@@ -377,7 +377,9 @@ enum AirShield {
                             quirks: Quirk, multikey: Bool = false) throws -> (send: Direction, recv: Direction) {
         let s = try deriveKeys(shared: shared, nonce: peerChallenge, seed: ownSeed, iv: ownIV,
                            quirks: quirks, multikey: multikey)
-        let r = try deriveKeys(shared: shared, nonce: peerSeed, seed: ownChallenge, iv: peerIV,
+        // Visor: rx = (nonce = myChallenge, seed = peerSeed, iv = peerIV). Swapping the
+        // first two produces a well-formed key that simply never matches the peer's HMAC.
+        let r = try deriveKeys(shared: shared, nonce: ownChallenge, seed: peerSeed, iv: peerIV,
                            quirks: quirks, multikey: multikey)
         return (Direction(s, seq: 0), Direction(r, seq: peerBaseSeq))
     }
