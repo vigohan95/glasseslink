@@ -917,7 +917,8 @@ final class Glasses: NSObject, ObservableObject {
             return
         }
         let data = Data(text.utf8)
-        guard let parsed = try? OwnerMaterial.loadAny(from: try? writeTemp(data)) else {
+        guard let temp = try? writeTemp(data),
+              let parsed = try? OwnerMaterial.loadAny(from: temp) else {
             note("剪贴板内容不是 owner key（要含 publicKeyXy 与 privateKeyPkcs8 两行）")
             return
         }
