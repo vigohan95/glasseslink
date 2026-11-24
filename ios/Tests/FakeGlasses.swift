@@ -271,7 +271,10 @@ final class FakeGlasses {
     private func write(_ data: Data) throws { try stream.write(data) }
 
     private func readPlain(timeout: TimeInterval) throws -> Data {
-        try stream.nextFrame(timeout: timeout)
+        print("[glass] readPlain: buffered=\(stream.debugBufferCount)B")
+        let f = try stream.nextFrame(timeout: timeout)
+        print("[glass] readPlain: got \(f.count)B")
+        return f
     }
 
     private func readSealed(timeout: TimeInterval) throws -> Data {

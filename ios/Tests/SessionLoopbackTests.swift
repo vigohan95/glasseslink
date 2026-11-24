@@ -38,13 +38,27 @@ final class SessionLoopbackTests: XCTestCase {
     /// `writeHook`/`feed`/`nextFrame` disagree about ownership or locking.
     func testLoopbackPipeDeliversAFrame() throws {
         let (a, b) = SDUStream.loopbackPair()
-        let frame = Data([0x80, 0x01, 0x00, 0x01])          // 4-byte plaintext DataX
+        // a plaintext DataX frame: 0x80 0x00 = no extension + 0 payload, 0x00 0x01 = channel
+        let frame = Data([0x80, 0x00, 0x00, 0x01])
         try a.write(frame)
         print("[pipe] wrote \(frame.count)B, a.buf=\(a.debugBufferCount) b.buf=\(b.debugBufferCount)")
         let got = try b.nextFrame(timeout: 2)
         print("[pipe] read back \(got.count)B")
         XCTAssertEqual(got, frame)
         XCTAssertEqual(b.debugBufferCount, 0)
+
+        // and the real handshake payloads must stay inside one frame
+        for payload in [try AirShield.requestEncryption(pubkey: Data(repeating: 7, count: 64),
+                                                        challenge: Data(repeating: 9, count: 16),
+                                                        quirks: .none),
+                        try AirShield.enableEncryption(pubkey: Data(repeating: 7, count: 64),
+                                                       seed: Data(repeating: 5, count: 32),
+                                                       iv: Data(repeating: 3, count: 16),
+                                                       baseSeq: 0, quirks: .none)] {
+            try a.write(payload)
+            let back = try b.nextFrame(timeout: 2)
+            XCTAssertEqual(back, payload)
+        }
     }
     func testFullHandshakeCaptureListAndTransfer() throws {
         // The fake peer still does not complete its side of the link; the signer it uses is
