@@ -248,7 +248,9 @@ enum P256ECDSA {
         let u2 = F.mulModP(q.x, z1z1)
         let s2 = F.mulModP(F.mulModP(q.y, p.z), z1z1)
         let h = F.subMod(u2, p.x, F.p)
-        let r = F.subMod(s2, p.y, F.p)
+        // mixed addition defines r = 2*(S2 - Y1); dropping the doubling is the classic
+        // "3G is wrong but 2G looks fine" bug.
+        let r = F.addMod(F.subMod(s2, p.y, F.p), F.subMod(s2, p.y, F.p), F.p)
         if h == F.zero {
             if r == F.zero { return jDouble(p) }
             return Jacobian(x: F.zero, y: F.zero, z: F.zero)   // P + (-P)
