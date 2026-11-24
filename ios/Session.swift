@@ -357,7 +357,7 @@ final class Session {
 
     struct RxCandidate {
         let label: String
-        let dir: AirShield.Direction
+        let dir: Direction
     }
 
     /// Every combination the receive direction could plausibly use on a link where the
@@ -391,7 +391,7 @@ final class Session {
                                                             iv: ivValue, quirks: quirks, multikey: multikey)
                     else { continue }
                     out.append(RxCandidate(label: "\(pn) \(ivn) \(sn)",
-                                           dir: AirShield.Direction(k, seq: seq)))
+                                           dir: Direction(k, seq: seq)))
                 }
             }
         }
@@ -401,7 +401,7 @@ final class Session {
     /// Try each candidate key against one encrypted frame. A wrong key fails the HMAC,
     /// so at most one candidate can succeed — no guessing in the caller.
     static func firstWorkingCandidate(_ sdu: Data, options: [RxCandidate])
-        -> (label: String, dir: AirShield.Direction, plain: Data)? {
+        -> (label: String, dir: Direction, plain: Data)? {
         for option in options {
             if let plain = try? option.dir.open(sdu) {
                 return (option.label, option.dir, plain)
