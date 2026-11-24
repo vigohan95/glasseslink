@@ -21,6 +21,7 @@ targets:
       - SelfTest.swift
       - SelfTestView.swift
       - CrashLog.swift
+      - LogStore.swift
       - ScanEntry.swift
       - Varm.swift
       - Provision.swift
@@ -53,8 +54,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "0.82"
-        CFBundleVersion: "82"
+        CFBundleShortVersionString: "0.83"
+        CFBundleVersion: "83"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。

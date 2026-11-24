@@ -606,8 +606,10 @@ final class Session {
         // services) happens after that. Without it the glasses answer nothing on svc36 —
         // the log showed `timeout awaiting svc36 0x3001 identity` right after a clean handshake.
         // Tolerate silence here: a device that does not want a link setup answer still gets trust.
+        // 2 s, not 6: on this firmware the glasses never answer it, and waiting longer only
+        // makes every connect feel like the app froze.
         do {
-            try endLinkSetup(timeout: min(timeout, 6))
+            try endLinkSetup(timeout: min(timeout, 2))
         } catch {
             emit("EndLinkSetup 未应答（\(error)）——继续尝试 trust")
         }

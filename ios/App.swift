@@ -45,7 +45,6 @@ final class Glasses: NSObject, ObservableObject {
     }
     @Published var route: Route?
 
-    @Published var log: [String] = []
 
     /// Whether the glasses accepted the key we hold. This is the single question a user has
     /// ("am I the owner or not?"), so it gets its own state instead of hiding in a log line.
@@ -148,6 +147,7 @@ final class Glasses: NSObject, ObservableObject {
         let info = Bundle.main.infoDictionary
         let short = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
+        LogStore.shared.start(fileURL: logURL)
         note("GlassesLink \(short) (\(build)) · iOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
         note("启动。owner=\(owner == nil ? "无" : "有")")
         switch UserDefaults.standard.string(forKey: "ownerState") ?? "" {
@@ -180,67 +180,19 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: logging (kept on disk so it can be shared from the phone)
 
-    private static let stamp: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f
-    }()
-
     /// Everything goes through here. Two rules learned the hard way:
     ///  * never touch @Published off the main thread (crash), and
     ///  * never touch @Published once per line either (the UI freezes: dozens of frames a
     ///    second, each one re-diffing a 500-row array). So lines land in a lock-protected
     ///    buffer and a 4 Hz timer publishes them in one go.
-    private let logLock = NSLock()
-    private var rawLog: [String] = []
-    private var pendingLog: [String] = []
-    private var logFlush: Timer?
-    private var logHandle: FileHandle?
-
     func note(_ s: String) {
-        let line = "\(Self.stamp.string(from: Date())) \(s)"
-        logLock.lock()
-        rawLog.append(line)
-        if rawLog.count > 400 { rawLog.removeFirst(rawLog.count - 400) }
-        pendingLog.append(line)
-        logLock.unlock()
-
-        appendToDisk(line)
-        print(line)
-
-        if logFlush == nil {
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.logFlush = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
-                    self.flushLog()
-                }
-                self.flushLog()
-            }
-        }
+        LogStore.shared.append(s)
     }
 
-    private func flushLog() {
-        logLock.lock()
-        let buffer = pendingLog
-        pendingLog.removeAll(keepingCapacity: true)
-        let snapshot = rawLog.reversed()
-        logLock.unlock()
-        guard !buffer.isEmpty else { return }
-        log = Array(snapshot)
-    }
+    /// Kept for the diagnostics screen; newest first.
+    var log: [String] { LogStore.shared.lines }
 
-    private func appendToDisk(_ line: String) {
-        if logHandle == nil {
-            if !FileManager.default.fileExists(atPath: logURL.path) {
-                FileManager.default.createFile(atPath: logURL.path, contents: nil)
-            }
-            logHandle = try? FileHandle(forWritingTo: logURL)
-            logHandle?.seekToEndOfFile()
-        }
-        if let d = (line + "\n").data(using: .utf8) {
-            try? logHandle?.write(contentsOf: d)
-        }
-    }
-
-    static func ts() -> String { stamp.string(from: Date()) }
+    static func ts() -> String { LogStore.ts() }
 
     // MARK: scan / connect
 
@@ -398,7 +350,12 @@ final class Glasses: NSObject, ObservableObject {
         UserDefaults.standard.set(true, forKey: "linkInFlight")
         defer { UserDefaults.standard.set(false, forKey: "linkInFlight") }
         do {
-            try sess.handshake(trust: trust)
+            // handshake() blocks on NSCondition while it waits for the glasses (up to 12 s).
+            // Calling it straight from a @MainActor method froze the whole UI for the whole
+            // wait — that is the "tapping anything takes seconds" report. Run it off-main.
+            try await Task.detached(priority: .userInitiated) {
+                try sess.handshake(trust: trust)
+            }.value
             connected = true
             if trust {
                 UserDefaults.standard.set(true, forKey: "isOwner")
@@ -1359,6 +1316,7 @@ struct ModelClient {
 
 struct ContentView: View {
     @ObservedObject var g: Glasses
+    @ObservedObject private var logStore = LogStore.shared
     @State private var question = "我面前有什么？有台阶或障碍物吗？"
     @State private var showLogin = false
     @State private var showSettings = false
@@ -1509,16 +1467,16 @@ struct ContentView: View {
                     }
                     // A wall of text is not a log viewer. Newest 12 lines inline, the rest behind
                     // one disclosure, and the count in the header so you know what you're hiding.
-                    if g.log.isEmpty {
+                    if logStore.lines.isEmpty {
                         Text("还没有日志").font(.footnote).foregroundStyle(.secondary)
                     } else {
-                        ForEach(Array(g.log.prefix(12).enumerated()), id: \.offset) { _, line in
+                        ForEach(Array(logStore.lines.prefix(12).enumerated()), id: \.offset) { _, line in
                             Text(line).font(.system(size: 11, design: .monospaced))
                                 .lineLimit(2)
                         }
-                        if g.log.count > 12 {
-                            DisclosureGroup("更早的 \(g.log.count - 12) 行") {
-                                ForEach(Array(g.log.dropFirst(12).enumerated()), id: \.offset) { _, line in
+                        if logStore.lines.count > 12 {
+                            DisclosureGroup("更早的 \(logStore.lines.count - 12) 行") {
+                                ForEach(Array(logStore.lines.dropFirst(12).enumerated()), id: \.offset) { _, line in
                                     Text(line).font(.system(size: 11, design: .monospaced))
                                         .lineLimit(3)
                                 }

@@ -1,0 +1,17 @@
+Swift/SwiftUI review. Be concrete and blunt; answer with code, not generalities.
+
+App: a SwiftUI client for Bluetooth smart glasses. Session layer: CBCentralManager -> openL2CAPChannel -> custom framed stream (SDUStream) -> handshake (ECDH P-256, AES-256-CBC + HMAC per frame) -> service messages (svc18 gallery, svc20 file transfer, svc28 shutter, svc30 live, svc31/33 settings, svc15 assistant).
+
+Reported on a real device: "everything lags, tapping a button takes seconds", "no indication whether the owner handshake succeeded", "camera buttons do nothing".
+
+Changed this round:
+1. Logging was `@Published var log: [String]` with `insert(at: 0)` per line plus opening and closing a FileHandle per line, called from the BLE read thread dozens of times a second. Now: NSLock-protected ring buffer (400 lines) plus a pending buffer, published by a 0.25 s Timer on main; persistent FileHandle opened once; static DateFormatter.
+2. Trust gating was `bringUp(trust: owner != nil && UserDefaults.bool("isOwner"))`, so a freshly imported key was never tested: the app connected and silently did nothing. Now trust runs whenever a key exists, and the verdict is `enum OwnerState { unknown, unverified, verified, rejected(UInt16) }` shown as a badge with a persisted timestamp.
+3. Camera buttons disabled unless OwnerState == .verified, with a one-line explanation.
+4. Firmware update service (svc29) messages are dropped and answered with 0xC001; there is a toggle.
+
+Questions:
+1. Is the batching approach sound, or will the 0.25 s Timer still invalidate the whole view tree? Should the log live in its own ObservableObject and be observed only by the diagnostics screen? Show the minimal refactor (code).
+2. `Glasses` is `NSObject, ObservableObject` with about 40 @Published properties mutated from CoreBluetooth callbacks bridged through `Task { @MainActor }`. What is the cheapest structural change that removes whole-tree re-renders without rewriting the app?
+3. Where are the hidden main-thread stalls? Specifically: `SDUStream(channel:)` created inside a @MainActor function, `openL2CAPChannel` called from a Task, and `session.handshake()` being synchronous and blocking (it waits on NSCondition for up to 12 s) while invoked from a @MainActor function. Show the correct way to run a blocking handshake off the main actor and keep the UI responsive while it waits.
+4. Risks in the logging change: reentrancy, Timer retain cycle, FileHandle lifetime, and the flush path clearing `pendingLog` under a lock.
