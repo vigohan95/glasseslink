@@ -579,8 +579,16 @@ final class Session {
                                            seed: seed, phonePubkey: pub)
         emit("keys up — encrypted from here")
 
-        // EndLinkSetup is *not* ours to start: the glasses send theirs and we answer with a
-        // bare 0x1000 status. Sending ours unprompted is what kept the real device silent.
+        // Visor's SecureLink.open() finishes with finishLinkSetup(); everything else (trust,
+        // services) happens after that. Without it the glasses answer nothing on svc36 —
+        // the log showed `timeout awaiting svc36 0x3001 identity` right after a clean handshake.
+        // Tolerate silence here: a device that does not want a link setup answer still gets trust.
+        do {
+            try endLinkSetup(timeout: min(timeout, 6))
+        } catch {
+            emit("EndLinkSetup 未应答（\(error)）——继续尝试 trust")
+        }
+
         if trust { try doTrust(timeout: timeout) }
     }
 
