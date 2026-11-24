@@ -482,8 +482,7 @@ final class Session {
 
             if let code = m.error {
                 guard code == Int(AirShield.stSuccess) || code == Int(AirShield.stOK) else {
-                    throw LinkError.serviceError(step: "EndLinkSetup",
-                                                 code: UInt16(truncatingIfNeeded: code))
+                    throw LinkError.serviceError("EndLinkSetup", UInt16(truncatingIfNeeded: code))
                 }
                 if !answeredPeer {
                     try sendAny(AirShield.endLinkStatus)
