@@ -47,6 +47,18 @@ final class Glasses: NSObject, ObservableObject {
 
     @Published var log: [String] = []
     @Published var devices: [ScanEntry] = []
+    /// Which row is currently being connected, so the list can show a spinner instead of a button.
+    @Published var connectingID: UUID?
+    @Published var scanning = false
+
+    /// The glasses first, then anything with a real name. Unnamed noise goes behind a disclosure —
+    /// a busy room otherwise fills the screen with a dozen UUIDs.
+    var primaryDevices: [ScanEntry] {
+        devices.filter { $0.isGlasses || !$0.displayName.hasPrefix("未命名设备") }
+    }
+    var otherDevices: [ScanEntry] {
+        devices.filter { !($0.isGlasses || !$0.displayName.hasPrefix("未命名设备")) }
+    }
     private var scanTimer: Timer?
     private var scanRound = 0
     private let scanRounds = 6
@@ -66,6 +78,12 @@ final class Glasses: NSObject, ObservableObject {
 
     @Published var modelBaseURL = UserDefaults.standard.string(forKey: "modelBaseURL") ?? "http://192.168.3.90:11434/v1"
     @Published var modelName = UserDefaults.standard.string(forKey: "modelName") ?? "gemma3:4b"
+    @Published var modelKey = UserDefaults.standard.string(forKey: "modelKey") ?? "" {
+        didSet { UserDefaults.standard.set(modelKey, forKey: "modelKey") }
+    }
+    @Published var testingModel = false
+    @Published var modelTestLine = ""
+    @Published var modelTestOK = false
     @Published var settings: [String: String] = [:]
     @Published var settingsLoading = false
     @Published var status = GlassesState()
@@ -181,6 +199,7 @@ final class Glasses: NSObject, ObservableObject {
         guard central.state == .poweredOn else { note("蓝牙不可用：\(central.state.rawValue)"); return }
         devices.removeAll()
         scanRound = 0
+        scanning = true
         beginScanRound()
     }
 
@@ -201,6 +220,7 @@ final class Glasses: NSObject, ObservableObject {
             Task { @MainActor in
                 self.central.stopScan()
                 if self.devices.contains(where: { $0.isGlasses }) {
+                    self.scanning = false
                     self.note("看到眼镜了，点列表最上面那条")
                     return
                 }
@@ -208,6 +228,7 @@ final class Glasses: NSObject, ObservableObject {
                     self.beginScanRound()
                     return
                 }
+                self.scanning = false
                 if self.devices.isEmpty {
                     self.note("六轮都没扫到任何设备：确认蓝牙是开的、GlassesLink 有蓝牙权限")
                 } else {
@@ -259,9 +280,11 @@ final class Glasses: NSObject, ObservableObject {
             return
         }
         connecting = true
+        connectingID = id
         lastConnectAt = Date()
         guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
             connecting = false
+            connectingID = nil
             note("找不到这台设备（先扫描一次）"); return
         }
         central.stopScan()
@@ -390,6 +413,7 @@ final class Glasses: NSObject, ObservableObject {
         if let p = peripheral { central.cancelPeripheralConnection(p) }
         connected = false
         connecting = false
+        connectingID = nil
         glassesLine = "未连接"
         note("已断开，可以重新点了")
     }
@@ -784,8 +808,28 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     // MARK: ask your own model
-    func ask(_ question: String) {
-        guard let photo = lastPhoto else { note("先拍一张"); return }
+    func testModel() {
+        UserDefaults.standard.set(modelBaseURL, forKey: "modelBaseURL")
+        UserDefaults.standard.set(modelName, forKey: "modelName")
+        testingModel = true
+        modelTestLine = ""
+        Task {
+            defer { testingModel = false }
+            let started = Date()
+            do {
+                let raw = try await ModelClient(baseURL: modelBaseURL, model: modelName).ping()
+                let ms = Int(Date().timeIntervalSince(started) * 1000)
+                let snippet = raw.replacingOccurrences(of: "\n", with: " ").prefix(60)
+                modelTestOK = true
+                modelTestLine = "通了 · \(ms) ms · \(snippet)"
+            } catch {
+                modelTestOK = false
+                modelTestLine = "失败：\(error)"
+            }
+        }
+    }
+
+    func ask(_ question: String) {        guard let photo = lastPhoto else { note("先拍一张"); return }
         UserDefaults.standard.set(modelBaseURL, forKey: "modelBaseURL")
         UserDefaults.standard.set(modelName, forKey: "modelName")
         busy = true
@@ -1090,6 +1134,7 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
         Task { @MainActor in
             self.connected = false
             self.connecting = false
+            self.connectingID = nil
             self.glassesLine = "断开"
             self.note("断开：\(error?.localizedDescription ?? "正常")")
         }
@@ -1099,6 +1144,7 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
         Task { @MainActor in
             self.connected = false
             self.connecting = false
+            self.connectingID = nil
             self.note("连接失败：\(error?.localizedDescription ?? "?")")
         }
     }
@@ -1121,6 +1167,7 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             }
             self.channel = ch
             self.connecting = false
+            self.connectingID = nil
             self.note("L2CAP up psm=0x\(String(ch.psm, radix: 16))")
             let hasOwner = self.owner != nil && UserDefaults.standard.bool(forKey: "isOwner")
             await self.bringUp(trust: hasOwner)
@@ -1142,6 +1189,33 @@ struct ModelClient {
     let baseURL: String
     let model: String
     var log: (String) -> Void = { _ in }
+
+    /// Text-only round trip, used by the "测试连通性" button: it answers "is the address right,
+    /// is the key right, does the model exist" in one second instead of during a camera question.
+    func ping() async throws -> String {
+        guard var comps = URLComponents(string: baseURL) else { throw LinkError.io("bad base URL") }
+        comps.path = (comps.path.hasSuffix("/") ? comps.path : comps.path + "/") + "chat/completions"
+        guard let url = comps.url else { throw LinkError.io("bad base URL") }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 30
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let key = UserDefaults.standard.string(forKey: "modelKey") ?? ""
+        if !key.isEmpty { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        let body: [String: Any] = [
+            "model": model,
+            "max_tokens": 16,
+            "messages": [["role": "user", "content": "Reply with the single word: ok"]],
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw LinkError.io("没有 HTTP 响应") }
+        let text = String(data: data, encoding: .utf8) ?? ""
+        guard http.statusCode == 200 else {
+            throw LinkError.io("HTTP \(http.statusCode)：\(text.prefix(160))")
+        }
+        return text
+    }
 
     func ask(question: String, jpeg: Data) async throws -> String {
         guard var comps = URLComponents(string: baseURL) else { throw LinkError.io("bad base URL") }
@@ -1332,8 +1406,23 @@ struct ContentView: View {
                         Spacer()
                         Button("复制全部") { g.copyLog() }
                     }
-                    ForEach(Array(g.log.enumerated()), id: \.offset) { _, line in
-                        Text(line).font(.system(size: 11, design: .monospaced))
+                    // A wall of text is not a log viewer. Newest 12 lines inline, the rest behind
+                    // one disclosure, and the count in the header so you know what you're hiding.
+                    if g.log.isEmpty {
+                        Text("还没有日志").font(.footnote).foregroundStyle(.secondary)
+                    } else {
+                        ForEach(Array(g.log.prefix(12).enumerated()), id: \.offset) { _, line in
+                            Text(line).font(.system(size: 11, design: .monospaced))
+                                .lineLimit(2)
+                        }
+                        if g.log.count > 12 {
+                            DisclosureGroup("更早的 \(g.log.count - 12) 行") {
+                                ForEach(Array(g.log.dropFirst(12).enumerated()), id: \.offset) { _, line in
+                                    Text(line).font(.system(size: 11, design: .monospaced))
+                                        .lineLimit(3)
+                                }
+                            }
+                        }
                     }
                 }
             }

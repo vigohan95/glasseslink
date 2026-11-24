@@ -428,26 +428,81 @@ struct ModelSheet: View {
     @ObservedObject var g: Glasses
     @Environment(\.dismiss) private var dismiss
 
+    /// Presets first: most people run one of these and only need to paste a key.
+    private struct Preset: Identifiable {
+        let id = UUID()
+        let label: String
+        let base: String
+        let model: String
+        let hint: String
+    }
+    private let presets: [Preset] = [
+        .init(label: "本地 Ollama", base: "http://192.168.3.90:11434/v1", model: "gemma3:4b",
+              hint: "电脑上跑 ollama serve；模型名填 ollama list 里的名字"),
+        .init(label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-mini",
+              hint: "key 填 sk-… 开头那个"),
+        .init(label: "DeepSeek", base: "https://api.deepseek.com/v1", model: "deepseek-chat",
+              hint: "key 在 platform.deepseek.com 里建"),
+        .init(label: "OpenRouter", base: "https://openrouter.ai/api/v1", model: "google/gemini-2.5-flash",
+              hint: "一个 key 走很多家模型"),
+        .init(label: "自建 / 其他", base: "", model: "", hint: "任何 OpenAI 兼容的 /v1/chat/completions"),
+    ]
+
     var body: some View {
         NavigationStack {
             Form {
-                Section("OpenAI 兼容地址") {
-                    TextField("http://192.168.3.90:11434/v1", text: Binding(
+                Section("选择服务") {
+                    ForEach(presets) { p in
+                        Button {
+                            if !p.base.isEmpty { g.modelBaseURL = p.base }
+                            if !p.model.isEmpty { g.modelName = p.model }
+                        } label: {
+                            HStack {
+                                Text(p.label)
+                                Spacer()
+                                if g.modelBaseURL == p.base, !p.base.isEmpty {
+                                    Image(systemName: "checkmark").foregroundStyle(.cyan)
+                                }
+                            }
+                        }
+                    }
+                }
+                Section("地址（OpenAI 兼容）") {
+                    TextField("https://…/v1", text: Binding(
                         get: { g.modelBaseURL }, set: { g.modelBaseURL = $0 }))
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
                 }
                 Section("模型名") {
-                    TextField("gemma3:4b", text: Binding(
+                    TextField("模型名", text: Binding(
                         get: { g.modelName }, set: { g.modelName = $0 }))
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    TextField("API key（本地 Ollama 可留空）", text: Binding(
+                        get: { g.modelKey }, set: { g.modelKey = $0 }))
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                 }
                 Section {
-                    Text("本地 Ollama 用 http://<电脑IP>:11434/v1，模型名填 ollama list 里的名字。")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                    Text(presets.first { $0.base == g.modelBaseURL }?.hint
+                         ?? "任何兼容 /v1/chat/completions 的服务都能用；带图的模型才能看图。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section {
+                    Button {
+                        g.testModel()
+                    } label: {
+                        HStack {
+                            Text("测试连通性")
+                            Spacer()
+                            if g.testingModel { ProgressView().controlSize(.small) }
+                        }
+                    }
+                    if !g.modelTestLine.isEmpty {
+                        Text(g.modelTestLine).font(.footnote)
+                            .foregroundStyle(g.modelTestOK ? Color.green : Color.orange)
+                    }
                 }
             }
             .navigationTitle("模型")
@@ -517,22 +572,55 @@ struct DeviceTabBody: View {
                 Button("一次性设置（导入或注册钥匙）") { g.route = .ownerSetup }
             }
             if !g.connected {
-                Section("附近的眼镜") {
+                Section {
                     if g.devices.isEmpty {
-                        Text("把眼镜双镜腿折起来，长按拍摄键 5 秒到指示灯闪蓝，再点扫描。")
-                            .font(.footnote).foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("还没看到眼镜", systemImage: "eyeglasses")
+                                .font(.subheadline.weight(.semibold))
+                            Text("① 把双镜腿折起来\n② 长按右侧拍摄键 5 秒，直到镜框内侧闪蓝\n③ 回到这里点「扫描」")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                     }
-                    ForEach(g.devices) { d in
+                    ForEach(g.primaryDevices) { d in
                         Button { g.connect(d.id) } label: {
-                            HStack {
+                            HStack(spacing: 12) {
                                 Image(systemName: d.isGlasses ? "eyeglasses" : "dot.radiowaves.left.and.right")
                                     .foregroundStyle(d.isGlasses ? Color.cyan : Color.secondary)
-                                Text(d.name)
+                                    .frame(width: 22)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(d.displayName).foregroundStyle(.primary)
+                                    if d.isGlasses {
+                                        Text("点一下连接").font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                }
                                 Spacer()
-                                Text("\(d.rssi) dBm").font(.caption2).foregroundStyle(.secondary)
+                                if g.connectingID == d.id {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Text("\(d.rssi) dBm").font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .disabled(g.connectingID != nil)
+                    }
+                    if !g.otherDevices.isEmpty {
+                        DisclosureGroup("其他 \(g.otherDevices.count) 个蓝牙信号") {
+                            ForEach(g.otherDevices) { d in
+                                HStack {
+                                    Text(d.displayName).font(.footnote)
+                                    Spacer()
+                                    Text("\(d.rssi) dBm").font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
                     }
+                } header: {
+                    Text("附近的眼镜")
+                } footer: {
+                    if g.scanning { Text("正在扫描…（20 秒自动停）") }
                 }
             }
             if g.connected {
