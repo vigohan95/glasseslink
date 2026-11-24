@@ -94,3 +94,8 @@
 - `ios/Tests/SessionLoopbackTests.swift` 里的 `testLoopbackPipeDeliversAFrame` 现在通过：这对 `SDUStream` 的 `writeHook`/`feed`/`nextFrame` 是真正的回归测试（此前的 4 字节帧是我自己写错了长度位，`0x80 0x01` 声明 1 字节负载，管道本身没问题）。
 - 仍然是 skip 的：`testFullHandshakeCaptureListAndTransfer` / `testHandshakeWithoutTrust`。假眼镜在第二阶段会把测试进程带崩（`Restarting after unexpected exit`），现象是「双方都停在等对方」，与真实协议无关；已记录，下一步用 Python 的 `pi/selftest_session.py` 逐步对照重写。
 - 版本号换到 `CFBundleShortVersionString 0.20 / CFBundleVersion 20`（之前几次改的是 yml 里不存在的 `version:` 键，ipa 里其实一直是 0.16）。
+## v0.21.0 (2026-11-23) — 一键复制日志 + 迁移手册
+
+- 日志页加「复制全部」：出问题时一次粘贴就能把现场发出来（`Glasses.copyLog()` 写 `UIPasteboard`，按时间正序）。
+- `OWNER-MIGRATION.md` 重写为四步 runbook（导出 → 转换 → 导入 → 验证），并明确打补丁的 Visor 包名是 `com.macedonga.visor.owner`（与正版并排共存、不动现有 owner key），附失败对照表（0x1044 / 0x1010 / 0x1042 / 卡在 RequestEncryption）。
+- 本轮仍未解决：回环用例 skip（假眼镜不忠实）；owner 迁移仍等用户在手机上完成 Meta 登录。
