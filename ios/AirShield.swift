@@ -29,6 +29,12 @@ import Security
 extension Data {
     var hex: String { map { String(format: "%02x", $0) }.joined() }
     var hexShort: String { let h = hex; return h.count > 32 ? String(h.prefix(32)) + "…" : h }
+    /// Full hex, capped so a 100 KB photo frame cannot blow up the log.
+    var hexCapped: String {
+        let cap = 512
+        guard count > cap else { return hex }
+        return String(hex.prefix(cap)) + "…(+\(count - cap / 2)B)"
+    }
 
     static func random(_ n: Int) -> Data {
         var d = Data(count: n)

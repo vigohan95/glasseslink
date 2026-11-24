@@ -257,11 +257,18 @@ final class Session {
     static let mtSyncData: UInt16 = 2
     static let mtAck: UInt16 = 3
 
+    /// Turn on from the UI before connecting: logs up to 60 frames as full hex
+    /// instead of the 16-byte prefix, which is what you need when the glasses
+    /// reject a trust frame and all you get back is a status code.
+    static var verbose = false
+
     let stream: SDUStream
     let owner: OwnerMaterial
     var quirks: AirShield.Quirk = .none
     var multikey = false
     var log: (String) -> Void = { _ in }
+
+    private var verboseLines = 0
 
     private var send: Direction?
     private var recv: Direction?
@@ -287,7 +294,14 @@ final class Session {
 
     private func emit(_ s: String, _ data: Data? = nil, inbound: Bool = false) {
         var line = "\(inbound ? "<-" : "->") \(s)"
-        if let d = data { line += " (\(d.count)B) \(d.hexShort)" }
+        if let d = data {
+            if Session.verbose, verboseLines < 60 {
+                verboseLines += 1
+                line += " (\(d.count)B) \(d.hexCapped)"
+            } else {
+                line += " (\(d.count)B) \(d.hexShort)"
+            }
+        }
         log(line)
     }
 
@@ -308,8 +322,26 @@ final class Session {
     private func recvMessage(timeout: TimeInterval) throws -> DataX.Message {
         let sdu = try stream.nextFrame(timeout: timeout)
         let plain: Data
-        if let r = recv { plain = try r.open(sdu) } else { plain = sdu }
-        let msg = try DataX.parse(plain)
+        if let r = recv {
+            do {
+                plain = try r.open(sdu)
+            } catch {
+                // A decrypt failure is the single most common real-device symptom,
+                // so keep the raw bytes: they tell us whether the keys disagree or
+                // the framing is off by a byte.
+                emit("decrypt FAILED (\(error))", sdu, inbound: true)
+                throw error
+            }
+        } else {
+            plain = sdu
+        }
+        let msg: DataX.Message
+        do {
+            msg = try DataX.parse(plain)
+        } catch {
+            emit("parse FAILED (\(error))", plain, inbound: true)
+            throw error
+        }
         emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
              plain, inbound: true)
         return msg
@@ -387,6 +419,7 @@ final class Session {
 
     private func doTrust(timeout: TimeInterval) throws {
         let sig = try owner.signRaw(digest: binding)
+        emit("trust: binding=\(binding.hexShort) sig=\(sig.hexShort) key=\(owner.publicKeyXy.hexShort)")
         try sendAny(AirShield.trustMessage(ownerPubkey: owner.publicKeyXy, signatureRaw: sig))
         // 1) the glasses' own ENABLE_TRUST (0x1001), 2) a status frame on the mirror channel
         while true {
@@ -394,18 +427,24 @@ final class Session {
             if m.service == AirShield.svcIdentity, m.type == Int(AirShield.idEnableTrustEC) { break }
             log("   (ignoring during trust: ch=0x\(String(m.channel, radix: 16)) type=\(m.type.map(String.init) ?? "-"))")
         }
+        // The glasses answer svc36 with 0x1000 on success; anything else is a real
+        // rejection (0x1010 key not found, 0x1044 bad signature, …).
         while true {
             let m = try recvMessage(timeout: timeout)
             if let code = m.error {
-                guard code != Int(AirShield.stOK) else { return }
-                throw LinkError.trustRejected(UInt16(code))
+                guard code == Int(AirShield.stSuccess) else {
+                    throw LinkError.trustRejected(UInt16(truncatingIfNeeded: code))
+                }
+                emit("trust ok (0x1000)")
+                return
             }
-            if let code = m.error, code == Int(AirShield.stSuccess) { return }
         }
     }
 
     private func endLinkSetup(timeout: TimeInterval) throws {
-        try sendAny(try AirShield.endLinkSetup(streamUUID: streamUUID, linkUUID: linkUUID))
+        let frame = try AirShield.endLinkSetup(streamUUID: streamUUID, linkUUID: linkUUID)
+        emit("EndLinkSetup (\(frame.count)B)")
+        try sendAny(frame)
         while true {
             let m = try recvMessage(timeout: timeout)
             if m.type == 0x1000 { break }

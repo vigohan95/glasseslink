@@ -747,6 +747,7 @@ struct ContentView: View {
     @State private var showImport = false
     @State private var showLive = false
     @State private var showQuick = false
+    @State private var verboseLog = false
 
     var body: some View {
         NavigationStack {
@@ -762,6 +763,10 @@ struct ContentView: View {
                         Button("连接 \(d.name)") { g.connect(d.id) }
                     }
                     Button("重新握手（setup 链路，不验 owner）") { g.connectSetup() }
+                    Toggle("详细日志（抓完整帧，排查用）", isOn: $verboseLog)
+                        .onChange(of: verboseLog) { _, on in Session.verbose = on }
+                    Text("打开后每帧最多记 512 字节十六进制；连不上或掉线时打开，再「复制全部」发我。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section("2 · 自检（不用连眼镜也能跑）") {

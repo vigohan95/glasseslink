@@ -48,8 +48,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "0.25"
-        CFBundleVersion: "25"
+        CFBundleShortVersionString: "0.26"
+        CFBundleVersion: "26"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
