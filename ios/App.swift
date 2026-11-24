@@ -56,6 +56,7 @@ final class Glasses: NSObject, ObservableObject {
     @Published var settingsLoading = false
     @Published var status = GlassesState()
     @Published var captures: [Capture] = []
+    @Published var thumbs: [String: UIImage] = [:]
     @Published var recording = false
     @Published var lastVideo: Data?
     @Published var live: LiveStream?
@@ -100,6 +101,7 @@ final class Glasses: NSObject, ObservableObject {
             ownerLine = "owner key: 没有——先点「成为主人」"
         }
         note("启动。owner=\(owner == nil ? "无" : "有")")
+        loadThumbs()
     }
 
     /// Runs the checks that only this phone can answer (key import, both signing paths,
@@ -349,6 +351,7 @@ final class Glasses: NSObject, ObservableObject {
                     return
                 }
                 note("收到 \(transfer.name) \(transfer.size)B")
+                rememberThumb(captureItem.id, transfer.data)
                 if transfer.data.prefix(2) == Data([0xFF, 0xD8]) {
                     lastPhoto = transfer.data
                     if saveToLibrary { saveToPhotos(transfer.data) }
@@ -364,8 +367,7 @@ final class Glasses: NSObject, ObservableObject {
 
     /// Press the glasses' shutter, then pull whatever landed. The glasses take a
     /// second or two to write the file, so this waits before asking for the list.
-    func snap() {
-        guard let sess = session else { note("先连接"); return }
+    func snap() {        guard let sess = session else { note("先连接"); return }
         busy = true
         Task {
             do {
@@ -549,6 +551,42 @@ final class Glasses: NSObject, ObservableObject {
         } catch {
             note("写临时文件失败：\(error)")
         }
+    }
+
+    // MARK: thumbnails (kept on disk so the album works offline)
+
+    private static var thumbDir: URL? {
+        guard let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        let dir = base.appendingPathComponent("thumbs", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    /// Caches a small preview of an imported asset, so the album shows real pictures
+    /// instead of placeholders — and keeps working with the glasses out of range.
+    func rememberThumb(_ id: String, _ data: Data) {
+        guard let image = UIImage(data: data) else { return }
+        let small = image.preparingThumbnail(of: CGSize(width: 168, height: 168)) ?? image
+        thumbs[id] = small
+        if let dir = Self.thumbDir,
+           let jpeg = small.jpegData(compressionQuality: 0.7) {
+            try? jpeg.write(to: dir.appendingPathComponent(Self.safeName(id) + ".jpg"))
+        }
+    }
+
+    func loadThumbs() {
+        guard let dir = Self.thumbDir,
+              let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
+        for file in files where file.pathExtension == "jpg" {
+            guard let data = try? Data(contentsOf: file), let image = UIImage(data: data) else { continue }
+            thumbs[file.deletingPathExtension().lastPathComponent] = image
+        }
+    }
+
+    private static func safeName(_ id: String) -> String {
+        id.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: ":", with: "_")
     }
 
     private func saveToPhotos(_ data: Data) {

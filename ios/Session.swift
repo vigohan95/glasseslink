@@ -181,6 +181,13 @@ struct Capture {
     let assets: [CaptureAsset]
     var isPhoto: Bool { kind == 3073 }
     var stills: [CaptureAsset] { assets.filter { $0.type == 2 } }
+
+    /// Stable id used for local bookkeeping (thumbnails, "already imported").
+    var id: String {
+        if let still = stills.first { return still.uuid }
+        if let first = assets.first { return first.uuid }
+        return handle
+    }
 }
 
 enum FB {

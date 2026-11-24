@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 /// Four screens organised by what you are trying to do — look at media, shoot, talk to the
@@ -143,6 +144,7 @@ struct AlbumTab: View {
                     }
                     ForEach(Array(rows.enumerated()), id: \.offset) { _, c in
                         CaptureRow(capture: c,
+                                   thumb: g.thumbs[c.id],
                                    imported: imported.contains(c.handle),
                                    working: inFlight == c.handle,
                                    failed: failed.contains(c.handle)) {
@@ -204,6 +206,7 @@ struct AlbumTab: View {
 
 struct CaptureRow: View {
     let capture: Capture
+    let thumb: UIImage?
     let imported: Bool
     let working: Bool
     let failed: Bool
@@ -211,14 +214,22 @@ struct CaptureRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.secondary.opacity(0.15))
-                .frame(width: 56, height: 56)
-                .overlay {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.secondary.opacity(0.15))
+                    .frame(width: 56, height: 56)
+                if let thumb {
+                    Image(uiImage: thumb)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 56, height: 56)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                } else {
                     Image(systemName: capture.isPhoto ? "photo" : "video")
                         .font(.title3)
                         .foregroundStyle(capture.isPhoto ? Color.cyan : Color.orange)
                 }
+            }
             VStack(alignment: .leading, spacing: 3) {
                 Text(clockText(capture.timestampNS)).font(.subheadline)
                 Text("\(capture.isPhoto ? "照片" : "视频") · \(sizeText(capture.assets.reduce(0) { $0 + $1.size }))")
