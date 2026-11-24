@@ -551,7 +551,7 @@ struct BecomeOwnerView: View {
             }
         }
         .navigationTitle("向 Meta 注册")
-        .sheet(isPresented: ) {
+        .sheet(isPresented: $signingIn) {
             LoginWebView(url: Meta.authorize(state: UUID().uuidString), onCode: { code in
                 signingIn = false
                 g.becomeOwner(userToken: code)
