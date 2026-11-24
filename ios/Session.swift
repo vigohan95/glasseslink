@@ -27,6 +27,9 @@ final class SDUStream: NSObject, StreamDelegate {
     private var writeHook: ((Data) throws -> Void)?
     private var reader: Thread?
 
+    /// Optional sink for transport-level notes (the app points this at its log).
+    var onLog: ((String) -> Void)?
+
     init(channel: CBL2CAPChannel) {
         input = channel.inputStream
         output = channel.outputStream
@@ -76,7 +79,8 @@ final class SDUStream: NSObject, StreamDelegate {
             buf.removeFirst(need)
         }
         if let need = Self.frameLength(buf), need > 8192 {
-            print("[sdu] resync: header claimed \(need)B, dropping a byte")
+            let note = "resync: header claimed \(need)B, dropping a byte"
+            onLog?(note)
             if !buf.isEmpty { buf.removeFirst() }
         }
         cond.broadcast()
@@ -172,6 +176,90 @@ final class SDUStream: NSObject, StreamDelegate {
         return buf.count + frames.reduce(0) { $0 + $1.count }
     }
 }
+
+struct CaptureAsset {
+    let uuid: String
+    let type: Int          // 1 video, 2 still, 3 IMU, 4 frame log
+    let delivered: Bool
+    let size: Int
+}
+
+struct Capture {
+    let handle: String
+    let kind: Int          // 3073 photo, 3074 video
+    let timestampNS: Int?
+    let assets: [CaptureAsset]
+    var isPhoto: Bool { kind == 3073 }
+    var stills: [CaptureAsset] { assets.filter { $0.type == 2 } }
+
+    /// Stable id used for local bookkeeping (thumbnails, "already imported").
+    var id: String {
+        if let still = stills.first { return still.uuid }
+        if let first = assets.first { return first.uuid }
+        return handle
+    }
+}
+
+enum FB {
+    static func u16(_ b: [UInt8], _ p: Int) throws -> Int {
+        guard p >= 0, p + 2 <= b.count else { throw LinkError.shortBuffer }
+        return Int(b[p]) | Int(b[p + 1]) << 8
+    }
+    static func u32(_ b: [UInt8], _ p: Int) throws -> Int {
+        guard p >= 0, p + 4 <= b.count else { throw LinkError.shortBuffer }
+        return Int(b[p]) | Int(b[p + 1]) << 8 | Int(b[p + 2]) << 16 | Int(b[p + 3]) << 24
+    }
+    static func i32(_ b: [UInt8], _ p: Int) throws -> Int32 {
+        Int32(bitPattern: UInt32(try u32(b, p)))
+    }
+    static func root(_ b: [UInt8]) throws -> Int { try u32(b, 0) }
+
+    static func fieldOffset(_ b: [UInt8], _ table: Int, _ slot: Int) throws -> Int {
+        let vt = table - Int(try i32(b, table))
+        let vtSize = try u16(b, vt)
+        let idx = 4 + slot * 2
+        if idx + 2 > vtSize { return 0 }
+        return try u16(b, vt + idx)
+    }
+
+    static func scalar(_ b: [UInt8], _ table: Int, _ slot: Int) throws -> Int {
+        let off = try fieldOffset(b, table, slot)
+        return off == 0 ? 0 : try u32(b, table + off)
+    }
+
+    static func string(_ b: [UInt8], _ table: Int, _ slot: Int) throws -> String? {
+        let off = try fieldOffset(b, table, slot)
+        guard off != 0 else { return nil }
+        let p = table + off
+        let s = p + (try u32(b, p))
+        let n = try u32(b, s)
+        guard s + 4 + n <= b.count else { throw LinkError.shortBuffer }
+        return String(decoding: b[(s + 4) ..< (s + 4 + n)], as: UTF8.self)
+    }
+
+    static func table(_ b: [UInt8], _ pos: Int, _ slot: Int) throws -> Int? {
+        let off = try fieldOffset(b, pos, slot)
+        guard off != 0 else { return nil }
+        let p = pos + off
+        return p + (try u32(b, p))
+    }
+
+    static func tableVector(_ b: [UInt8], _ pos: Int, _ slot: Int) throws -> [Int] {
+        let off = try fieldOffset(b, pos, slot)
+        guard off != 0 else { return [] }
+        let p = pos + off
+        let v = p + (try u32(b, p))
+        let n = try u32(b, v)
+        var out: [Int] = []
+        for i in 0 ..< n {
+            let elem = v + 4 + 4 * i
+            out.append(elem + (try u32(b, elem)))
+        }
+        return out
+    }
+}
+
+// MARK: - the session
 
 final class Session {
     static let chLocalFirst: UInt16 = 0x8002

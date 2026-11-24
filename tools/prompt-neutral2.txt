@@ -1,0 +1,65 @@
+Sanitised, vendor-neutral question about a length-prefixed binary stream parser and a Swift crash. No product names.
+
+## Situation
+
+A mobile app reads a byte stream from a peripheral over a socket-like channel. The parser accumulates bytes and cuts records:
+
+```
+record = 1 byte tag | 8 byte trailer | 1 byte count | count+1 records of 16 bytes each
+```
+
+So the total length is `10 + 16 * (count + 1)`. A second record kind is `4 + ((tag & 0x3F) << 8 | nextByte)`.
+
+## Crash
+
+Release build, iOS. Signal 5 (SIGTRAP). Backtrace:
+
+```
+SDUStream.frameLength(Data) -> Int? + 128
+SDUStream.frameLength(Data) -> Int? + 128
+SDUStream.nextFrame(timeout:) + 344
+Session.handshake(timeout:trust:) + 2160
+```
+
+Code (abridged):
+
+```swift
+private var buf = Data()
+
+static func frameLength(_ b: Data) -> Int? {
+    let base = b.startIndex
+    guard b.count >= 1 else { return nil }
+    let b0 = b[base]
+    if b0 & 0xC0 == 0x40 {
+        guard b.count >= 10 else { return nil }
+        return 10 + 16 * (Int(b[base + 9]) + 1)
+    }
+    guard b.count >= 4 else { return nil }
+    return 4 + (Int(b0 & 0x3F) << 8 | Int(b[base + 1]))
+}
+
+func nextFrame(timeout: TimeInterval) throws -> Data {
+    let deadline = Date().addingTimeInterval(timeout)
+    while true {
+        cond.lock()
+        if let need = Self.frameLength(buf), buf.count >= need {
+            let frame = Data(buf.prefix(need))
+            buf = Data(buf.dropFirst(need))
+            cond.unlock(); return frame
+        }
+        cond.unlock()
+        if Date() >= deadline { throw Err.timeout }
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+    }
+}
+```
+
+Everything runs on the main thread; the stream is scheduled on the main run loop; no other thread touches `buf`.
+
+## Questions
+
+1. With those guards, what expression in `frameLength` can still trap (SIGTRAP) — or is the trace pointing at the caller's inlined copy?
+2. Two identical frames for the same function usually means recursion. Is there any way `RunLoop.current.run(...)` makes this function re-enter itself in practice, and would that end in a trap or in a wrong-but-quiet result?
+3. If `buf` were a slice (`startIndex != 0`) and someone appended to it, could the guard pass while the subscript still traps?
+4. What is the cleanest restructure: a dedicated reader thread that owns the stream and hands finished records to the consumer through a condition variable, or delegate + semaphore? Give the shape you would write, in ~30 lines.
+5. Byte arithmetic: for `count = 2` the formula gives 58 total. Given 1 + 8 + 1 + 16*blocks, does 58 imply blocks = 3? Show the arithmetic, and say how a parser should resynchronise after suspecting it started one byte late.

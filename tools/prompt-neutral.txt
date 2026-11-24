@@ -1,0 +1,67 @@
+Two independent technical questions from a BLE peripheral project (custom firmware on a wearable I own; I have the full protocol spec and a reference implementation in Kotlin). Please answer both.
+
+## A. Swift crash inside a framing function (Release build, iOS device)
+
+A class reads from an `InputStream` and frames messages. Reproducible crash, signal 5 (SIGTRAP), top app frames:
+
+```
+frame 0  my handler closure
+frame 1  libsystem_platform.dylib  (signal trampoline)
+frame 2  SDUStream.frameLength(Data) -> Int? + 128
+frame 3  SDUStream.frameLength(Data) -> Int? + 128    <- same function, twice
+frame 4  SDUStream.nextFrame(timeout:) + 344
+frame 5  Session.handshake(timeout:trust:) + 2160
+frame 6  Wearable.bringUp + 844
+```
+
+The code at the time (Data version):
+
+```swift
+private var buf = Data()
+
+private func append(_ chunk: [UInt8]) {
+    buf.append(contentsOf: chunk)                     // called from InputStream delegate
+}
+
+static func frameLength(_ b: Data) -> Int? {
+    let base = b.startIndex
+    guard b.count >= 1 else { return nil }
+    let b0 = b[base]
+    if b0 & 0xC0 == 0x40 {
+        guard b.count >= 10 else { return nil }
+        return 10 + 16 * (Int(b[base + 9]) + 1)
+    }
+    guard b.count >= 4 else { return nil }
+    return 4 + (Int(b0 & 0x3F) << 8 | Int(b[base + 1]))
+}
+
+func nextFrame(timeout: TimeInterval) throws -> Data {
+    let deadline = Date().addingTimeInterval(timeout)
+    while true {
+        cond.lock()
+        if let need = Self.frameLength(buf), buf.count >= need {
+            let frame = Data(buf.prefix(need))
+            buf = Data(buf.dropFirst(need))
+            cond.unlock()
+            return frame
+        }
+        cond.unlock()
+        if Date() >= deadline { throw Err.timeout }
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+    }
+}
+```
+
+The stream is scheduled on the main run loop; `nextFrame` is called on the main thread; the delegate also runs on the main thread. Nothing else mutates `buf`.
+
+Questions: (1) what can raise SIGTRAP inside `frameLength` given the guards above? (2) why would the same function appear twice consecutively in the trace — is that recursion, or an artefact of optimisation/symbolication? (3) is `RunLoop.current.run(...)` inside `nextFrame` able to re-enter the delegate and corrupt `buf` in a way that ends in a trap rather than a wrong value? (4) what is the correct structure — dedicated reader thread, or delegate + semaphore?
+
+## B. Framing arithmetic
+
+Encrypted frame layout I was told: `1 byte header | 8 byte MAC | 1 byte blockCount | N*16 bytes ciphertext`, where blockCount is stored as `blocks - 1`, and the payload was padded so that its length is a multiple of 16 (custom padding, not PKCS#7). Header's top bits: `0b01` marks this frame type.
+
+So for a 46-byte plaintext payload the padded length is 48? Or is the "blockCount" counting 16-byte blocks including some overhead? Given the formula `total = 10 + 16 * (blockCount + 1)`, what total do you expect for a 46-byte payload, and does that arithmetic agree with "1 + 8 + 1 + 16*blocks"?
+
+If a receiver instead saw a frame whose first byte was `0x41` and following bytes looked like ciphertext, what would it compute as the frame length, and how would it detect that it is off by a byte while resynchronising?
+
+Answer concretely, with the exact lines you would change.

@@ -1,0 +1,8 @@
+﻿python.exe : 
+所在位置 行:2 字符: 1
++ & "C:\Users\lokla\AppData\Local\Programs\Python\Python311\python.exe" ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+--- usage: in=1127 out=2500 model=claude-fable-5-2
