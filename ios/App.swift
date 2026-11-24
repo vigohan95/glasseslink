@@ -118,7 +118,18 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: logging (kept on disk so it can be shared from the phone)
 
+    /// Logging has to be safe from any thread: the reader thread emits protocol lines while
+    /// SwiftUI watches log. Touching a @Published array off the main thread is a data race
+    /// that shows up as a random crash in the middle of a handshake.
     func note(_ s: String) {
+        if Thread.isMainThread {
+            writeNote(s)
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.writeNote(s) }
+        }
+    }
+
+    private func writeNote(_ s: String) {
         let line = "\(Self.ts()) \(s)"
         log.insert(line, at: 0)
         if log.count > 500 { log.removeLast() }
