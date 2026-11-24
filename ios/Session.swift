@@ -117,7 +117,7 @@ final class SDUStream: NSObject, StreamDelegate {
                 // A mis-read header can claim a 4 KB+ frame. Drop one byte and resync
                 // instead of waiting for megabytes that will never arrive.
                 cond.unlock()
-                emit("resync: header claimed \(need)B, dropping a byte")
+                print("[sdu] resync: header claimed \(need)B, dropping a byte")
                 cond.lock()
                 if !buf.isEmpty { buf.removeFirst() }
                 cond.unlock()
