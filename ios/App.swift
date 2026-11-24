@@ -860,6 +860,31 @@ final class Glasses: NSObject, ObservableObject {
         return url
     }
 
+    /// Same as the file importer, but from whatever is on the clipboard — copying the JSON out of
+    /// a chat is far easier than getting a file into the Files app on iOS.
+    func importOwnerFromPasteboard() {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else {
+            note("剪贴板里没有文字——先把 owner-export.json 的内容复制下来")
+            return
+        }
+        let data = Data(text.utf8)
+        guard let parsed = try? OwnerMaterial.loadAny(from: try? writeTemp(data)) else {
+            note("剪贴板内容不是 owner key（要含 publicKeyXy 与 privateKeyPkcs8 两行）")
+            return
+        }
+        do {
+            let normalised = try JSONEncoder().encode(parsed.1)
+            try normalised.write(to: OwnerMaterial.defaultURL, options: .atomic)
+            try parsed.0.saveToKeychain()
+            owner = parsed.0
+            ownerLine = "owner key: 已导入 \(parsed.1.serial)"
+            note("已从剪贴板导入 \(parsed.1.serial) 的 owner key")
+            route = nil
+        } catch {
+            note("导入失败：\(error)")
+        }
+    }
+
     func shareOwner() {        let url = OwnerMaterial.defaultURL
         guard FileManager.default.fileExists(atPath: url.path) else {
             note("还没有 owner-export.json（provision 成功后才会有）")

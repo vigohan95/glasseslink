@@ -600,6 +600,9 @@ struct ImportOwnerView: View {
             Text("选 owner-export.json").font(.headline)
             Button("从文件 App 选择") { picking = true }
                 .buttonStyle(.borderedProminent)
+            Button("从剪贴板粘贴（更快）") { g.importOwnerFromPasteboard() }
+                .buttonStyle(.bordered)
+            Text("把 owner-export.json 的全部内容复制，然后点上面这个按钮。").font(.caption2).foregroundStyle(.secondary)
             Text(g.ownerLine).font(.caption).foregroundStyle(.secondary)
             Spacer()
         }
