@@ -450,6 +450,7 @@ struct DeviceTabBody: View {
     @State private var showSettings = false
     @State private var showQuick = false
     @State private var showDiagnostics = false
+    @State private var showAbout = false
 
     var body: some View {
         List {
@@ -510,11 +511,15 @@ struct DeviceTabBody: View {
                 Button { showDiagnostics = true } label: {
                     Label("自检、读写日志、原始诊断", systemImage: "wrench.and.screwdriver")
                 }
+                Button { showAbout = true } label: {
+                    Label("关于 · 许可 · 隐私", systemImage: "info.circle")
+                }
             }
         }
         .sheet(isPresented: $showQuick) { NavigationStack { QuickPanel(g: g) } }
         .sheet(isPresented: $showSettings) { NavigationStack { SettingsView(g: g) } }
         .sheet(isPresented: $showDiagnostics) { NavigationStack { ContentView(g: g) } }
+        .sheet(isPresented: $showAbout) { AboutView() }
     }
 }
 
