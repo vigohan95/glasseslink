@@ -348,31 +348,41 @@ final class Session {
     }
 
     private func recvMessage(timeout: TimeInterval) throws -> DataX.Message {
-        let sdu = try stream.nextFrame(timeout: timeout)
-        let plain: Data
-        if let r = recv {
+        while true {
+            let sdu = try stream.nextFrame(timeout: timeout)
+            let plain: Data
+            if let r = recv {
+                do {
+                    plain = try r.open(sdu)
+                } catch {
+                    // A decrypt failure is the single most common real-device symptom,
+                    // so keep the raw bytes: they tell us whether the keys disagree or
+                    // the framing is off by a byte.
+                    emit("decrypt FAILED (\(error))", sdu, inbound: true)
+                    throw error
+                }
+            } else {
+                plain = sdu
+            }
+            let msg: DataX.Message
             do {
-                plain = try r.open(sdu)
+                msg = try DataX.parse(plain)
             } catch {
-                // A decrypt failure is the single most common real-device symptom,
-                // so keep the raw bytes: they tell us whether the keys disagree or
-                // the framing is off by a byte.
-                emit("decrypt FAILED (\(error))", sdu, inbound: true)
+                emit("parse FAILED (\(error))", plain, inbound: true)
                 throw error
             }
-        } else {
-            plain = sdu
+            emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
+                 plain, inbound: true)
+
+            // The glasses start EndLinkSetup; the answer is a bare 0x1000 status on the
+            // mirror channel. Callers never see this message.
+            if msg.channel == DataX.chSetup, msg.type == 0x1000 {
+                try sendAny(AirShield.endLinkStatus)
+                emit("answered the glasses' EndLinkSetup")
+                continue
+            }
+            return msg
         }
-        let msg: DataX.Message
-        do {
-            msg = try DataX.parse(plain)
-        } catch {
-            emit("parse FAILED (\(error))", plain, inbound: true)
-            throw error
-        }
-        emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
-             plain, inbound: true)
-        return msg
     }
 
     private func allocChannel(_ name: String) -> UInt16 {
@@ -396,57 +406,72 @@ final class Session {
         let challenge = Data.random(16)
         let seed = Data.random(32)
         let iv = Data.random(16)
+        // Visor sends a random per-direction preamble seq and starts its own numbering there;
+        // a hard-coded 0 makes some firmware reject the whole EnableEncryption.
+        let baseSeq = UInt32.random(in: 1 ... 0xFFFF_FFF0)
 
         try sendPlain(try AirShield.requestEncryption(pubkey: pub, challenge: challenge, quirks: quirks))
-        let first = try recvMessage(timeout: timeout)
-        guard first.channel == DataX.chSetup, first.service == 5, first.type == 1 else {
-            throw LinkError.unexpected("expected RequestEncryption, got ch=0x\(String(first.channel, radix: 16))")
+
+        // Both messages are plaintext and may arrive in either order, sometimes twice.
+        // Read a few frames and keep whatever parses; stop as soon as we have both.
+        var peerRequest: (pub: Data, challenge: Data, quirks: AirShield.Quirk, version: Int)?
+        var peerEnable: (seed: Data, iv: Data, base: UInt32, quirks: AirShield.Quirk)?
+        for _ in 0 ..< 4 {
+            let sdu = try stream.nextFrame(timeout: timeout)
+            let m = try DataX.parse(sdu)
+            guard m.channel == DataX.chSetup, let t = m.type else { continue }
+            let f = try PB.parse(m.payload)
+            if t == 1, peerRequest == nil,
+               let p = f[1]?.first as? Data, let c = f[2]?.first as? Data {
+                let q = (f[6]?.first as? Int) ?? 0
+                peerRequest = (p, c, q == 1 ? .qcs7 : .none, (f[7]?.first as? Int) ?? 0)
+            } else if t == 2, peerEnable == nil,
+                      let s = f[2]?.first as? Data, let i = f[3]?.first as? Data {
+                let q = (f[6]?.first as? Int) ?? 0
+                peerEnable = (s, i, UInt32((f[4]?.first as? Int) ?? 0), q == 1 ? .qcs7 : .none)
+            }
+            if peerRequest != nil, peerEnable != nil { break }
         }
-        let f = try PB.parse(first.payload)
-        guard let peerPub = f[1]?.first as? Data, let peerChallenge = f[2]?.first as? Data else {
-            throw LinkError.unexpected("RequestEncryption missing fields")
+        guard let req = peerRequest else {
+            throw LinkError.unexpected("no RequestEncryption from the glasses")
         }
-        if let q = f[6]?.first as? Int, q != 0, quirks == .none {
-            quirks = q == 1 ? .qcs7 : .none      // follow what the glasses advertise
+        guard let en = peerEnable else {
+            throw LinkError.unexpected("no EnableEncryption from the glasses")
         }
+        emit("peer version=\(req.version) quirks req=\(req.quirks) enable=\(en.quirks)")
+
         if let forced = forcedQuirks {
             quirks = forced == 1 ? .qcs7 : .none
             emit("quirks forced to \(quirks)")
+        } else {
+            // Each direction carries its own quirks; the request's value is the one our
+            // transmitter must use (Visor derives the two sides separately).
+            quirks = req.quirks
         }
 
-        let shared = try owner.sharedSecret(peerPubkeyXy: peerPub)
+        let shared = try owner.sharedSecret(peerPubkeyXy: req.pub)
         emit("ecdh ok, shared=\(shared.hexShort) quirks=\(quirks)")
 
         try stream.write(try AirShield.enableEncryption(pubkey: pub, seed: seed, iv: iv,
-                                                    baseSeq: 0, quirks: quirks))
-        emit("EnableEncryption sent")
-
-        // The glasses' own EnableEncryption is still plaintext.
-        let sdu = try stream.nextFrame(timeout: timeout)
-        let second = try DataX.parse(sdu)
-        guard second.channel == DataX.chSetupMirror, second.type == 2 else {
-            throw LinkError.unexpected("expected EnableEncryption, got ch=0x\(String(second.channel, radix: 16))")
-        }
-        let g = try PB.parse(second.payload)
-        guard let peerSeed = g[2]?.first as? Data, let peerIV = g[3]?.first as? Data else {
-            throw LinkError.unexpected("EnableEncryption missing fields")
-        }
-        let baseSeq = UInt32((g[4]?.first as? Int) ?? 0)
+                                                    baseSeq: baseSeq, quirks: quirks))
+        emit("EnableEncryption sent (base=\(baseSeq))")
 
         let keys = try AirShield.sessionKeys(shared: shared,
                                         ownChallenge: challenge, ownSeed: seed,
-                                        peerChallenge: peerChallenge, peerSeed: peerSeed,
-                                        ownIV: iv, peerIV: peerIV, peerBaseSeq: baseSeq,
+                                        peerChallenge: req.challenge, peerSeed: en.seed,
+                                        ownIV: iv, peerIV: en.iv, peerBaseSeq: en.base,
                                         quirks: quirks, multikey: multikey)
         send = keys.send
         recv = keys.recv
-        peerPubkey = peerPub
-        binding = AirShield.channelBinding(glassesChallenge: peerChallenge, glassesPubkey: peerPub,
+        send?.seq = baseSeq
+        peerPubkey = req.pub
+        binding = AirShield.channelBinding(glassesChallenge: req.challenge, glassesPubkey: req.pub,
                                            seed: seed, phonePubkey: pub)
         emit("keys up — encrypted from here")
 
+        // EndLinkSetup is *not* ours to start: the glasses send theirs and we answer with a
+        // bare 0x1000 status. Sending ours unprompted is what kept the real device silent.
         if trust { try doTrust(timeout: timeout) }
-        try endLinkSetup(timeout: timeout)
     }
 
     private func doTrust(timeout: TimeInterval) throws {
