@@ -104,3 +104,8 @@
 - 新增 `ROUTES.md`：路线 A = iPhone 自己登录一次并注册为 owner（不需要安卓、不需要导出文件）；路线 B = 从补丁版 Visor 导出钥匙（不进 Meta 的服务器，但需要那台安卓）。给了对照表和取舍建议。
 - 关键判断：路线 A 才是最短路径 —— 眼镜的 owner 换成本机生成的 P-256 私钥后，安卓上的 Visor 会失效（`0x1042`），但用户本来就不想再带安卓。
 - 顺手修掉界面段号（`3 · 成为主人` 与 `3 · 相册` 撞号，后者改为 `3.5`），并把被 edit 挤成一行的 Section 头恢复格式。
+## v0.23.0 (2026-11-23) — 签名与分发指南
+
+- 新增 `SIGNING.md`：四条路（免费 Apple ID + Sideloadly 7 天 / SideStore + StosVPN 自续签 / UDID 超级签名 ¥10–50 一年 / Apple Developer 99 美元），每条给具体命令与坑（企业签名会集体掉签、免费号限 3 个 app 与 10 个 App ID）。
+- 写明「换证书重签会清 Keychain」这件事的后果与对策：第一次 trust 成功后立刻导出 `owner-export.json` 存文件；重签后导入即可恢复，不必重新找 Meta。
+- 也给上架/分发的现实约束：TestFlight 需 99 美元且过 beta 审核；上 App Store 还要处理 AGPL（`varm_template.bin`/`settings.tsv`/`settings_ui.json` 来自 Visor）。
