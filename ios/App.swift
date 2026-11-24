@@ -461,10 +461,49 @@ final class Glasses: NSObject, ObservableObject {
                     note("已发开始录像")
                     recording = true
                     busy = false
+                    scheduleAutoStop()
                 }
             } catch {
                 busy = false
                 note("录像控制失败：\(error)")
+            }
+        }
+    }
+
+    /// 0 means "until I stop it". The glasses themselves cap a clip, so this only decides when
+    /// *we* send the stop; it is enforced on our side so the length is predictable.
+    @Published var maxRecordSeconds: Int = UserDefaults.standard.integer(forKey: "maxRecordSeconds") {
+        didSet {
+            UserDefaults.standard.set(maxRecordSeconds, forKey: "maxRecordSeconds")
+            recordDeadline = nil
+            if recording { scheduleAutoStop() }
+        }
+    }
+    @Published var recordDeadline: Date?
+
+    private var autoStopTask: Task<Void, Never>?
+
+    /// Stops the take when the chosen limit is reached, and shows the countdown in the UI.
+    private func scheduleAutoStop() {
+        autoStopTask?.cancel()
+        autoStopTask = nil
+        guard maxRecordSeconds > 0, recording else { recordDeadline = nil; return }
+        let seconds = maxRecordSeconds
+        let deadline = Date().addingTimeInterval(TimeInterval(seconds))
+        recordDeadline = deadline
+        note("到 \(seconds) 秒会自动停止")
+        autoStopTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard let self else { return }
+                if Date() >= deadline {
+                    self.recordDeadline = nil
+                    if self.recording {
+                        self.note("到时限，自动停止录像")
+                        self.toggleRecording()
+                    }
+                    return
+                }
             }
         }
     }

@@ -308,6 +308,24 @@ struct ShootTab: View {
                         .buttonStyle(.bordered)
                     }
                     .padding(.horizontal)
+                    HStack(spacing: 8) {
+                        Text("最长录制").font(.caption).foregroundStyle(.secondary)
+                        Picker("最长录制", selection: $g.maxRecordSeconds) {
+                            Text("不限").tag(0)
+                            Text("30 秒").tag(30)
+                            Text("1 分钟").tag(60)
+                            Text("3 分钟").tag(180)
+                            Text("5 分钟").tag(300)
+                        }
+                        .pickerStyle(.menu)
+                        Spacer()
+                        if let d = g.recordDeadline {
+                            Text(timerText(d))
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.red)
+                        }
+                    }
+                    .padding(.horizontal)
                     Text("蓝牙链路只有约 120–165 KB/s，取景是低码率画面；要高清照就按快门，再回相册导入。")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -321,6 +339,11 @@ struct ShootTab: View {
             }
             .sheet(isPresented: $showDevice) { DeviceSheet(g: g) }
         }
+    }
+
+    private func timerText(_ d: Date) -> String {
+        let left = max(0, Int(d.timeIntervalSinceNow.rounded()))
+        return String(format: "%d:%02d 后停", left / 60, left % 60)
     }
 }
 
