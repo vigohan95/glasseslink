@@ -781,8 +781,28 @@ final class Glasses: NSObject, ObservableObject {
 
     /// Copies the log to the pasteboard so it can be pasted into a chat in one step.
     func copyLog() {
-        UIPasteboard.general.string = log.reversed().joined(separator: "\n")
-        note("日志已复制到剪贴板（\(log.count) 行）")
+        UIPasteboard.general.string = diagnosticBundle()
+        note("诊断包已复制到剪贴板（\(log.count) 行日志 + 环境信息）")
+    }
+
+    /// Everything needed to explain a failed trust without another round trip: what build
+    /// is running, which key the phone claims, and the last frames it saw.
+    func diagnosticBundle() -> String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        var out: [String] = []
+        out.append("GlassesLink \(v) (\(b)) · iOS \(UIDevice.current.systemVersion) · \(UIDevice.current.model)")
+        if let k = owner {
+            out.append("owner pubkey(SHA256) \(Data(SHA256.hash(data: k.publicKeyXy)).hexShort)")
+            out.append("owner source \(ownerLine)")
+        } else {
+            out.append("owner 无")
+        }
+        out.append("trust \(trustLine)")
+        out.append("link \(glassesLine)")
+        out.append("--- log ---")
+        out.append(contentsOf: log.reversed())
+        return out.joined(separator: "\n")
     }
 
     // MARK: settings (svc33)
