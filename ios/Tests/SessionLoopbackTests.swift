@@ -47,7 +47,21 @@ final class SessionLoopbackTests: XCTestCase {
         XCTAssertEqual(got, frame)
         XCTAssertEqual(b.debugBufferCount, 0)
 
+        // Two frames in a row: this is the case that crashed the app on the wrist.
+        // `Data.removeFirst` only moves startIndex, so a slice-blind `b[0]` traps
+        // (SIGTRAP / signal 5) on the second frame. Reading both back through
+        // `frameLength` + `nextFrame` is the regression test for that bug.
+        let second = Data([0x80, 0x02, 0x00, 0x02, 0xAA, 0xBB])
+        try a.write(second)
+        let got2 = try b.nextFrame(timeout: 2)
+        print("[pipe] second frame \(got2.count)B")
+        XCTAssertEqual(got2, second)
 
+        // And the same thing one layer down: a buffer whose startIndex is no longer 0.
+        var sliced = Data([0x00, 0x00])
+        sliced.append(contentsOf: frame)
+        let trimmed = sliced.dropFirst(2)
+        XCTAssertEqual(SDUStream.frameLength(trimmed), frame.count)
     }
     func testFullHandshakeCaptureListAndTransfer() throws {
 
