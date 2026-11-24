@@ -12,7 +12,7 @@ targets:
     sources:
       - App.swift
       - RootView.swift
-    - AboutView.swift
+      - AboutView.swift
       - AirShield.swift
       - OwnerKey.swift
       - Session.swift
