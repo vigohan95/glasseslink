@@ -297,6 +297,7 @@ final class Glasses: NSObject, ObservableObject {
         }
         guard let own = owner else { note("建不出密钥对"); return }
         let sess = Session(stream: s, owner: own, log: { [weak self] in self?.note($0) })
+        sess.forcedQuirks = Glasses.pendingQuirks
         session = sess
         // A crash inside handshake() would otherwise be repeated by auto-reconnect on every
         // launch, which is exactly the "闪退十几次" loop. We mark the attempt in flight and
@@ -309,7 +310,8 @@ final class Glasses: NSObject, ObservableObject {
             if trust { UserDefaults.standard.set(true, forKey: "isOwner") }
             trustLine = trust ? "已通过（这台 iPhone 是主人）" : "未验证（临时密钥，仅用于注册）"
             glassesLine = "已连上 · trust=\(trust) · serial \(sess.peerSerial)"
-            note("✅ 握手完成")
+            note("✅ 握手完成（quirks=\(sess.quirks)）")
+            UserDefaults.standard.set(Int(sess.quirks.rawValue), forKey: "quirkMode")
         } catch {
             trustLine = Glasses.explain(error)
             note("❌ 握手中断：\(error)")
@@ -321,7 +323,13 @@ final class Glasses: NSObject, ObservableObject {
             channel = nil
             connected = false
             if let p = peripheral { central.cancelPeripheralConnection(p) }
-            note("已释放这条链路，可以直接再点一次")
+            // The glasses never say which AirShield variant they want, and the wrong one
+            // makes them drop our sealed frames (or answer with a MAC we cannot verify).
+            // So each failed attempt flips the variant: tap again and we try the other one.
+            let used = UserDefaults.standard.object(forKey: "quirkMode") as? Int ?? -1
+            let next = (used == 1) ? 0 : 1
+            UserDefaults.standard.set(next, forKey: "quirkMode")
+            note("已释放这条链路。下次点击会用 \(next == 1 ? "QCS7" : "普通") 兼容模式重试（这次是 \(used < 0 ? "自动" : used == 1 ? "QCS7" : "普通")）")
         }
     }
 
@@ -351,6 +359,12 @@ final class Glasses: NSObject, ObservableObject {
 
     /// Connect without proving ownership — used before the first provisioning.
     func connectSetup() { Task { await bringUp(trust: false) } }
+
+    /// `nil` follows whatever the glasses advertise; 0/1 force one AirShield variant.
+    static var pendingQuirks: UInt64? {
+        let v = UserDefaults.standard.object(forKey: "quirkMode") as? Int ?? -1
+        return v < 0 ? nil : UInt64(v)
+    }
 
     /// Tear the link down so the next connect starts from a clean slate. Without this a failed
     /// attempt leaves the PSM occupied and every retry just says "L2CAP PSM already connected".

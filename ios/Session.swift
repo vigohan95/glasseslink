@@ -288,6 +288,11 @@ final class Session {
     let stream: SDUStream
     let owner: OwnerMaterial
     var quirks: AirShield.Quirk = .none
+    /// Set by the caller to stop trusting the advertisement: `nil` follows the glasses,
+    /// `0` forces the plain HKDF/MAC word, `1` forces the QCS7 variant (136-byte HKDF info
+    /// and a different MAC word). Gen 2 firmware has been seen to advertise nothing and then
+    /// silently drop frames sealed with the plain variant.
+    var forcedQuirks: UInt64?
     var multikey = false
     var log: (String) -> Void = { _ in }
 
@@ -403,6 +408,10 @@ final class Session {
         }
         if let q = f[6]?.first as? Int, q != 0, quirks == .none {
             quirks = q == 1 ? .qcs7 : .none      // follow what the glasses advertise
+        }
+        if let forced = forcedQuirks {
+            quirks = forced == 1 ? .qcs7 : .none
+            emit("quirks forced to \(quirks)")
         }
 
         let shared = try owner.sharedSecret(peerPubkeyXy: peerPub)
