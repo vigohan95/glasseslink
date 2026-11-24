@@ -697,10 +697,11 @@ final class Session {
 
     /// Serves exactly one incoming file. Every offer must be answered with type 7
     /// (drop), even when we keep the bytes — skipping it stalls the glasses' queue.
-    func receiveFile(timeout: TimeInterval = 120) throws -> Transfer? {
+    func receiveFile(timeout: TimeInterval = 120, onBytes: ((Int, Int) -> Void)? = nil) throws -> Transfer? {
         let ch = allocChannel("airship")
         var name = "capture.bin"
         var buf = Data()
+        var total = 0
         let deadline = Date().addingTimeInterval(timeout)
         while true {
             let left = deadline.timeIntervalSinceNow
@@ -712,12 +713,14 @@ final class Session {
             case Self.airOffer:
                 let f = try PB.parse(m.payload)
                 if let n = f[4]?.first as? Data { name = String(decoding: n, as: UTF8.self) }
+                if let s = f[2]?.first as? UInt64 { total = Int(s) }
                 // cursor {1: offset, 2: adler32} — zeros for the start of a file
                 try sendAny(DataX.message(ch, tags: [DataX.tag(1, UInt16(Self.svcAirship), last: false),
                                                      DataX.tag(2, Self.airCursor, last: true)],
                                           payload: PB.uint(1, 0) + PB.uint(2, 0)))
             case Self.airData:
                 buf.append(m.payload)
+                onBytes?(buf.count, max(total, buf.count))
             case Self.airCheck:
                 try sendAny(DataX.message(ch, tags: [DataX.tag(1, UInt16(Self.svcAirship), last: false),
                                                      DataX.tag(2, Self.airCursor, last: true)],

@@ -147,7 +147,8 @@ struct AlbumTab: View {
                                    thumb: g.thumbs[c.id],
                                    imported: imported.contains(c.handle),
                                    working: inFlight == c.handle,
-                                   failed: failed.contains(c.handle)) {
+                                   failed: failed.contains(c.handle),
+                                   fraction: g.progress[c.id] ?? 0) {
                             importOne(c)
                         }
                     }
@@ -210,6 +211,8 @@ struct CaptureRow: View {
     let imported: Bool
     let working: Bool
     let failed: Bool
+    /// 0…1 while transferring; the glasses tell us the real total, so this is not an estimate.
+    let fraction: Double
     var onImport: () -> Void
 
     var body: some View {
@@ -238,7 +241,16 @@ struct CaptureRow: View {
             }
             Spacer()
             if working {
-                ProgressView().controlSize(.small)
+                VStack(alignment: .trailing, spacing: 2) {
+                    ProgressView()
+                        .controlSize(.small)
+                    if fraction > 0 {
+                        Text("\(Int(fraction * 100))%")
+                            .font(.caption2)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                }
             } else if failed {
                 Button(action: onImport) {
                     Image(systemName: "arrow.clockwise.circle").foregroundStyle(.orange)

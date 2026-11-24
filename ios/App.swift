@@ -47,6 +47,8 @@ final class Glasses: NSObject, ObservableObject {
     @Published var ownerLine = "owner key: 未知"
     /// Human-readable result of the last ownership proof, e.g. "已通过" or a code with a fix.
     @Published var trustLine = "未验证"
+    /// Per-capture transfer fraction, filled from the glasses' own byte counts.
+    @Published var progress: [String: Double] = [:]
     @Published var glassesLine = "未连接"
     @Published var lastPhoto: Data?
     @Published var answer = ""
@@ -374,7 +376,12 @@ final class Glasses: NSObject, ObservableObject {
             do {
                 note("拉取 \(captureItem.handle) / \(asset.uuid)（\(asset.size)B）")
                 try sess.requestAsset(handle: captureItem.handle, assetID: asset.uuid)
-                guard let transfer = try sess.receiveFile(timeout: 300) else {
+                guard let transfer = try sess.receiveFile(timeout: 300, onBytes: { got, total in
+                    let id = captureItem.id
+                    DispatchQueue.main.async {
+                        if total > 0 { self.progress[id] = Double(got) / Double(total) }
+                    }
+                }) else {
                     note("没收到文件（对端没发起传输）")
                     return
                 }
