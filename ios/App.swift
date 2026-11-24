@@ -770,7 +770,8 @@ struct ContentView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
-                Section("3 · 成为主人（只做一次）") {                    Button("用 Meta 账号登录并注册这台 iPhone") { showLogin = true }
+                Section("3 · 成为主人（只做一次）") {
+                    Button("用 Meta 账号登录并注册这台 iPhone") { showLogin = true }
                     Text("登录在 app 内完成；token 只用来给眼镜签一张 ownership receipt。"
                          + "成功后 owner-export.json 会弹出来，务必存到 iCloud。")
                         .font(.caption).foregroundStyle(.secondary)
@@ -778,7 +779,7 @@ struct ContentView: View {
                     Button("从文件 App 导入 owner-export.json") { showImport = true }
                 }
 
-                Section("3 · 相册 / 拍照") {
+                Section("3.5 · 相册 / 拍照") {
                     HStack {
                         Button(g.busy ? "处理中…" : "刷新清单") { g.loadCaptures() }
                             .disabled(!g.connected || g.busy)
