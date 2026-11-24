@@ -880,26 +880,64 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: export
 
+    /// Short, stable identifier for the key currently loaded — so the user can see *which* key it is.
+    var ownerFingerprint: String {
+        guard let o = owner else { return "没有钥匙" }
+        let xy = o.publicKeyXy
+        let tail = xy.suffix(6).map { String(format: "%02x", $0) }.joined()
+        return "公钥尾号 \(tail)（\(xy.count) 字节）"
+    }
+
     /// Copies an owner bundle picked in the Files app into Documents, then loads it.
-    func importOwner(from url: URL) {
+    @discardableResult
+    func importOwner(from url: URL) -> Bool {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         do {
             let data = try Data(contentsOf: url)
-            guard let parsed = try? OwnerMaterial.loadAny(from: try writeTemp(data)) else {
-                note("解析失败——要 owner-export.json 或 Visor 导出的 visor-owner-*.json")
-                return
-            }
-            // Normalise to owner-export.json so the next launch finds it without the original file.
+            return adopt(data, source: "文件")
+        } catch {
+            note("读文件失败：\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Same as the file importer, but from text the user pasted into a field.
+    @discardableResult
+    func importOwner(text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { note("没有内容可导入"); return false }
+        return adopt(Data(trimmed.utf8), source: "粘贴")
+    }
+
+    func importOwnerFromPasteboard() {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else {
+            note("剪贴板里没有文字——先把 owner-export.json 的内容复制下来")
+            return
+        }
+        importOwner(text: text)
+    }
+
+    /// Parses, normalises and stores; returns false (with a log line) when the blob is not a key.
+    private func adopt(_ data: Data, source: String) -> Bool {
+        guard let temp = try? writeTemp(data),
+              let parsed = try? OwnerMaterial.loadAny(from: temp) else {
+            note("导入失败：内容不是 owner key（要含 publicKeyXy 与 privateKeyPkcs8）")
+            return false
+        }
+        do {
             let normalised = try JSONEncoder().encode(parsed.1)
             try normalised.write(to: OwnerMaterial.defaultURL, options: .atomic)
             try parsed.0.saveToKeychain()
             owner = parsed.0
-            ownerLine = "owner key: 已导入 \(parsed.1.serial)"
-            note("已导入 \(parsed.1.serial) 的 owner key（来源文件可直接是 Visor 导出的那个）")
+            ownerLine = "owner key: 已导入 \(parsed.1.serial) · \(ownerFingerprint)"
+            note("已从\(source)导入 \(parsed.1.serial) 的 owner key · \(ownerFingerprint)")
+            trustLine = "未验证（钥匙已就位，连接一次看结果）"
             route = nil
+            return true
         } catch {
-            note("导入失败：\(error)")
+            note("导入失败：\(error.localizedDescription)")
+            return false
         }
     }
 
@@ -907,32 +945,6 @@ final class Glasses: NSObject, ObservableObject {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("import-owner.json")
         try data.write(to: url, options: .atomic)
         return url
-    }
-
-    /// Same as the file importer, but from whatever is on the clipboard — copying the JSON out of
-    /// a chat is far easier than getting a file into the Files app on iOS.
-    func importOwnerFromPasteboard() {
-        guard let text = UIPasteboard.general.string, !text.isEmpty else {
-            note("剪贴板里没有文字——先把 owner-export.json 的内容复制下来")
-            return
-        }
-        let data = Data(text.utf8)
-        guard let temp = try? writeTemp(data),
-              let parsed = try? OwnerMaterial.loadAny(from: temp) else {
-            note("剪贴板内容不是 owner key（要含 publicKeyXy 与 privateKeyPkcs8 两行）")
-            return
-        }
-        do {
-            let normalised = try JSONEncoder().encode(parsed.1)
-            try normalised.write(to: OwnerMaterial.defaultURL, options: .atomic)
-            try parsed.0.saveToKeychain()
-            owner = parsed.0
-            ownerLine = "owner key: 已导入 \(parsed.1.serial)"
-            note("已从剪贴板导入 \(parsed.1.serial) 的 owner key")
-            route = nil
-        } catch {
-            note("导入失败：\(error)")
-        }
     }
 
     func shareOwner() {        let url = OwnerMaterial.defaultURL

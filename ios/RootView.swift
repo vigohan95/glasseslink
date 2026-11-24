@@ -682,23 +682,71 @@ struct OwnerSetupView: View {
 struct ImportOwnerView: View {
     @ObservedObject var g: Glasses
     @State private var picking = false
+    @State private var text = ""
+    @State private var result = ""
+    @State private var failed = false
 
     var body: some View {
-        VStack(spacing: 16) {
-            Text("选 owner-export.json").font(.headline)
-            Button("从文件 App 选择") { picking = true }
-                .buttonStyle(.borderedProminent)
-            Button("从剪贴板粘贴（更快）") { g.importOwnerFromPasteboard() }
-                .buttonStyle(.bordered)
-            Text("把 owner-export.json 的全部内容复制，然后点上面这个按钮。").font(.caption2).foregroundStyle(.secondary)
-            Text(g.ownerLine).font(.caption).foregroundStyle(.secondary)
-            Spacer()
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("把 owner-export.json 的完整内容粘到下面").font(.headline)
+
+                TextEditor(text: $text)
+                    .frame(minHeight: 200)
+                    .font(.system(.caption, design: .monospaced))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.4)))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                HStack(spacing: 10) {
+                    Button("从剪贴板填入") {
+                        text = UIPasteboard.general.string ?? ""
+                        result = text.isEmpty ? "剪贴板是空的" : "已填入 \(text.count) 个字符，点「导入」确认"
+                        failed = text.isEmpty
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("导入") { doImport() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+
+                if !result.isEmpty {
+                    Label(result, systemImage: failed ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
+                        .font(.footnote)
+                        .foregroundStyle(failed ? Color.orange : Color.green)
+                }
+
+                Text(g.ownerLine).font(.caption).foregroundStyle(.secondary)
+
+                Divider()
+
+                Button("从文件 App 选择文件") { picking = true }
+                    .buttonStyle(.bordered)
+
+                Text("文件也可能是从微信/邮件里收到的；iOS 的「文件」App 里找到它，长按 → 共享 → 存储到“文件”，再回来这里选。")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .padding()
         }
-        .padding()
         .navigationTitle("导入钥匙")
-        .fileImporter(isPresented: $picking, allowedContentTypes: [.json, .data]) { result in
-            if case .success(let url) = result { g.importOwner(from: url) }
+        .fileImporter(isPresented: $picking, allowedContentTypes: [.json, .data]) { res in
+            switch res {
+            case .success(let url):
+                let ok = g.importOwner(from: url)
+                failed = !ok
+                result = ok ? "导入成功：\(g.ownerFingerprint)" : "这个文件不是可用的 owner key"
+            case .failure(let e):
+                failed = true
+                result = "打不开文件：\(e.localizedDescription)"
+            }
         }
+    }
+
+    private func doImport() {
+        let ok = g.importOwner(text: text)
+        failed = !ok
+        result = ok ? "导入成功：\(g.ownerFingerprint)" : "内容不是可用的 owner key（要有 publicKeyXy 和 privateKeyPkcs8 两行）"
     }
 }
 
