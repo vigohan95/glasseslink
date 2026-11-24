@@ -455,6 +455,10 @@ struct DeviceTabBody: View {
                     }
                 }
             }
+            Section("主人身份") {
+                Text(g.trustLine).font(.footnote)
+                NavigationLink("一次性设置（导入或注册钥匙）") { OwnerSetupView(g: g) }
+            }
             if !g.connected {
                 Section("附近的眼镜") {
                     if g.devices.isEmpty {

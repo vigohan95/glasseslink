@@ -45,6 +45,8 @@ final class Glasses: NSObject, ObservableObject {
     private var lastConnectAt = Date.distantPast
     @Published var busy = false
     @Published var ownerLine = "owner key: 未知"
+    /// Human-readable result of the last ownership proof, e.g. "已通过" or a code with a fix.
+    @Published var trustLine = "未验证"
     @Published var glassesLine = "未连接"
     @Published var lastPhoto: Data?
     @Published var answer = ""
@@ -284,12 +286,38 @@ final class Glasses: NSObject, ObservableObject {
             try sess.handshake(trust: trust)
             connected = true
             if trust { UserDefaults.standard.set(true, forKey: "isOwner") }
+            trustLine = trust ? "已通过（这台 iPhone 是主人）" : "未验证（临时密钥，仅用于注册）"
             glassesLine = "已连上 · trust=\(trust) · serial \(sess.peerSerial)"
             note("✅ 握手完成")
         } catch {
+            trustLine = Glasses.explain(error)
             note("❌ 握手中断：\(error)")
-            glassesLine = "握手失败：\(error)"
+            glassesLine = "握手失败：\(Glasses.explain(error))"
         }
+    }
+
+    /// Turns the glasses' status codes into something actionable, because a bare hex code
+    /// tells the user nothing and the fix is different for each one.
+    static func explain(_ error: Error) -> String {
+        if let e = error as? LinkError {
+            switch e {
+            case .trustRejected(let code):
+                switch code {
+                case 0x1010: return "眼镜不认识这把钥匙（0x1010）——导入 Visor 导出的 owner-export.json"
+                case 0x1044: return "签名不被接受（0x1044）——钥匙或签名方式与眼镜记的不一致"
+                case 0x1042: return "眼镜属于另一个 Meta 账号（0x1042）——要用当初注册它的账号"
+                case 0x1040: return "receipt 无效（0x1040）——重新注册一次"
+                case 0x1045: return "时间戳超范围（0x1045）——手机时间不准"
+                default: return "信任被拒：\(AirShield.statusName(code))（0x\(String(code, radix: 16))）"
+                }
+            case .serviceError(let step, let code):
+                return "「\(step)」被拒：\(AirShield.statusName(code))（0x\(String(code, radix: 16))）"
+            case .unexpected(let s): return "链路数据异常：\(s)"
+            case .badMAC: return "一帧没通过校验（bad MAC）——密钥或计数不同步"
+            default: return e.description
+            }
+        }
+        return "\(error)"
     }
 
     /// Connect without proving ownership — used before the first provisioning.

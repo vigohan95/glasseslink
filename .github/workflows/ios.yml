@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15   # arm64 pool is starved; Intel runners acquire instantly
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
@@ -53,4 +53,5 @@ jobs:
           name: GlassesLink-ipa
           path: out/GlassesLink.ipa
           retention-days: 14
+
 
