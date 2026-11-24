@@ -135,7 +135,7 @@ struct OwnerMaterial {
     /// so a mismatch shows up as one log line instead of a silent 0x1044 on the glasses.
     static var importStyle: String?
 
-    private func secPrivateKey() throws -> SecKey {
+    func secPrivateKey() throws -> SecKey {
         let base: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
                                    kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
                                    kSecAttrKeySizeInBits as String: 256]

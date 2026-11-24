@@ -8,6 +8,17 @@ import Security
 enum SelfTest {
     struct Line { let ok: Bool; let text: String }
 
+    private static func hexData(_ s: String) -> Data {
+        var out = Data(capacity: s.count / 2)
+        var i = s.startIndex
+        while i < s.endIndex {
+            let j = s.index(i, offsetBy: 2, limitedBy: s.endIndex) ?? s.endIndex
+            if let b = UInt8(s[i ..< j], radix: 16) { out.append(b) }
+            i = j
+        }
+        return out
+    }
+
     static func run() -> [Line] {
         var out: [Line] = []
 
@@ -15,7 +26,7 @@ enum SelfTest {
         let referenceScalar = Data((0 ..< 32).map { UInt8($0 + 0x0a) })
         let referenceDigest = Data((0 ..< 32).map { UInt8($0) })
         let referenceNonce = Data((0 ..< 32).map { UInt8($0 + 0x11) })
-        let expected = Data(hex: "4c6336e3b8b3de771b613a1c7a1734834cd69c1a4f5ffecb240c63bc0ddb1574"
+        let expected = hexData("4c6336e3b8b3de771b613a1c7a1734834cd69c1a4f5ffecb240c63bc0ddb1574"
                                  + "03bf8bb6c07d98211266b44f2c126e24cdb99572444e0d01d35b15d04433a4e2")
         let owner = OwnerMaterial(scalar: referenceScalar)
         if let sig = try? owner.signRaw(digest: referenceDigest, nonce: referenceNonce) {
