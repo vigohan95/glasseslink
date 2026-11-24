@@ -115,7 +115,9 @@ final class SDUStream: NSObject, StreamDelegate {
             }
             if let need = Self.frameLength(buf), buf.count >= need {
                 let frame = Data(buf.prefix(need))
-                buf.removeFirst(need)
+                // Re-base the buffer: `removeFirst` only moves `startIndex`, and every
+                // slice-blind index (b[0], b[1], b[9]) would then trap on the next frame.
+                buf = Data(buf.dropFirst(need))
                 cond.unlock()
                 return frame
             }
@@ -135,15 +137,19 @@ final class SDUStream: NSObject, StreamDelegate {
     }
 
     /// How many bytes the frame at the head of the buffer occupies, if knowable.
+    ///
+    /// Indexes through `startIndex` on purpose: `Data` slices keep the parent's indices,
+    /// so `b[0]` traps (SIGTRAP, signal 5) as soon as the buffer has been trimmed once.
     static func frameLength(_ b: Data) -> Int? {
+        let base = b.startIndex
         guard b.count >= 1 else { return nil }
-        let b0 = b[0]
+        let b0 = b[base]
         if b0 & 0xC0 == Direction.frameData {          // encrypted DATA frame
             guard b.count >= 10 else { return nil }
-            return 10 + 16 * (Int(b[9]) + 1)
+            return 10 + 16 * (Int(b[base + 9]) + 1)
         }
         guard b.count >= 4 else { return nil }         // plaintext DataX
-        let payloadLen = Int(b0 & 0x3F) << 8 | Int(b[1])
+        let payloadLen = Int(b0 & 0x3F) << 8 | Int(b[base + 1])
         return 4 + payloadLen
     }
 
