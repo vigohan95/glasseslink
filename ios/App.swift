@@ -208,6 +208,10 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     func connect(_ id: UUID) {
+        if channel != nil {
+            note("链路已经打开了，不用再点；要重来先「断开」")
+            return
+        }
         guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
             note("找不到这台设备（先扫描一次）"); return
         }
@@ -242,10 +246,13 @@ final class Glasses: NSObject, ObservableObject {
         let s = SDUStream(channel: ch)
         s.onLog = { [weak self] in self?.note($0) }
         stream = s
-        guard let own = owner else {
-            note("没有 owner key：这条链路只能用来跑「成为主人」")
-            return
+        // No key yet is not a dead end: the setup link only needs *a* key pair so the
+        // handshake can run, and provisioning replaces it with the real one afterwards.
+        if owner == nil {
+            owner = try? OwnerMaterial.generate()
+            note("还没有 owner key：先用临时密钥把链路打通（成为主人时会换成正式那把）")
         }
+        guard let own = owner else { note("建不出密钥对"); return }
         let sess = Session(stream: s, owner: own, log: { [weak self] in self?.note($0) })
         session = sess
         do {
@@ -262,6 +269,20 @@ final class Glasses: NSObject, ObservableObject {
 
     /// Connect without proving ownership — used before the first provisioning.
     func connectSetup() { Task { await bringUp(trust: false) } }
+
+    /// Tear the link down so the next connect starts from a clean slate. Without this a failed
+    /// attempt leaves the PSM occupied and every retry just says "L2CAP PSM already connected".
+    func disconnect() {
+        session?.close()
+        session = nil
+        stream?.close()
+        stream = nil
+        channel = nil
+        if let p = peripheral { central.cancelPeripheralConnection(p) }
+        connected = false
+        glassesLine = "未连接"
+        note("已断开，可以重新点了")
+    }
 
     /// Normal connect: prove we hold the owner key.
     func connectTrusted() { Task { await bringUp(trust: true) } }
@@ -860,6 +881,7 @@ struct ContentView: View {
                 Section("1 · 连眼镜") {
                     Button("从系统已配对里找（不用扫描）") { g.loadSystemPaired() }
                     Button("扫描附近眼镜（6 轮）") { g.startScan() }
+                    Button("断开（点不动或报 PSM 已占用时用）") { g.disconnect() }
                     ForEach(g.devices, id: \.id) { d in
                         Button {
                             g.connect(d.id)
