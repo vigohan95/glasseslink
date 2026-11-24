@@ -13,7 +13,7 @@ import UniformTypeIdentifiers
 
 @main
 struct GlassesApp: App {
-    var body: some Scene { WindowGroup { ContentView() } }
+    var body: some Scene { WindowGroup { RootView() } }
 }
 
 // MARK: - share sheet plumbing
@@ -922,7 +922,7 @@ struct ModelClient {
 // MARK: - UI
 
 struct ContentView: View {
-    @StateObject private var g = Glasses()
+    @ObservedObject var g: Glasses
     @State private var question = "我面前有什么？有台阶或障碍物吗？"
     @State private var showLogin = false
     @State private var showSettings = false
