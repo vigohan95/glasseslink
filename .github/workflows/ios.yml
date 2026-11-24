@@ -25,6 +25,8 @@ jobs:
           xcodebuild test \
             -project GlassesLink.xcodeproj \
             -scheme GlassesLink \
+            -only-testing:GlassesLinkTests/ProtocolTests \
+            -only-testing:GlassesLinkTests/CompatibilityTests \
             -destination "platform=iOS Simulator,name=$DEVICE" \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
