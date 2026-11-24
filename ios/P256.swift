@@ -201,72 +201,121 @@ enum P256Field {
 }
 
 enum P256ECDSA {
+    /// Affine point, coordinates in Montgomery form.
     struct Point {
         var x: P256Field.Word
         var y: P256Field.Word
         var infinity: Bool
     }
 
-    static func add(_ p1: Point, _ p2: Point) -> Point {
+    /// Jacobian point: (X/Z^2, Y/Z^3). One inversion at the end instead of one per step,
+    /// which is what made 256-bit scalar multiplication time out in CI.
+    private struct Jacobian {
+        var x: P256Field.Word
+        var y: P256Field.Word
+        var z: P256Field.Word
+    }
+
+    private static func jDouble(_ p: Jacobian) -> Jacobian {
         typealias F = P256Field
+        if p.z == F.zero { return p }
+        let delta = F.mulModP(p.z, p.z)                       // Z^2
+        let gamma = F.mulModP(p.y, p.y)                       // Y^2
+        let beta = F.mulModP(p.x, gamma)                      // X*Y^2
+        let alpha = F.mulModP(F.toMont([3, 0, 0, 0, 0, 0, 0, 0], F.p, F.n0p, F.r2p),
+                              F.mulModP(F.subMod(p.x, delta, F.p),
+                                        F.addMod(p.x, delta, F.p)))
+        let x3 = F.subMod(F.mulModP(alpha, alpha),
+                          F.mulModP(F.toMont([8, 0, 0, 0, 0, 0, 0, 0], F.p, F.n0p, F.r2p), beta),
+                          F.p)
+        let z3 = F.subMod(F.subMod(F.mulModP(F.addMod(p.y, p.z, F.p), F.addMod(p.y, p.z, F.p)),
+                                  gamma, F.p), delta, F.p)
+        let fourBeta = F.mulModP(F.toMont([4, 0, 0, 0, 0, 0, 0, 0], F.p, F.n0p, F.r2p), beta)
+        let eightGamma2 = F.mulModP(F.toMont([8, 0, 0, 0, 0, 0, 0, 0], F.p, F.n0p, F.r2p),
+                                    F.mulModP(gamma, gamma))
+        let y3 = F.subMod(F.mulModP(alpha, F.subMod(fourBeta, x3, F.p)), eightGamma2, F.p)
+        return Jacobian(x: x3, y: y3, z: z3)
+    }
+
+    private static func jAdd(_ p: Jacobian, _ q: Point) -> Jacobian {
+        typealias F = P256Field
+        if q.infinity { return p }
+        if p.z == F.zero {
+            return Jacobian(x: q.x, y: q.y,
+                            z: F.toMont([1, 0, 0, 0, 0, 0, 0, 0], F.p, F.n0p, F.r2p))
+        }
+        let z1z1 = F.mulModP(p.z, p.z)
+        let u2 = F.mulModP(q.x, z1z1)
+        let s2 = F.mulModP(F.mulModP(q.y, p.z), z1z1)
+        let h = F.subMod(u2, p.x, F.p)
+        let r = F.subMod(s2, p.y, F.p)
+        if h == F.zero {
+            if r == F.zero { return jDouble(p) }
+            return Jacobian(x: F.zero, y: F.zero, z: F.zero)   // P + (-P)
+        }
+        let hh = F.mulModP(h, h)
+        let i = F.mulModP(F.toMont([4, 0, 0, 0, 0, 0, 0, 0], F.p, F.n0p, F.r2p), hh)
+        let j = F.mulModP(h, i)
+        let rr = F.mulModP(r, r)
+        let v = F.mulModP(p.x, i)
+        let x3 = F.subMod(F.subMod(rr, j, F.p), F.addMod(v, v, F.p), F.p)
+        let y3 = F.subMod(F.mulModP(r, F.subMod(v, x3, F.p)),
+                          F.mulModP(F.addMod(p.y, p.y, F.p), j), F.p)
+        let z3 = F.subMod(F.subMod(F.mulModP(F.addMod(p.z, h, F.p), F.addMod(p.z, h, F.p)),
+                                  z1z1, F.p), hh, F.p)
+        return Jacobian(x: x3, y: y3, z: z3)
+    }
+
+    private static func affine(_ j: Jacobian) -> Point {
+        typealias F = P256Field
+        if j.z == F.zero { return Point(x: F.zero, y: F.zero, infinity: true) }
+        let zi = F.invP(j.z)
+        let zi2 = F.mulModP(zi, zi)
+        let zi3 = F.mulModP(zi2, zi)
+        return Point(x: F.mulModP(j.x, zi2), y: F.mulModP(j.y, zi3), infinity: false)
+    }
+
+    static func add(_ p1: Point, _ p2: Point) -> Point {
         if p1.infinity { return p2 }
         if p2.infinity { return p1 }
-        if F.cmp(p1.x, p2.x) == 0 {
-            if F.cmp(p1.y, p2.y) != 0 { return Point(x: F.zero, y: F.zero, infinity: true) }
-            return double(p1)
-        }
-        let dy = F.subMod(p2.y, p1.y, F.p)
-        let dx = F.subMod(p2.x, p1.x, F.p)
-        let lam = F.mulModP(dy, F.invP(dx))
-        let x3 = F.subMod(F.subMod(F.mulModP(lam, lam), p1.x, F.p), p2.x, F.p)
-        let y3 = F.subMod(F.mulModP(lam, F.subMod(p1.x, x3, F.p)), p1.y, F.p)
-        return Point(x: x3, y: y3, infinity: false)
+        return affine(jAdd(Jacobian(x: p1.x, y: p1.y,
+                                    z: P256Field.toMont([1, 0, 0, 0, 0, 0, 0, 0],
+                                                        P256Field.p, P256Field.n0p, P256Field.r2p)),
+                           p2))
     }
 
     static func double(_ p1: Point) -> Point {
-        typealias F = P256Field
         if p1.infinity { return p1 }
-        // 3 and A must enter the Montgomery domain like every other operand: mixing a
-        // plain limb vector with a Montgomery one is off by a factor of R.
-        let three = F.toMont([3, 0, 0, 0, 0, 0, 0, 0], F.p, F.n0p, F.r2p)
-        let aMont = F.toMont(F.a, F.p, F.n0p, F.r2p)
-        let num = F.addMod(F.mulModP(three, F.mulModP(p1.x, p1.x)), aMont, F.p)
-        let den = F.invP(F.addMod(p1.y, p1.y, F.p))
-        let lam = F.mulModP(num, den)
-        let x3 = F.subMod(F.mulModP(lam, lam), F.addMod(p1.x, p1.x, F.p), F.p)
-        let y3 = F.subMod(F.mulModP(lam, F.subMod(p1.x, x3, F.p)), p1.y, F.p)
-        return Point(x: x3, y: y3, infinity: false)
+        return affine(jDouble(Jacobian(x: p1.x, y: p1.y,
+                                       z: P256Field.toMont([1, 0, 0, 0, 0, 0, 0, 0],
+                                                           P256Field.p, P256Field.n0p, P256Field.r2p))))
+    }
+
+    private static func multiply(_ k: P256Field.Word, _ base: Point) -> Point {
+        typealias F = P256Field
+        var acc = Jacobian(x: F.zero, y: F.zero, z: F.zero)
+        var i = 255
+        while i >= 0 {
+            acc = jDouble(acc)
+            if (k[i / 32] >> UInt32(i % 32)) & 1 == 1 { acc = jAdd(acc, base) }
+            i -= 1
+        }
+        return affine(acc)
     }
 
     /// k * G, with all coordinates in Montgomery form.
     static func mulG(_ k: P256Field.Word) -> Point {
         typealias F = P256Field
-        var result = Point(x: F.zero, y: F.zero, infinity: true)
-        var addend = Point(x: F.toMont(F.gx, F.p, F.n0p, F.r2p),
-                           y: F.toMont(F.gy, F.p, F.n0p, F.r2p),
-                           infinity: false)
-        var i = 0
-        while i < 256 {
-            if (k[i / 32] >> UInt32(i % 32)) & 1 == 1 { result = add(result, addend) }
-            addend = double(addend)
-            i += 1
-        }
-        return result
+        let g = Point(x: F.toMont(F.gx, F.p, F.n0p, F.r2p),
+                      y: F.toMont(F.gy, F.p, F.n0p, F.r2p),
+                      infinity: false)
+        return multiply(k, g)
     }
 
     /// k * P for an arbitrary point, coordinates in Montgomery form.
     static func mul(_ k: P256Field.Word, _ point: Point) -> Point {
-        var result = Point(x: P256Field.zero, y: P256Field.zero, infinity: true)
-        var addend = point
-        var i = 0
-        while i < 256 {
-            if (k[i / 32] >> UInt32(i % 32)) & 1 == 1 { result = add(result, addend) }
-            addend = double(addend)
-            i += 1
-        }
-        return result
+        multiply(k, point)
     }
-
     /// NONEwithECDSA verification: `digest` is used verbatim, `publicKeyXy` is 64 bytes.
     static func verify(digest: Data, signature: Data, publicKeyXy: Data) -> Bool {
         typealias F = P256Field

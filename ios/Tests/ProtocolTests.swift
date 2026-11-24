@@ -23,9 +23,7 @@ final class ProtocolTests: XCTestCase {
     /// verbatim. tools/p256_ref.py is the executable spec: it produces r||s for the same
     /// digest with a fixed nonce and checks it with `cryptography`'s prehashed verifier.
     func testSignsTheDigestVerbatim() throws {
-        // The custom signer is only a fallback (Security is tried first) and its scalar
-        // multiplication still diverges/crashes for large k; see PROGRESS.md.
-        throw XCTSkip("custom P-256 signer is not trusted yet")
+
 
         // tools/p256_ref.py produced this r||s for exactly these inputs and confirmed with
         // `cryptography`'s Prehashed verifier that it is a NONEwithECDSA signature.
@@ -49,7 +47,7 @@ final class ProtocolTests: XCTestCase {
     }
 
     func testSignsWithARandomNonceAndIsStableAcrossCalls() throws {
-        throw XCTSkip("custom P-256 signer is not trusted yet")
+
         let owner = OwnerMaterial(scalar: Data((1 ... 32).map { UInt8($0) }))
         let digest = Data((0 ..< 32).map { UInt8($0) })
         let a = try owner.signRaw(digest: digest)
@@ -65,7 +63,6 @@ final class ProtocolTests: XCTestCase {
     }
     /// Pinpoints which primitive is wrong when signing diverges from tools/p256_ref.py.
     func testFieldAndPointPrimitives() throws {
-        throw XCTSkip("custom P-256 signer is not trusted yet")
         typealias F = P256Field
         func plainMul(_ a: UInt64, _ b: UInt64) -> UInt64 {
             func m(_ v: UInt64) -> F.Word {
