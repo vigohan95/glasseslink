@@ -50,7 +50,7 @@ final class SessionLoopbackTests: XCTestCase {
 
     }
     func testFullHandshakeCaptureListAndTransfer() throws {
-        throw XCTSkip("fake peer crashes the runner in its second stage; tracked in PROGRESS.md")
+        
         // The fake peer still does not complete its side of the link; the signer it uses is
         // now verified, so what remains is the peer's own setup path.
 
@@ -102,7 +102,7 @@ final class SessionLoopbackTests: XCTestCase {
         // KNOWN ISSUE (2026-11-23): the setup-only link still hangs against the fake peer
         // while the trusted link gets no further than its first frame, so the fake peer is
         // not yet a faithful server. Tracked in PROGRESS.md; skipping keeps CI meaningful.
-        throw XCTSkip("fake peer crashes the runner in its second stage; tracked in PROGRESS.md")
+        
         let peer = FakeGlasses(stream: glassStream, records: [],
                                file: ("unused", Data()), expectTrust: false,
                                log: { print("[glass] \($0)") })
