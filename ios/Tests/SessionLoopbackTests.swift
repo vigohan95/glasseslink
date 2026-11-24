@@ -37,7 +37,6 @@ final class SessionLoopbackTests: XCTestCase {
     func testFullHandshakeCaptureListAndTransfer() throws {
         // The fake peer still does not complete its side of the link; the signer it uses is
         // now verified, so what remains is the peer's own setup path.
-        throw XCTSkip("fake peer does not complete the link yet")
 
         let owner = OwnerMaterial(scalar: Data((0 ..< 32).map { UInt8($0 + 1) }))
 
@@ -50,12 +49,12 @@ final class SessionLoopbackTests: XCTestCase {
         print("[loop] A owner+pair+record built")
         let peer = FakeGlasses(stream: glassStream, records: [record],
                                file: ("Visor_20261123_110000.jpg", payload),
-                               log: { NSLog("glass: %@", $0) })
+                               log: { print("[glass] \($0)") })
         peer.start()
         print("[loop] B peer started")
 
         let session = Session(stream: phoneStream, owner: owner,
-                              log: { NSLog("phone: %@", $0) })
+                              log: { print("[phone] \($0)") })
         print("[loop] C session built, handshaking")
 
         try session.handshake(timeout: 15)
@@ -87,14 +86,14 @@ final class SessionLoopbackTests: XCTestCase {
         // KNOWN ISSUE (2026-11-23): the setup-only link still hangs against the fake peer
         // while the trusted link gets no further than its first frame, so the fake peer is
         // not yet a faithful server. Tracked in PROGRESS.md; skipping keeps CI meaningful.
-        throw XCTSkip("fake peer does not complete the setup link yet")
+        print("[loop] no-trust variant starts")
         let peer = FakeGlasses(stream: glassStream, records: [],
                                file: ("unused", Data()), expectTrust: false,
-                               log: { NSLog("glass: %@", $0) })
+                               log: { print("[glass] \($0)") })
         peer.start()
 
         let session = Session(stream: phoneStream, owner: owner,
-                              log: { NSLog("phone: %@", $0) })
+                              log: { print("[phone] \($0)") })
         try session.handshake(timeout: 15, trust: false)
         XCTAssertNil(peer.failure, "fake peer rejected the setup link: \(peer.failure ?? "")")
         XCTAssertTrue(peer.sawEndLinkStatus, "EndLinkSetup was not acknowledged")
