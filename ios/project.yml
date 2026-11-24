@@ -53,8 +53,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "0.72"
-        CFBundleVersion: "72"
+        CFBundleShortVersionString: "0.73"
+        CFBundleVersion: "73"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
@@ -81,6 +81,11 @@ targets:
         SWIFT_VERSION: "5.9"
         CODE_SIGNING_ALLOWED: NO
         TARGETED_DEVICE_FAMILY: 1
+        # Run as a bare logic test: without a host app the suite finishes in seconds.
+        # With TEST_HOST set, xcodebuild boots the whole app (CoreBluetooth, UI, the lot)
+        # for every run, which is what turned a 90-second build into a 10-minute one.
+        TEST_HOST: ""
+        BUNDLE_LOADER: ""
 
 schemes:
   GlassesLink:
