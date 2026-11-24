@@ -36,7 +36,8 @@ struct ActivityView: UIViewControllerRepresentable {
 @MainActor
 final class Glasses: NSObject, ObservableObject {
     @Published var log: [String] = []
-    @Published var devices: [(id: UUID, name: String)] = []
+    @Published var devices: [ScanEntry] = []
+    private var scanTimer: Timer?
     @Published var connected = false
     @Published var busy = false
     @Published var ownerLine = "owner key: 未知"
@@ -130,9 +131,22 @@ final class Glasses: NSObject, ObservableObject {
     func startScan() {
         guard central.state == .poweredOn else { note("蓝牙不可用：\(central.state.rawValue)"); return }
         devices.removeAll()
-        note("扫描中…眼镜展开、靠近手机")
+        note("扫描中…眼镜展开、靠近手机、并在播放配对模式（指示灯闪蓝）")
+        // Duplicates must stay ON: the glasses announce themselves in a short burst and
+        // then go quiet, so a scan started a second too early would otherwise never see them.
         central.scanForPeripherals(withServices: nil,
-                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        scanTimer?.invalidate()
+        scanTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { _ in
+            Task { @MainActor in
+                self.central.stopScan()
+                if self.devices.isEmpty {
+                    self.note("20 秒内没扫到任何设备；若眼镜也没出现，检查：①眼镜是否在配对模式（闪烁蓝灯）②是否还被安卓连着（关掉安卓蓝牙）")
+                } else if self.devices.allSatisfy({ !$0.isGlasses }) {
+                    self.note("扫到 \(self.devices.count) 台设备，但没有眼镜。眼镜可能还连着那台安卓（先关安卓蓝牙），或者没进配对模式（折叠后长按拍摄键 5 秒到闪蓝）")
+                }
+            }
+        }
     }
 
     func connect(_ id: UUID) {
@@ -656,11 +670,25 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
                                     advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? p.name ?? "?"
+        let services = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        // The glasses are the only thing here advertising Meta's service (0xfd5f) — everything
+        // else (car keys, printers) just floods the list and buries them.
+        let isGlasses = name.localizedCaseInsensitiveContains("meta")
+            || name.localizedCaseInsensitiveContains("rb ")
+            || services.contains { $0.uuidString.lowercased().hasPrefix("fd5") }
+        let entry = ScanEntry(id: p.identifier, name: name, rssi: RSSI.intValue, isGlasses: isGlasses)
         Task { @MainActor in
-            if !self.devices.contains(where: { $0.id == p.identifier }) {
-                self.devices.append((p.identifier, name))
-                self.note("发现 \(name) rssi=\(RSSI)")
+            if let i = self.devices.firstIndex(where: { $0.id == p.identifier }) {
+                self.devices[i] = entry
+            } else {
+                self.devices.append(entry)
+                self.note("发现 \(name) rssi=\(RSSI)\(isGlasses ? " ← 像眼镜" : "")")
             }
+            self.devices.sort { a, b in
+                if a.isGlasses != b.isGlasses { return a.isGlasses }
+                return a.rssi > b.rssi
+            }
+            if self.devices.count > 40 { self.devices.removeLast(self.devices.count - 40) }
         }
     }
 
@@ -767,8 +795,21 @@ struct ContentView: View {
                 Section("1 · 连眼镜") {
                     Button("扫描附近眼镜") { g.startScan() }
                     ForEach(g.devices, id: \.id) { d in
-                        Button("连接 \(d.name)") { g.connect(d.id) }
+                        Button {
+                            g.connect(d.id)
+                        } label: {
+                            HStack {
+                                if d.isGlasses { Image(systemName: "eyeglasses") }
+                                Text(d.name)
+                                Spacer()
+                                Text("\(d.rssi) dBm")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(d.isGlasses ? Color.accentColor : .secondary)
+                            }
+                        }
                     }
+                    Text("眼镜排在前面（有眼镜图标）。列表里没有 `RB Meta` 时：①眼镜折叠后长按拍摄键 5 秒，等指示灯闪蓝 ②把那台安卓的蓝牙关掉，否则眼镜不会广播。")
+                        .font(.caption).foregroundStyle(.secondary)
                     Button("重新握手（setup 链路，不验 owner）") { g.connectSetup() }
                     Toggle("详细日志（抓完整帧，排查用）", isOn: $verboseLog)
                         .onChange(of: verboseLog) { _, on in Session.verbose = on }
