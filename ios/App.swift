@@ -55,6 +55,8 @@ final class Glasses: NSObject, ObservableObject {
     @Published var lastVideo: Data?
     @Published var live: LiveStream?
     @Published var liveLine = "—"
+    @Published var selfTestLines: [SelfTest.Line] = []
+    @Published var selfTestBad = 0
     private var liveTicker: Timer?
 
     private var central: CBCentralManager!
@@ -96,6 +98,10 @@ final class Glasses: NSObject, ObservableObject {
         for l in lines { note("\(l.ok ? "✓" : "✗") \(l.text)") }
         let bad = lines.filter { !$0.ok }.count
         note("—— 自检结束：\(lines.count) 项，失败 \(bad) ——")
+        // Also show it as a sheet: the log area is easy to miss on first run.
+        selfTestLines = lines
+        selfTestBad = bad
+        showSelfTest = true
     }
 
     // MARK: logging (kept on disk so it can be shared from the phone)
@@ -748,6 +754,7 @@ struct ContentView: View {
     @State private var showLive = false
     @State private var showQuick = false
     @State private var verboseLog = false
+    @State private var showSelfTest = false
 
     var body: some View {
         NavigationStack {
@@ -901,6 +908,7 @@ struct ContentView: View {
             .sheet(isPresented: $showSettings) { SettingsView(g: g) }
             .sheet(isPresented: $showLive) { LiveView(g: g) }
             .sheet(isPresented: $showQuick) { NavigationStack { QuickPanel(g: g) } }
+            .sheet(isPresented: $showSelfTest) { SelfTestView(g: g) }
             .fileImporter(isPresented: $showImport, allowedContentTypes: [.json, .data]) { result in
                 switch result {
                 case .success(let url): g.importOwner(from: url)
