@@ -1,0 +1,63 @@
+﻿python.exe : 
+所在位置 行:2 字符: 1
++ & "C:\Users\lokla\AppData\Local\Programs\Python\Python311\python.exe" ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+--- usage: in=3066 out=3000 model=claude-opus-5-5
+# Diagnosis: the trace almost certainly isn't from the code you're running
+
+## Ranked hypotheses
+
+### 1. (Most likely) The crash report is stale or the binary is stale
+
+The evidence points this way:
+
+- The symbol is `frameLength(Data)`, which doesn't exist in the current source.
+- The offset stays at exactly `+128` across 6 builds, while you changed the buffer type from `Data` to `[UInt8]`. That change alters codegen. An identical offset means you're looking at the same old report or the same old binary.
+- The current `frameLength([UInt8])`/`nextFrame` contain no reachable trap:
+  - Every subscript is guarded by a `count` check.
+  - `buf[0..<need]` is guarded by `buf.count >= need`.
+  - `removeFirst()` is guarded by `!isEmpty`.
+  - `chunk[0..<n]` has `n ≤ 8192`.
+
+Common ways this happens:
+
+- `CrashLog.install` writes a file that is never deleted, so you re-read the first crash on every launch.
+- Xcode or TestFlight installs an older build.
+- Symbolication uses an old dSYM.
+
+**Patch:**
+- In `CrashLog.install`, stamp each report with the executable's `LC_UUID` (or the git hash) and a timestamp.
+- Delete or rename the file after reading it at launch.
+
+**Experiment:**
+- Add a log line like `print("build", gitHash)` at launch.
+- Compare the report's UUID with `dwarfdump --uuid` on the installed `.app`.
+- If they differ, this hypothesis is confirmed. If they match and it really still crashes, the crashing frame is somewhere other than `frameLength`, so re-symbolicate and look again.
+
+### 2. Frame-length formula mismatch, which explains "bad MAC, then silence"
+
+`10 + 16*(b[9]+1)` probably doesn't count a MAC trailer, or `b[9]` means something slightly different in the reference. Either way:
+
+- You'd cut the first encrypted frame short, so the HMAC fails.
+- The leftover bytes are then parsed as a new header, producing a bogus `need`.
+- `nextFrame` waits forever, which looks like silence.
+
+**Lines to check:** the `return 10 + 16 * ...` line. Diff it against the Kotlin framer byte for byte. Check whether the length includes the HMAC (32B or truncated), and whether the count is in blocks or blocks-minus-one.
+
+**Experiment:** log the hex of `buf` (count + first 64 bytes) whenever `frameLength` returns non-nil after encryption starts. Compare with `need`.
+
+### 3. Re-entrancy via `RunLoop.run` (your Q2): real, but causes desync, not SIGTRAP
+
+- Pumping `RunLoop.main` inside `nextFrame` lets any main-thread callback run. That includes CoreBluetooth delegate callbacks, timers, and a reconnect path calling `bringUp`.
+- A second `handshake`/`nextFrame` running nested would steal frames. Each consumer would see half the stream, which also produces "bad MAC".
+- It cannot double-read the `InputStream`: the delegate runs on the same thread, and you never hold `cond` across `run`, so there's no deadlock or trap.
+
+**Patch:** add a reentrancy guard on handshake:
+
+```swift
+private var inHandshake = false
+// in handshake:
+precondition(!inHandsh

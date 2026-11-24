@@ -1,0 +1,115 @@
+Context: I maintain a Swift iOS client that talks to Meta Ray-Ban Gen 2 smart glasses over BLE L2CAP directly (no vendor app). I have a byte-exact protocol description and a working Android implementation's Kotlin source to compare with. Everything below is real device behaviour, reproducible every attempt.
+
+Systematic symptom (release build on iPhone, iOS 27.2), 100% reproducible, 6 different versions:
+
+1. Connect, L2CAP CoC up (PSM 0x80) — fine.
+2. Send plaintext RequestEncryption (ch 0x8001, svc 5, type 1, fields: 1=64B pubkey, 2=16B challenge, 3=0, 4=31, 7=16). Log: `-> plain (102B) 80628001810000050200...`
+3. Glasses reply RequestEncryption 116B: fields 1=64B pubkey, 2=16B challenge, 3=0, 4=31, 5=12B key hint, 7=17. No field 6 (no quirks).
+4. Derive keys (ECDH P-256, HKDF-SHA256, AES-256-CBC + HMAC-SHA256 per frame), send EnableEncryption on ch 0x0001 with fields 1=pubkey, 2=seed, 3=iv, 4=baseSeq(now random), 5=31. Log: `-> ecdh ok, shared=...` then `-> EnableEncryption sent`.
+5. **Immediately after that the process dies** with SIGTRAP (signal 5), and the crash report always shows exactly:
+```
+frame 0  CrashLog.install closure            (our signal handler)
+frame 1  libsystem_platform.dylib  (signal trampoline)
+frame 2  GlassesLink SDUStream.frameLength(Data) -> Int? + 128
+frame 3  GlassesLink SDUStream.frameLength(Data) -> Int? + 128   <-- same function twice in a row
+frame 4  GlassesLink SDUStream.nextFrame(timeout:) + 344
+frame 5  GlassesLink Session.handshake(timeout:trust:) + 2160
+frame 6  GlassesLink Glasses.bringUp + 844
+```
+Occasionally instead of the crash we get exactly one inbound frame that fails our HMAC check ("bad MAC"), then silence.
+
+Here is the exact current source of the stream class (iOS, Swift 5.9, built with -O in Release):
+
+```swift
+// ---- SDUStream: one L2CAP channel, framed SDUs, thread-safe buffer ----
+final class SDUStream: NSObject, StreamDelegate {
+    private let input: InputStream?
+    private let output: OutputStream?
+    private var buf = [UInt8]()          // was Data before; crash persisted either way
+    private var closed = false
+    private var lastError: Error?
+    private let cond = NSCondition()
+    private var writeHook: ((Data) throws -> Void)?
+
+    init(channel: CBL2CAPChannel) { input = channel.inputStream; output = channel.outputStream; super.init(); ... schedule on RunLoop.main, open ... }
+
+    static func loopbackPair() -> (a: SDUStream, b: SDUStream) { ... two instances cross-fed ... }
+    func feed(_ data: Data) { cond.lock(); buf.append(contentsOf: data); cond.broadcast(); cond.unlock() }
+
+    func write(_ data: Data) throws {
+        if let hook = writeHook { try hook(data); return }
+        guard let output else { throw LinkError.io("no output stream") }
+        try data.withUnsafeBytes { raw in
+            var sent = 0
+            while sent < data.count {
+                let p = raw.bindMemory(to: UInt8.self).baseAddress!.advanced(by: sent)
+                let n = output.write(p, maxLength: data.count - sent)
+                if n <= 0 { throw LinkError.io("write failed") }
+                sent += n
+            }
+        }
+    }
+
+    static func frameLength(_ b: [UInt8]) -> Int? {
+        guard b.count >= 1 else { return nil }
+        let b0 = b[0]
+        if b0 & 0xC0 == 0x40 {                 // encrypted DATA frame
+            guard b.count >= 10 else { return nil }
+            return 10 + 16 * (Int(b[9]) + 1)
+        }
+        guard b.count >= 4 else { return nil } // plaintext DataX
+        let payloadLen = Int(b0 & 0x3F) << 8 | Int(b[1])
+        return 4 + payloadLen
+    }
+
+    func nextFrame(timeout: TimeInterval) throws -> Data {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            cond.lock()
+            if closed { cond.unlock(); throw LinkError.io("stream closed") }
+            if let need = Self.frameLength(buf), need > 4096 {
+                cond.unlock(); print("[sdu] resync"); cond.lock()
+                if !buf.isEmpty { buf.removeFirst() }
+                cond.unlock(); continue
+            }
+            if let need = Self.frameLength(buf), buf.count >= need {
+                let frame = Data(buf[0 ..< need])
+                buf.removeFirst(need)
+                cond.unlock()
+                return frame
+            }
+            cond.unlock()
+            if Date() >= deadline { throw LinkError.unexpected("timeout waiting for a frame") }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+    }
+
+    func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
+        switch eventCode {
+        case .hasBytesAvailable:
+            var chunk = [UInt8](repeating: 0, count: 8192)
+            let n = input?.read(&chunk, maxLength: chunk.count) ?? -1
+            if n > 0 { cond.lock(); buf.append(contentsOf: chunk[0 ..< n]); cond.broadcast(); cond.unlock() }
+        case .errorOccurred: cond.lock(); closed = true; cond.broadcast(); cond.unlock()
+        default: break
+        }
+    }
+}
+```
+
+Notes:
+- The decompiled symbol name in the trace is `frameLength(Data) -> Int?` — that is the OLD signature (Data). The current source has `frameLength([UInt8])` plus a `Data` convenience overload, so that trace was produced by a build where the buffer was still `Data`.
+- The two identical consecutive `frameLength` frames are suspicious to me: Swift does not tail-call-optimise a recursive call unless I wrote recursion, and `frameLength` is not recursive. Could this be `Data`'s subscript trapping (Data indices are not 0-based for slices) inside the specialised clone, reported twice because of inlining?
+- We previously had a bug where `buf = Data(buf.dropFirst(need))` left `startIndex != 0`, so the next `b[0]`/`b[9]` trapped. I "fixed" that by re-basing the buffer, then later changed the buffer to `[UInt8]`. Yet the crash kept happening at exactly the same address across builds, which makes me doubt the fix is on the crashing path at all.
+- `handshake` calls `nextFrame` first while waiting for the glasses' EnableEncryption; the crash happens there (after we sent ours).
+- Sending a sealed EndLinkSetup is no longer done (the Android reference explicitly does not send it in the handshake).
+- Everything is called from the main thread / main actor; the stream is scheduled on RunLoop.main and `nextFrame` also pumps RunLoop.main, so re-entrancy is possible.
+
+Question: what is the most likely actual cause of a SIGTRAP whose top app frames are `frameLength` twice, and what is the minimal, safest patch? Please rank hypotheses and, for each, name the exact line to change and the cheapest experiment that distinguishes it. In particular:
+1. Can `Data`-index traps survive a re-base and show up as two identical `frameLength` frames (i.e. is the trace misleading about which build it came from)?
+2. Could pumping `RunLoop.current.run(...)` inside `nextFrame` while `cond` is unlocked re-enter `handshake`/`nextFrame` and blow something up (e.g. double-read of the same stream, buffer corruption)?
+3. Is there any way `Int(b[9]) + 1` * 16 can overflow or produce a huge `need` that then makes `Data(buf[0..<need])` trap (given the guard `buf.count >= need`)?
+4. Would you restructure this to a lock-free single-owner reader (dedicated thread reading, main thread only consuming a queue) — and is that worth doing now?
+5. Anything about `NSCondition` + `RunLoop.run` interacting badly on iOS 27 that could raise SIGTRAP?
+
+Answer concisely but concretely; I will implement whatever you rank first.

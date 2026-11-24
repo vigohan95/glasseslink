@@ -15,141 +15,104 @@ import CoreBluetooth
 ///   * 0x00..0x3F / 0x80..0xBF  plaintext DataX: 2B length (14 bits) | 2B channel
 /// The two ranges are disjoint, which is what makes one-pass demux possible.
 final class SDUStream: NSObject, StreamDelegate {
-    private var input: InputStream?
-    private var output: OutputStream?
-    /// Loopback hook: when set, writes go straight to the peer's buffer and the real
-    /// streams are never touched (see `loopbackPair()`).
-    private var writeHook: ((Data) throws -> Void)?
-    private let cond = NSCondition()
-    private var buf = [UInt8]()
-    private var closed = false
-    private(set) var lastError: Error?
+    private let input: InputStream?
+    private let output: OutputStream?
 
-    var onLog: ((String) -> Void)?
+    private var buf: [UInt8] = []
+    private var frames: [Data] = []
+    private var closed = false
+    private var lastError: Error?
+    private let cond = NSCondition()
+
+    private var writeHook: ((Data) throws -> Void)?
+    private var reader: Thread?
 
     init(channel: CBL2CAPChannel) {
         input = channel.inputStream
         output = channel.outputStream
         super.init()
-        input?.delegate = self
-        output?.delegate = self
-        input?.schedule(in: .main, forMode: .common)
-        output?.schedule(in: .main, forMode: .common)
-        input?.open()
-        output?.open()
+        startReader()
     }
 
-
-    /// Two cross-wired bound pairs: what one side writes the other reads. Both ends are
-    /// scheduled on the main run loop, so a test that waits on the main queue delivers
-    /// the stream callbacks exactly as CoreBluetooth would.
-    /// Two cross-wired streams for tests: `a.write` lands in `b`'s buffer and vice versa.
-    /// No run loop, no CoreBluetooth, no simulator privileges — which is what makes the
-    /// handshake testable in CI.
-    static func loopbackPair() -> (a: SDUStream, b: SDUStream) {
-        let a = SDUStream(nullStreams: ())
-        let b = SDUStream(nullStreams: ())
-        a.writeHook = { [weak b] data in b?.feed(data) }
-        b.writeHook = { [weak a] data in a?.feed(data) }
-        return (a, b)
-    }
-
+    /// Test seam: a pair that never touches Bluetooth.
     private init(nullStreams: Void) {
+        input = nil
+        output = nil
         super.init()
     }
 
-    /// Hand bytes to whoever is blocked in `nextFrame`.
-    func feed(_ data: Data) {
+    private func startReader() {
+        let t = Thread { [weak self] in self?.readLoop() }
+        t.name = "sdu.reader"
+        t.stackSize = 512 * 1024
+        reader = t
+        t.start()
+    }
+
+    /// One thread owns the input stream; it never pumps a run loop, so nothing the
+    /// caller does can re-enter it. Frames are handed over through `frames`.
+    private func readLoop() {
+        guard let input else { return }
+        input.open()
+        output?.open()
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = input.read(&chunk, maxLength: chunk.count)
+            if n <= 0 { break }
+            ingest(Array(chunk[0 ..< n]))
+        }
         cond.lock()
-        buf.append(contentsOf: data)
+        closed = true
+        lastError = input.streamError
         cond.broadcast()
         cond.unlock()
     }
+
+    private func ingest(_ bytes: [UInt8]) {
+        cond.lock()
+        buf.append(contentsOf: bytes)
+        while let need = Self.frameLength(buf), need <= 8192, buf.count >= need {
+            frames.append(Data(buf[0 ..< need]))
+            buf.removeFirst(need)
+        }
+        if let need = Self.frameLength(buf), need > 8192 {
+            print("[sdu] resync: header claimed \(need)B, dropping a byte")
+            if !buf.isEmpty { buf.removeFirst() }
+        }
+        cond.broadcast()
+        cond.unlock()
+    }
+
+    static func loopbackPair() -> (a: SDUStream, b: SDUStream) {
+        let a = SDUStream(nullStreams: ())
+        let b = SDUStream(nullStreams: ())
+        a.writeHook = { [weak b] data in b?.ingest([UInt8](data)) }
+        b.writeHook = { [weak a] data in a?.ingest([UInt8](data)) }
+        return (a, b)
+    }
+
+    /// Bytes pushed by a test (or by a hook) enter exactly the same path as the socket.
+    func feed(_ data: Data) { ingest([UInt8](data)) }
+
     func write(_ data: Data) throws {
         if let hook = writeHook {
-            cond.lock()
-            let isClosed = closed
-            cond.unlock()
-            if isClosed { throw LinkError.io("stream closed") }
+            cond.lock(); let dead = closed; cond.unlock()
+            if dead { throw LinkError.io("stream closed") }
             try hook(data)
             return
         }
-        guard let output else { throw LinkError.io("stream closed") }
-        var sent = 0
-        let total = data.count
-        while sent < total {
-            cond.lock(); defer { cond.unlock() }
-            if closed { throw LinkError.io("stream closed") }
-            let n: Int = data.withUnsafeBytes { raw in
-                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
-                return output.write(base.advanced(by: sent), maxLength: total - sent)
+        guard let output else { throw LinkError.io("no output stream") }
+        try data.withUnsafeBytes { raw in
+            var sent = 0
+            let base = raw.bindMemory(to: UInt8.self).baseAddress!
+            while sent < data.count {
+                let n = output.write(base.advanced(by: sent), maxLength: data.count - sent)
+                if n <= 0 { throw LinkError.io("write failed") }
+                sent += n
             }
-            if n > 0 { sent += n; continue }
-            if n < 0 { throw LinkError.io(output.streamError?.localizedDescription ?? "write failed") }
-            if let e = output.streamError { throw LinkError.io(e.localizedDescription) }
-            cond.wait(until: Date().addingTimeInterval(0.05))
         }
     }
 
-    func close() {
-        cond.lock(); closed = true; cond.broadcast(); cond.unlock()
-        input?.close(); output?.close()
-    }
-
-    /// Block until one complete SDU is available.
-    /// Block until one whole SDU is buffered.
-    ///
-    /// Deliberately pumps the current run loop instead of parking on the condition variable:
-    /// the streams are scheduled on the main run loop, so a caller that blocked its own queue
-    /// would starve the very callbacks that feed this buffer (and the in-process loopback used
-    /// by the tests would never make progress either). The condition variable still wakes us
-    /// early when `feed` arrives from another thread.
-    func nextFrame(timeout: TimeInterval) throws -> Data {
-        let deadline = Date().addingTimeInterval(timeout)
-        while true {
-            cond.lock()
-            if closed {
-                let why = lastError.map { ": \($0)" } ?? ""
-                cond.unlock()
-                throw LinkError.io("stream closed\(why)")
-            }
-            if let need = Self.frameLength(buf), need > 4096 {
-                // A mis-read header can claim a 4 KB+ frame. Drop one byte and resync
-                // instead of waiting for megabytes that will never arrive.
-                cond.unlock()
-                print("[sdu] resync: header claimed \(need)B, dropping a byte")
-                cond.lock()
-                if !buf.isEmpty { buf.removeFirst() }
-                cond.unlock()
-                continue
-            }
-            if let need = Self.frameLength(buf), buf.count >= need {
-                let frame = Data(buf[0 ..< need])
-                // Re-base the buffer: `removeFirst` only moves `startIndex`, and every
-                // slice-blind index (b[0], b[1], b[9]) would then trap on the next frame.
-                buf.removeFirst(need)
-                cond.unlock()
-                return frame
-            }
-            cond.unlock()
-
-            if Date() >= deadline {
-                throw LinkError.unexpected("timeout waiting for a frame (folded? out of range?)")
-            }
-            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
-        }
-    }
-
-    /// Bytes sitting in the buffer; only meaningful from a single-threaded test.
-    var debugBufferCount: Int {
-        cond.lock(); defer { cond.unlock() }
-        return buf.count
-    }
-
-    /// How many bytes the frame at the head of the buffer occupies, if knowable.
-    ///
-    /// Indexes through `startIndex` on purpose: `Data` slices keep the parent's indices,
-    /// so `b[0]` traps (SIGTRAP, signal 5) as soon as the buffer has been trimmed once.
     static func frameLength(_ b: [UInt8]) -> Int? {
         guard b.count >= 1 else { return nil }
         let b0 = b[0]
@@ -167,109 +130,48 @@ final class SDUStream: NSObject, StreamDelegate {
         frameLength([UInt8](b))
     }
 
-    func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
-        switch eventCode {
-        case .hasBytesAvailable:
-            var chunk = [UInt8](repeating: 0, count: 8192)
-            let n = input?.read(&chunk, maxLength: chunk.count) ?? -1
-            if n > 0 {
-                cond.lock(); buf.append(contentsOf: chunk[0 ..< n]); cond.broadcast(); cond.unlock()
+    func nextFrame(timeout: TimeInterval) throws -> Data {
+        let deadline = Date().addingTimeInterval(timeout)
+        cond.lock()
+        defer { cond.unlock() }
+        while frames.isEmpty {
+            if closed {
+                let why = lastError.map { ": \($0)" } ?? ""
+                throw LinkError.io("stream closed\(why)")
             }
-        case .errorOccurred:
-            cond.lock(); closed = true; lastError = aStream.streamError; cond.broadcast(); cond.unlock()
-        case .endEncountered:
-            cond.lock(); closed = true; cond.broadcast(); cond.unlock()
-        default:
-            break
+            if !cond.wait(until: deadline) {
+                throw LinkError.unexpected("timeout waiting for a frame (folded? out of range?)")
+            }
+        }
+        return frames.removeFirst()
+    }
+
+    func close() {
+        cond.lock()
+        closed = true
+        cond.broadcast()
+        cond.unlock()
+        input?.close()
+        output?.close()
+    }
+
+    func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
+        if eventCode == .errorOccurred {
+            cond.lock()
+            closed = true
+            lastError = aStream.streamError
+            cond.broadcast()
+            cond.unlock()
         }
     }
-}
 
-// MARK: - capture records (schema-less flatbuffer)
-
-struct CaptureAsset {
-    let uuid: String
-    let type: Int          // 1 video, 2 still, 3 IMU, 4 frame log
-    let delivered: Bool
-    let size: Int
-}
-
-struct Capture {
-    let handle: String
-    let kind: Int          // 3073 photo, 3074 video
-    let timestampNS: Int?
-    let assets: [CaptureAsset]
-    var isPhoto: Bool { kind == 3073 }
-    var stills: [CaptureAsset] { assets.filter { $0.type == 2 } }
-
-    /// Stable id used for local bookkeeping (thumbnails, "already imported").
-    var id: String {
-        if let still = stills.first { return still.uuid }
-        if let first = assets.first { return first.uuid }
-        return handle
+    /// Bytes still waiting to be framed, plus whole frames not yet consumed by tests.
+    var debugBufferCount: Int {
+        cond.lock()
+        defer { cond.unlock() }
+        return buf.count + frames.reduce(0) { $0 + $1.count }
     }
 }
-
-enum FB {
-    static func u16(_ b: [UInt8], _ p: Int) throws -> Int {
-        guard p >= 0, p + 2 <= b.count else { throw LinkError.shortBuffer }
-        return Int(b[p]) | Int(b[p + 1]) << 8
-    }
-    static func u32(_ b: [UInt8], _ p: Int) throws -> Int {
-        guard p >= 0, p + 4 <= b.count else { throw LinkError.shortBuffer }
-        return Int(b[p]) | Int(b[p + 1]) << 8 | Int(b[p + 2]) << 16 | Int(b[p + 3]) << 24
-    }
-    static func i32(_ b: [UInt8], _ p: Int) throws -> Int32 {
-        Int32(bitPattern: UInt32(try u32(b, p)))
-    }
-    static func root(_ b: [UInt8]) throws -> Int { try u32(b, 0) }
-
-    static func fieldOffset(_ b: [UInt8], _ table: Int, _ slot: Int) throws -> Int {
-        let vt = table - Int(try i32(b, table))
-        let vtSize = try u16(b, vt)
-        let idx = 4 + slot * 2
-        if idx + 2 > vtSize { return 0 }
-        return try u16(b, vt + idx)
-    }
-
-    static func scalar(_ b: [UInt8], _ table: Int, _ slot: Int) throws -> Int {
-        let off = try fieldOffset(b, table, slot)
-        return off == 0 ? 0 : try u32(b, table + off)
-    }
-
-    static func string(_ b: [UInt8], _ table: Int, _ slot: Int) throws -> String? {
-        let off = try fieldOffset(b, table, slot)
-        guard off != 0 else { return nil }
-        let p = table + off
-        let s = p + (try u32(b, p))
-        let n = try u32(b, s)
-        guard s + 4 + n <= b.count else { throw LinkError.shortBuffer }
-        return String(decoding: b[(s + 4) ..< (s + 4 + n)], as: UTF8.self)
-    }
-
-    static func table(_ b: [UInt8], _ pos: Int, _ slot: Int) throws -> Int? {
-        let off = try fieldOffset(b, pos, slot)
-        guard off != 0 else { return nil }
-        let p = pos + off
-        return p + (try u32(b, p))
-    }
-
-    static func tableVector(_ b: [UInt8], _ pos: Int, _ slot: Int) throws -> [Int] {
-        let off = try fieldOffset(b, pos, slot)
-        guard off != 0 else { return [] }
-        let p = pos + off
-        let v = p + (try u32(b, p))
-        let n = try u32(b, v)
-        var out: [Int] = []
-        for i in 0 ..< n {
-            let elem = v + 4 + 4 * i
-            out.append(elem + (try u32(b, elem)))
-        }
-        return out
-    }
-}
-
-// MARK: - the session
 
 final class Session {
     static let chLocalFirst: UInt16 = 0x8002
