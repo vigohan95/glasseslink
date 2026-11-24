@@ -50,8 +50,7 @@ final class SessionLoopbackTests: XCTestCase {
 
     }
     func testFullHandshakeCaptureListAndTransfer() throws {
-        try XCTSkip("in-process loopback still stalls: Session.wait drives the same queue the fake peer needs; tracked in BUGLOG J")
-        
+
         // The fake peer still does not complete its side of the link; the signer it uses is
         // now verified, so what remains is the peer's own setup path.
 
@@ -98,7 +97,6 @@ final class SessionLoopbackTests: XCTestCase {
     /// The provisioning link skips trust entirely: the glasses do not know our key yet,
     /// which is exactly why the owner can be moved onto a new device without Meta.
     func testHandshakeWithoutTrust() throws {
-        try XCTSkip("in-process loopback still stalls: Session.wait drives the same queue the fake peer needs; tracked in BUGLOG J")
         let owner = OwnerMaterial(scalar: Data((0 ..< 32).map { UInt8($0 + 1) }))
         let (phoneStream, glassStream) = SDUStream.loopbackPair()
         // KNOWN ISSUE (2026-11-23): the setup-only link still hangs against the fake peer

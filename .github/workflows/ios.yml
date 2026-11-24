@@ -1,4 +1,4 @@
-﻿name: ios
+name: ios
 
 on:
   push:
@@ -27,6 +27,7 @@ jobs:
             -scheme GlassesLink \
             -only-testing:GlassesLinkTests/ProtocolTests \
             -only-testing:GlassesLinkTests/CompatibilityTests \
+            -only-testing:GlassesLinkTests/SessionLoopbackTests/testLoopbackPipeDeliversAFrame \
             -destination "platform=iOS Simulator,name=$DEVICE" \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
