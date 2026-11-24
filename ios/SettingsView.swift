@@ -63,11 +63,13 @@ struct SettingsView: View {
         let raw = g.settings[info.key]
         switch info.control.type {
         case "toggle":
+            // A value the glasses never reported must not look like "off" — that is how Visor
+            // left people staring at locked-looking switches. Say we don't know, still allow a write.
             Toggle(isOn: Binding(
                 get: { raw == "true" },
                 set: { g.writeSetting(info.key, $0 ? "true" : "false") }
             )) {
-                label(info, value: nil)
+                label(info, value: raw == nil ? "未读取" : nil)
             }
         case "choice":
             Menu {

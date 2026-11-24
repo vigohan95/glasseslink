@@ -285,7 +285,12 @@ final class Glasses: NSObject, ObservableObject {
         guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
             connecting = false
             connectingID = nil
-            note("找不到这台设备（先扫描一次）"); return
+            // Visor issue #114: after the glasses reboot, the cached identifier can go stale and
+            // every connect attempt says "Out of reach" while Bluetooth audio stays fine. Rescan
+            // instead of making the user guess.
+            note("找不到这台设备（可能刚重启过），自动重新扫描…")
+            startScan()
+            return
         }
         central.stopScan()
         peripheral = p
