@@ -480,16 +480,11 @@ final class Session {
         // a hard-coded 0 makes some firmware reject the whole EnableEncryption.
         let baseSeq = UInt32.random(in: 1 ... 0xFFFF_FFF0)
 
-        try sendPlain(try AirShield.requestEncryption(pubkey: pub, challenge: challenge, quirks: quirks))
-
-        // Both messages are plaintext and may arrive in either order, sometimes twice.
-        // Read a few frames and keep whatever parses; stop as soon as we have both.
         var peerRequest: (pub: Data, challenge: Data, quirks: AirShield.Quirk, version: Int)?
         var peerEnable: (seed: Data, iv: Data, base: UInt32, quirks: AirShield.Quirk)?
-        for _ in 0 ..< 4 {
-            let sdu = try stream.nextFrame(timeout: timeout)
-            let m = try DataX.parse(sdu)
-            guard m.channel == DataX.chSetup, let t = m.type else { continue }
+
+        func absorb(_ m: DataX.Message) throws {
+            guard m.channel == DataX.chSetup, let t = m.type else { return }
             let f = try PB.parse(m.payload)
             if t == 1, peerRequest == nil,
                let p = f[1]?.first as? Data, let c = f[2]?.first as? Data {
@@ -500,15 +495,44 @@ final class Session {
                 let q = (f[6]?.first as? Int) ?? 0
                 peerEnable = (s, i, UInt32((f[4]?.first as? Int) ?? 0), q == 1 ? .qcs7 : .none)
             }
-            if peerRequest != nil, peerEnable != nil { break }
+        }
+
+        // Fresh pairings: the glasses usually announce themselves first, and they ignore a
+        // request that lands while they are still switching out of pairing mode. Waiting a
+        // few seconds costs nothing; sending blind is what produced twelve seconds of
+        // silence in the field.
+        var passive = 0
+        let passiveUntil = Date().addingTimeInterval(6)
+        while Date() < passiveUntil, peerRequest == nil {
+            guard let sdu = try? stream.nextFrame(timeout: 1.0) else { continue }
+            guard let m = try? DataX.parse(sdu) else { continue }
+            emit("passive inbound ch=0x\(String(m.channel, radix: 16)) type=\(m.type.map(String.init) ?? "-")",
+                 sdu, inbound: true)
+            passive += 1
+            try absorb(m)
+        }
+        emit("passive read: \(passive) frame(s) before we spoke")
+
+        // Speak regardless: the exchange needs our challenge and seed even when they went first.
+        try sendPlain(try AirShield.requestEncryption(pubkey: pub, challenge: challenge, quirks: quirks))
+
+        // Both messages are plaintext and may arrive in either order, sometimes twice.
+        let deadline = Date().addingTimeInterval(timeout)
+        // Gen 2 never sends its own EnableEncryption, so only insist on the request; give a
+        // short extra window for an EnableEncryption that some firmware does send.
+        let enableWindow = Date().addingTimeInterval(4)
+        while Date() < deadline {
+            let done = peerRequest != nil && (peerEnable != nil || Date() > enableWindow)
+            if done { break }
+            guard let sdu = try? stream.nextFrame(timeout: 2.0) else { continue }
+            guard let m = try? DataX.parse(sdu) else { continue }
+            try absorb(m)
         }
         guard let req = peerRequest else {
             throw LinkError.unexpected("no RequestEncryption from the glasses")
         }
-        guard let en = peerEnable else {
-            throw LinkError.unexpected("no EnableEncryption from the glasses")
-        }
-        emit("peer version=\(req.version) quirks req=\(req.quirks) enable=\(en.quirks)")
+        let en = peerEnable
+        emit("peer version=\(req.version) quirks req=\(req.quirks) enable=\(en == nil ? "absent" : "\(en!.quirks)")")
 
         if let forced = forcedQuirks {
             quirks = forced == 1 ? .qcs7 : .none
@@ -528,8 +552,8 @@ final class Session {
 
         let keys = try AirShield.sessionKeys(shared: shared,
                                         ownChallenge: challenge, ownSeed: seed,
-                                        peerChallenge: req.challenge, peerSeed: en.seed,
-                                        ownIV: iv, peerIV: en.iv, peerBaseSeq: en.base,
+                                        peerChallenge: req.challenge, peerSeed: en?.seed ?? Data(),
+                                        ownIV: iv, peerIV: en?.iv ?? Data(), peerBaseSeq: en?.base ?? 0,
                                         quirks: quirks, multikey: multikey)
         send = keys.send
         recv = keys.recv
@@ -542,8 +566,8 @@ final class Session {
         // failing with bad MAC forever, prepare the plausible combinations; the first
         // frame the glasses send decides — its HMAC verifies under exactly one of them.
         rxOptions = Self.receiveCandidates(shared: shared, ownChallenge: challenge, ownSeed: seed,
-                                           peerChallenge: req.challenge, peerSeed: en.seed,
-                                           ownIV: iv, peerIV: en.iv, peerBase: en.base,
+                                           peerChallenge: req.challenge, peerSeed: en?.seed ?? Data(),
+                                           ownIV: iv, peerIV: en?.iv ?? Data(), peerBase: en?.base ?? 0,
                                            ownBase: baseSeq, quirks: quirks, multikey: multikey)
         emit("rx candidates: \(rxOptions.count)")
         peerPubkey = req.pub
