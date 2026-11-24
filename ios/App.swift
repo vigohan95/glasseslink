@@ -6,6 +6,7 @@
 //        → ask your own model about it (any OpenAI-compatible endpoint)
 
 import SwiftUI
+import AVFoundation
 import CoreBluetooth
 import Photos
 import UIKit
@@ -392,7 +393,11 @@ final class Glasses: NSObject, ObservableObject {
                     if saveToLibrary { saveToPhotos(transfer.data) }
                 } else {
                     lastVideo = transfer.data
-                    note("视频已收到，用「分享视频」导出")
+                    note("视频已收到 \(transfer.size)B")
+                    // A video should land in the library and show a poster frame, not a
+                    // generic film icon — otherwise the album looks empty after importing.
+                    saveVideoToPhotos(transfer.data)
+                    rememberVideoThumb(captureItem.id, transfer.data)
                 }
             } catch {
                 note("取文件失败：\(error)")
@@ -640,8 +645,53 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
-    // MARK: ask your own model
+    /// Videos go to the library the same way photos do, so importing a clip ends with
+    /// something you can actually watch in Photos instead of a file only this app knows.
+    private func saveVideoToPhotos(_ data: Data) {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("import-\(Int(Date().timeIntervalSince1970)).mp4")
+        do { try data.write(to: url) } catch {
+            note("写临时视频失败：\(error)")
+            return
+        }
+        PHPhotoLibrary.requestAuthorization { [weak self] status in
+            guard status == .authorized || status == .limited else {
+                Task { @MainActor in self?.note("没有相册权限，视频只在 app 内") }
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                let req = PHAssetCreationRequest.forAsset()
+                req.addResource(with: .video, fileURL: url, options: nil)
+            } completionHandler: { ok, err in
+                let msg = ok ? "视频已存到相册" : "视频存相册失败：\(err?.localizedDescription ?? "?")"
+                Task { @MainActor in self?.note(msg) }
+            }
+        }
+    }
 
+    /// Poster frame for a clip, using the first decodable frame.
+    func rememberVideoThumb(_ id: String, _ data: Data) {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thumb-\(Self.safeName(id)).mp4")
+        do { try data.write(to: url) } catch { return }
+        let asset = AVURLAsset(url: url)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.maximumSize = CGSize(width: 336, height: 336)
+        let time = CMTime(seconds: 0.3, preferredTimescale: 600)
+        gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { [weak self] _, image, _, _, _ in
+            guard let image else { return }
+            let ui = UIImage(cgImage: image)
+            Task { @MainActor in
+                self?.thumbs[id] = ui
+                if let dir = Self.thumbDir, let jpeg = ui.jpegData(compressionQuality: 0.7) {
+                    try? jpeg.write(to: dir.appendingPathComponent(Self.safeName(id) + ".jpg"))
+                }
+            }
+        }
+    }
+
+    // MARK: ask your own model
     func ask(_ question: String) {
         guard let photo = lastPhoto else { note("先拍一张"); return }
         UserDefaults.standard.set(modelBaseURL, forKey: "modelBaseURL")
