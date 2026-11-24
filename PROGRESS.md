@@ -87,3 +87,10 @@
 - 现在 `signRaw` 的自研路径与 `tools/p256_ref.py`（固定 d/digest/k → r||s，用 `cryptography` 的 Prehashed 验回）**逐字节相同**，`P256ECDSA.verify` 也一致；相关 4 个用例全部恢复运行并通过。
 - trust 的签名因此不再依赖 Security 能否导入独立 EC 私钥（本机/模拟器一律 `-50`）；真机优先仍走 Security，失败即回退自研，两条都有实现的依据。
 - 仍挂着的：`SessionLoopbackTests.testFullHandshakeCaptureListAndTransfer` 与 `testHandshakeWithoutTrust`（假眼镜自身还没走通 setup 链路），保持在 skip 并在本节记录。
+## v0.20.0 (2026-11-23) — 手机自检 + 传输管道回归测试
+
+- app 新增「自检」入口（`ios/SelfTest.swift` + `Glasses.runSelfTest()`）：参考向量签名、自研验签、公钥宽度、Security 能否导入私钥、信任摘要签名与篡改检测、ECDH 双向一致、PKCS#8 长度。结果全部写进 `Documents/glasses.log`。
+  为什么要有它：这几项在模拟器上被 Security 拒绝（`-50`），只有真机能回答；第一次连不上时，日志能立刻分出「密码学错」还是「链路错」。
+- `ios/Tests/SessionLoopbackTests.swift` 里的 `testLoopbackPipeDeliversAFrame` 现在通过：这对 `SDUStream` 的 `writeHook`/`feed`/`nextFrame` 是真正的回归测试（此前的 4 字节帧是我自己写错了长度位，`0x80 0x01` 声明 1 字节负载，管道本身没问题）。
+- 仍然是 skip 的：`testFullHandshakeCaptureListAndTransfer` / `testHandshakeWithoutTrust`。假眼镜在第二阶段会把测试进程带崩（`Restarting after unexpected exit`），现象是「双方都停在等对方」，与真实协议无关；已记录，下一步用 Python 的 `pi/selftest_session.py` 逐步对照重写。
+- 版本号换到 `CFBundleShortVersionString 0.20 / CFBundleVersion 20`（之前几次改的是 yml 里不存在的 `version:` 键，ipa 里其实一直是 0.16）。
