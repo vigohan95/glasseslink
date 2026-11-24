@@ -88,6 +88,16 @@ final class Glasses: NSObject, ObservableObject {
         note("启动。owner=\(owner == nil ? "无" : "有")")
     }
 
+    /// Runs the checks that only this phone can answer (key import, both signing paths,
+    /// ECDH) and pushes every line into the log so it can be shared after a failed connect.
+    func runSelfTest() {
+        let lines = SelfTest.run()
+        note("—— 自检开始 ——")
+        for l in lines { note("\(l.ok ? "✓" : "✗") \(l.text)") }
+        let bad = lines.filter { !$0.ok }.count
+        note("—— 自检结束：\(lines.count) 项，失败 \(bad) ——")
+    }
+
     // MARK: logging (kept on disk so it can be shared from the phone)
 
     func note(_ s: String) {
@@ -748,8 +758,13 @@ struct ContentView: View {
                     Button("重新握手（setup 链路，不验 owner）") { g.connectSetup() }
                 }
 
-                Section("2 · 成为主人（只做一次）") {
-                    Button("用 Meta 账号登录并注册这台 iPhone") { showLogin = true }
+                Section("2 · 自检（不用连眼镜也能跑）") {
+                    Button("跑一遍密钥 / 签名 / ECDH 自检") { g.runSelfTest() }
+                    Text("结果会写进下面的日志；连不上眼镜时先看这里，能分清是手机这套密码学的问题还是链路的问题。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section("3 · 成为主人（只做一次）") {                    Button("用 Meta 账号登录并注册这台 iPhone") { showLogin = true }
                     Text("登录在 app 内完成；token 只用来给眼镜签一张 ownership receipt。"
                          + "成功后 owner-export.json 会弹出来，务必存到 iCloud。")
                         .font(.caption).foregroundStyle(.secondary)
