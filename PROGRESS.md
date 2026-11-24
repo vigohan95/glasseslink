@@ -75,3 +75,9 @@
 
 - 假眼镜（`ios/Tests/FakeGlasses.swift`）还不够忠实：setup 链路会挂住，trusted 链路停在首帧，两个回环用例暂时 `XCTSkip`。
 - Security 在本机/模拟器拒绝导入独立 EC 私钥（`OSStatus -50`，raw / pkcs8 / sec1 / keychain 四种容器都试过），所以 `signRaw` 目前只能在真机上验证是否可用；真机如果回 0x1044，下一步就是自己实现 P-256 的 ECDSA（用 CryptoKit 只做 k*G 的 x 坐标）。
+## v0.18.0 (2026-11-23) — 签名回到系统实现
+
+- trust 的签名优先用 SecKeyCreateSignature(.ecdsaSignatureDigestX962SHA256)：它对 32 字节摘要原文签名，正是眼镜的 NONEwithECDSA。
+- 自研 P-256（ios/P256.swift，Montgomery 32 位 limb）只做回退。**已知缺陷**：小标量（2G/3G/255G/65535G）与参考实现一致，256 位标量的标量乘仍偏离 	ools/p256_ref.py，之前还有一次崩溃；相关用例（	estSignsTheDigestVerbatim、	estFieldAndPointPrimitives、	estSignsWithARandomNonceAndIsStableAcrossCalls、两个 loopback）全部 XCTSkip，等算术修好再开。
+- 过程中修掉的真 bug：P256Field.words 把字节写进了反序的 limb（常量是小端 limb 序），导致 Montgomery 运算整体错位；publicKeyXy 可能只有 63 字节；pkcs8 的 AlgorithmIdentifier 长度少一字节。
+- 参考实现留档：	ools/p256_ref.py（固定 d/digest/k → r||s，用 cryptography 的 Prehashed 验回）、	ools/p256_mirror.py（同算法的 Python 镜像，用来把「算法错」和「Swift 转写错」分开）、	ools/p256_consts.py（Montgomery 常量）。
