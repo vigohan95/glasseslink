@@ -655,7 +655,7 @@ struct DeviceTabBody: View {    @ObservedObject var g: Glasses
                     set: { Glasses.blockOTA = $0 }
                 ))
                 Button("同时让眼镜关掉云端更新（cloud_ota_enabled = false）") {
-                    g.writeSetting("cloud_ota_enabled", value: "false")
+                    g.writeSetting("cloud_ota_enabled", "false")
                 }
                 .font(.footnote)
             } header: {
