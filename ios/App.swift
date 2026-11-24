@@ -107,6 +107,12 @@ final class Glasses: NSObject, ObservableObject {
         } else {
             ownerLine = "owner key: 没有——先点「成为主人」"
         }
+        // The version banner is load-bearing: without it a pasted log cannot be matched
+        // to the build that produced it, and hours get spent re-diagnosing old crashes.
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        note("GlassesLink \(short) (\(build)) · iOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
         note("启动。owner=\(owner == nil ? "无" : "有")")
         if let prev = CrashLog.takePrevious() {
             note("—— 上次崩溃现场 ——")
