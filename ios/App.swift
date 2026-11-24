@@ -263,6 +263,13 @@ final class Glasses: NSObject, ObservableObject {
     /// the same peripheral without scanning — that is what makes "打开就能用" work.
     func autoReconnect() {
         guard central.state == .poweredOn else { return }
+        if UserDefaults.standard.bool(forKey: "linkInFlight") {
+            // Last launch died inside the handshake. Reconnecting automatically would replay
+            // the same crash, so this launch waits for an explicit tap.
+            UserDefaults.standard.set(false, forKey: "linkInFlight")
+            note("上次是在握手途中退出的，这次不自动重连——请手动点一次眼镜，日志里会有崩溃现场")
+            return
+        }
         guard let saved = UserDefaults.standard.string(forKey: "lastPeripheral"),
               let id = UUID(uuidString: saved) else { return }
         guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
@@ -291,6 +298,11 @@ final class Glasses: NSObject, ObservableObject {
         guard let own = owner else { note("建不出密钥对"); return }
         let sess = Session(stream: s, owner: own, log: { [weak self] in self?.note($0) })
         session = sess
+        // A crash inside handshake() would otherwise be repeated by auto-reconnect on every
+        // launch, which is exactly the "闪退十几次" loop. We mark the attempt in flight and
+        // clear it on the way out, so a leftover flag at next launch means "it died here".
+        UserDefaults.standard.set(true, forKey: "linkInFlight")
+        defer { UserDefaults.standard.set(false, forKey: "linkInFlight") }
         do {
             try sess.handshake(trust: trust)
             connected = true
