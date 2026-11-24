@@ -81,3 +81,9 @@
 - 自研 P-256（ios/P256.swift，Montgomery 32 位 limb）只做回退。**已知缺陷**：小标量（2G/3G/255G/65535G）与参考实现一致，256 位标量的标量乘仍偏离 	ools/p256_ref.py，之前还有一次崩溃；相关用例（	estSignsTheDigestVerbatim、	estFieldAndPointPrimitives、	estSignsWithARandomNonceAndIsStableAcrossCalls、两个 loopback）全部 XCTSkip，等算术修好再开。
 - 过程中修掉的真 bug：P256Field.words 把字节写进了反序的 limb（常量是小端 limb 序），导致 Montgomery 运算整体错位；publicKeyXy 可能只有 63 字节；pkcs8 的 AlgorithmIdentifier 长度少一字节。
 - 参考实现留档：	ools/p256_ref.py（固定 d/digest/k → r||s，用 cryptography 的 Prehashed 验回）、	ools/p256_mirror.py（同算法的 Python 镜像，用来把「算法错」和「Swift 转写错」分开）、	ools/p256_consts.py（Montgomery 常量）。
+## v0.19.0 (2026-11-23) — 自研 P-256 与参考实现逐字节一致
+
+- 点运算改 Jacobian（每步不再求逆，256 位标量乘从超时降到毫秒级），修掉 mixed addition 里 `r = 2*(S2 - Y1)` 少乘 2 的经典错误（表现正是「2G 对、3G 错」）。
+- 现在 `signRaw` 的自研路径与 `tools/p256_ref.py`（固定 d/digest/k → r||s，用 `cryptography` 的 Prehashed 验回）**逐字节相同**，`P256ECDSA.verify` 也一致；相关 4 个用例全部恢复运行并通过。
+- trust 的签名因此不再依赖 Security 能否导入独立 EC 私钥（本机/模拟器一律 `-50`）；真机优先仍走 Security，失败即回退自研，两条都有实现的依据。
+- 仍挂着的：`SessionLoopbackTests.testFullHandshakeCaptureListAndTransfer` 与 `testHandshakeWithoutTrust`（假眼镜自身还没走通 setup 链路），保持在 skip 并在本节记录。
