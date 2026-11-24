@@ -57,6 +57,7 @@ final class Glasses: NSObject, ObservableObject {
     @Published var liveLine = "—"
     @Published var selfTestLines: [SelfTest.Line] = []
     @Published var selfTestBad = 0
+    @Published var showSelfTest = false
     private var liveTicker: Timer?
 
     private var central: CBCentralManager!
@@ -754,7 +755,6 @@ struct ContentView: View {
     @State private var showLive = false
     @State private var showQuick = false
     @State private var verboseLog = false
-    @State private var showSelfTest = false
 
     var body: some View {
         NavigationStack {
@@ -908,7 +908,7 @@ struct ContentView: View {
             .sheet(isPresented: $showSettings) { SettingsView(g: g) }
             .sheet(isPresented: $showLive) { LiveView(g: g) }
             .sheet(isPresented: $showQuick) { NavigationStack { QuickPanel(g: g) } }
-            .sheet(isPresented: $showSelfTest) { SelfTestView(g: g) }
+            .sheet(isPresented: $g.showSelfTest) { SelfTestView(g: g) }
             .fileImporter(isPresented: $showImport, allowedContentTypes: [.json, .data]) { result in
                 switch result {
                 case .success(let url): g.importOwner(from: url)
