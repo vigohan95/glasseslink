@@ -1,9 +1,10 @@
 name: ios
 
-# Private repos are billed: free plan = 2000 minutes/month, and macOS is charged at a 10x
-# multiplier, i.e. ~200 real macOS minutes. A full run with the simulator suite costs ~12 min,
-# a build-only run costs ~2 min. So: every push builds (fast, cheap), the simulator suite runs
-# on demand and once a week. Flip `full_tests` to true when you need the whole thing.
+# While this repo is PUBLIC, macOS runner minutes are free, so the simulator suite runs on every
+# push. If it is ever made private again: free plan = 2000 minutes/month with macOS billed at a
+# 10x multiplier (~200 real macOS minutes), a full run costs ~12 min and a build-only run ~2 min —
+# in that case re-add `if: github.event_name == 'schedule' || inputs.full_tests == true` to the
+# "Unit tests" step and flip `full_tests` on when you need the whole suite.
 on:
   push:
     paths: ["ios/**", ".github/workflows/ios.yml"]
