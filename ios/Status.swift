@@ -50,9 +50,11 @@ enum Status {
             if let total = number(storage, 2) { state.storageTotalMb = total }
         }
         if let volume = inner(25) {
-            if let percent = number(volume, 3) { state.volumePercent = percent }
-            if let level = number(volume, 1) { state.volumeLevel = level }
-            if let stream = number(volume, 2) { state.volumeStream = streamName(stream) }
+            // The glasses may report UINT32_MAX for a volume that is unavailable.
+            let percent = number(volume, 3)
+            state.volumePercent = percent.flatMap { (0 ... 100).contains($0) ? $0 : nil }
+            state.volumeLevel = number(volume, 1)
+            state.volumeStream = number(volume, 2).map(streamName)
         }
     }
 
@@ -73,8 +75,8 @@ enum Status {
         switch value {
         case 0: return "UNKNOWN"
         case 1: return "MEDIA"
-        case 2: return "CALL"
-        case 3: return "ALARM"
+        case 2: return "TELEPHONY"
+        case 3: return "CURRENT"
         default: return "STREAM \(value)"
         }
     }
@@ -109,8 +111,9 @@ struct GlassesState {
             out.append("空间 \(gb(storageFreeMb)) 可用 / \(gb(storageTotalMb))")
         }
         if let volumePercent {
+            let level = volumeLevel.map { "（level \($0)）" } ?? ""
             let stream = volumeStream.map { " · \($0)" } ?? ""
-            out.append("音量 \(volumePercent)%（level \(volumeLevel ?? 0)）\(stream)")
+            out.append("音量 \(volumePercent)%\(level)\(stream)")
         }
         if let thermalC {
             let note = throttling == true ? "（限速中）" : ""

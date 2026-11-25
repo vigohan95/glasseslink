@@ -58,7 +58,7 @@ struct LiveView: View {
                         Button("停止") { g.stopLive() }
                             .buttonStyle(.bordered)
                         Button("抓取取景画面") { g.live?.requestPhoto() }
-                            .disabled(!g.canUseGlasses || g.busy)
+                            .disabled(!g.canUseGlasses || g.busy || g.live?.phase != .running)
                             .buttonStyle(.bordered)
                     }
                 }

@@ -45,6 +45,8 @@ jobs:
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testLoopbackPipeDeliversAFrame \
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testFrameLengthWithPartialHeadersAndNonzeroStartIndex \
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testLoopbackPipeKeepsTrailingPartialFrame \
+            -only-testing:GlassesLinkTests/SessionLoopbackTests/testTransportReportsUnexpectedEndOnceAndPreservesItsCause \
+            -only-testing:GlassesLinkTests/SessionLoopbackTests/testTransportReadsLargestDocumentedDataXFrameAcrossReads \
             -destination "platform=iOS Simulator,name=$DEVICE" \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO

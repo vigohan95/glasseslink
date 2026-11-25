@@ -17,6 +17,26 @@ final class ProtocolTests: XCTestCase {
 
     private func bytes(_ range: Range<Int>) -> Data { Data(range.map { UInt8($0) }) }
 
+    func testClaudeAndCompatibleModelRequestsUseTheirOwnAuthentication() throws {
+        let claude = ModelClient(baseURL: "https://api.anthropic.com/v1/messages/",
+                                 model: "demo-claude", apiKey: "test-claude")
+        let direct = try claude.completionRequest(question: "hello", image: nil, maxTokens: 64)
+        XCTAssertEqual(direct.url?.path, "/v1/messages")
+        XCTAssertEqual(direct.value(forHTTPHeaderField: "x-api-key"), "test-claude")
+        XCTAssertEqual(direct.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
+        XCTAssertNil(direct.value(forHTTPHeaderField: "Authorization"))
+        let body = try XCTUnwrap(direct.httpBody)
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let messages = try XCTUnwrap(object["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.first?["content"] as? String, "hello")
+
+        let router = ModelClient(baseURL: "https://openrouter.ai/api/v1", model: "example/model", apiKey: "test-router")
+        let routed = try router.completionRequest(question: "hello", image: nil, maxTokens: 64)
+        XCTAssertEqual(routed.url?.path, "/api/v1/chat/completions")
+        XCTAssertEqual(routed.value(forHTTPHeaderField: "Authorization"), "Bearer test-router")
+        XCTAssertNil(routed.value(forHTTPHeaderField: "x-api-key"))
+    }
+
     // MARK: - varint
 
     func testProtobufLengthDelimitedFieldAtBufferBoundary() throws {

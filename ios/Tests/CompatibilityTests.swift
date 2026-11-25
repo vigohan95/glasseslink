@@ -55,6 +55,24 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(hex(DataX.status(DataX.chSetupMirror, 0x1000)), "8004000103001000")
     }
 
+    func testDeviceVolumeDistinguishesUnavailableFromMuted() {
+        var state = GlassesState()
+        Status.merge(bytes("ca0106080710011823"), into: &state)
+        XCTAssertEqual(state.volumePercent, 35)
+        XCTAssertEqual(state.volumeLevel, 7)
+        XCTAssertEqual(state.volumeStream, "MEDIA")
+
+        Status.merge(bytes("ca0108100318ffffffff0f"), into: &state)
+        XCTAssertNil(state.volumePercent)
+        XCTAssertNil(state.volumeLevel)
+        XCTAssertEqual(state.volumeStream, "CURRENT")
+
+        Status.merge(bytes("ca0106080010021800"), into: &state)
+        XCTAssertEqual(state.volumePercent, 0)
+        XCTAssertEqual(state.volumeLevel, 0)
+        XCTAssertEqual(state.volumeStream, "TELEPHONY")
+    }
+
     func testNativeCaptureRecordReadsWrappedFields() throws {
         // The root points to the capture table, which points to an asset vector and 64-bit metadata.
         let payload = bytes("0c00000006000800040000000800000014000000"
@@ -73,5 +91,127 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(still.uuid, "asset-1")
         XCTAssertEqual(still.size, 2_730_026)
         XCTAssertTrue(still.delivered)
+    }
+
+    private func mediaOffer(channel: UInt16, id: Data, size: UInt64) -> Data {
+        let tags = [DataX.tag(1, UInt16(Session.svcAirship), last: false),
+                    DataX.tag(2, Session.airOffer, last: true)]
+        let payload = PB.bytes(1, id) + PB.uint(2, size) + PB.string(3, "namespace_media")
+            + PB.string(4, "example.heic")
+        return DataX.message(channel, tags: tags, payload: payload)
+    }
+
+    func testCatalogDeclinesAnUnrequestedOfferOnItsMirror() throws {
+        let (client, peer) = SDUStream.loopbackPair()
+        let session = Session(stream: client, owner: OwnerMaterial(scalar: Data(repeating: 1, count: 32)))
+        let id = bytes("00112233445546778999aabbccddeeff")
+        try peer.write(mediaOffer(channel: 0x8006, id: id, size: 256))
+        try peer.write(DataX.message(0x0002, tags: [DataX.tag(2, Session.capEnd, last: true)]))
+
+        XCTAssertTrue(try session.captureList(timeout: 1).isEmpty)
+        let request = try DataX.parse(peer.nextFrame(timeout: 1))
+        XCTAssertEqual(request.type, Int(Session.capEnum))
+        let reply = try DataX.parse(peer.nextFrame(timeout: 1))
+        XCTAssertEqual(reply.channel, 0x0006)
+        XCTAssertEqual(reply.type, Int(Session.airDrop))
+        XCTAssertEqual(reply.payload, PB.bytes(1, id))
+    }
+
+    func testMediaImportAcceptsSelectedOfferBeforeTheAssetAcknowledgement() throws {
+        let (client, peer) = SDUStream.loopbackPair()
+        let session = Session(stream: client, owner: OwnerMaterial(scalar: Data(repeating: 1, count: 32)))
+        let id = bytes("00112233445546778999aabbccddeeff")
+        let content = Data("example".utf8)
+        let offerChannel: UInt16 = 0x8008
+        try session.requestAsset(handle: "capture-1", assetID: "00112233-4455-4677-8999-aabbccddeeff")
+        let selected = try DataX.parse(peer.nextFrame(timeout: 1))
+        XCTAssertEqual(selected.type, Int(Session.capRequestAsset))
+        let route = try DataX.parse(peer.nextFrame(timeout: 1))
+        XCTAssertEqual(route.type, Int(Session.capSetLink))
+        XCTAssertEqual(route.payload, Data("capture-1:1".utf8))
+
+        try peer.write(mediaOffer(channel: offerChannel, id: id, size: UInt64(content.count)))
+        try peer.write(DataX.message(0x0002, tags: [DataX.tag(2, Session.capAssetQueued, last: true)]))
+        try peer.write(DataX.message(offerChannel, tags: [DataX.tag(2, Session.airData, last: true)], payload: content))
+        let completion = PB.uint(1, UInt64(content.count)) + PB.uint(2, UInt64(Session.adler32(content)))
+        try peer.write(DataX.message(offerChannel, tags: [DataX.tag(2, Session.airComplete, last: true)], payload: completion))
+
+        let result = try XCTUnwrap(session.receiveFile(timeout: 1))
+        XCTAssertEqual(result.name, "example.heic")
+        XCTAssertEqual(result.data, content)
+        let cursor = try DataX.parse(peer.nextFrame(timeout: 1))
+        XCTAssertEqual(cursor.channel, 0x0008)
+        XCTAssertEqual(cursor.type, Int(Session.airCursor))
+        XCTAssertEqual(cursor.payload, PB.uint(2, 1))
+        let drop = try DataX.parse(peer.nextFrame(timeout: 1))
+        XCTAssertEqual(drop.channel, 0x0008)
+        XCTAssertEqual(drop.type, Int(Session.airDrop))
+        XCTAssertEqual(drop.payload, PB.bytes(1, id))
+    }
+
+    func testShutterConfirmationUsesCameraEventsOnSubscriptionMirror() throws {
+        let (client, peer) = SDUStream.loopbackPair()
+        let session = Session(stream: client, owner: OwnerMaterial(scalar: Data(repeating: 1, count: 32)))
+        let mirror = Session.chLocalFirst ^ 0x8000
+        let snapshot = PB.bytes(1, PB.uint(3, 60)) + PB.bytes(21, PB.uint(1, 1024))
+        try peer.write(DataX.message(mirror, tags: [DataX.tag(2, 2005, last: true)], payload: snapshot))
+        _ = try session.subscribeStatus(timeout: 1)
+
+        let start = PB.uint(3, UInt64(Status.photoStarted))
+        let wrongChannel = [DataX.tag(1, UInt16(Status.service), last: false), DataX.tag(2, 2009, last: true)]
+        try peer.write(DataX.message(mirror + 1, tags: wrongChannel, payload: start))
+        try peer.write(DataX.message(mirror, tags: [DataX.tag(2, 2005, last: true)], payload: start))
+        try peer.write(DataX.message(mirror, tags: [DataX.tag(2, 2009, last: true)]))
+        let matched = start + PB.bytes(1, PB.uint(3, 61))
+        try peer.write(DataX.message(mirror, tags: [], payload: matched))
+
+        let state = try session.confirmedShutter(Shutter.photoPayload()) { $0 == Status.photoStarted }
+        XCTAssertEqual(state.batteryPercent, 61)
+        XCTAssertEqual(state.camera, Status.cameraName(Status.photoStarted))
+    }
+
+    func testSettingsReadMatchesRequestAndFinishesTheSyncOnEitherChannel() throws {
+        let (client, peer) = SDUStream.loopbackPair()
+        let session = Session(stream: client, owner: OwnerMaterial(scalar: Data(repeating: 1, count: 32)))
+        let settingsPeer: UInt16 = 0x8009
+        let key = "example_setting"
+        let value = "true"
+        let namespace = Drive.deviceSettings
+        let answered = expectation(description: "The settings peer saw round two")
+
+        DispatchQueue.global().async {
+            defer { answered.fulfill() }
+            do {
+                let ask = try DataX.parse(peer.nextFrame(timeout: 2))
+                let request = try XCTUnwrap(Drive.decode(ask.payload))
+                XCTAssertEqual(request.round, 0)
+                let named = [DataX.tag(1, UInt16(Drive.service), last: false),
+                             DataX.tag(2, Drive.syncMessage, last: true)]
+                let unrelated = Drive.build(namespace: namespace, requestID: "older-request", round: 1,
+                                            types: [Drive.kv])
+                try peer.write(DataX.message(settingsPeer, tags: named, payload: unrelated))
+
+                let found = Drive.Object(uri: key, type: Drive.kv, data: value, deleted: false, raw: Data())
+                let reply = Drive.build(namespace: namespace, requestID: request.requestID, round: 1,
+                                        types: [Drive.kv], objects: [found])
+                try peer.write(DataX.message(settingsPeer, tags: [], payload: reply))
+
+                let sync = try DataX.parse(peer.nextFrame(timeout: 2))
+                let roundTwo = try XCTUnwrap(Drive.decode(sync.payload))
+                XCTAssertEqual(roundTwo.round, 2)
+                XCTAssertEqual(roundTwo.requestID, request.requestID)
+                let done = Drive.build(namespace: namespace, requestID: request.requestID, round: 3,
+                                       types: [Drive.kv], terminated: true)
+                try peer.write(DataX.message(ask.channel ^ 0x8000, tags: [], payload: done))
+            } catch {
+                XCTFail("Settings loopback failed: \(error)")
+            }
+        }
+
+        let values = try session.driveObjects(types: [Drive.kv], timeout: 2)
+        wait(for: [answered], timeout: 2)
+        XCTAssertEqual(values.count, 1)
+        XCTAssertEqual(values.first?.uri, key)
+        XCTAssertEqual(values.first?.data, value)
     }
 }

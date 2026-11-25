@@ -63,8 +63,10 @@ final class LiveStream {
     var onPhase: ((Phase) -> Void)?
     var log: (String) -> Void = { _ in }
 
+    private let runningLock = NSLock()
     private var running = false
-    private var thread: Thread?
+    private var streamChannels: Set<UInt16> = []
+    private var streamTypes: [UInt16: UInt16] = [:]
     private var frameBuf = Data()
     private var photoBuf = Data()
     private var format: CMVideoFormatDescription?
@@ -81,8 +83,10 @@ final class LiveStream {
     // MARK: control
 
     func start(rung: LiveRung = .ble) {
-        guard !running else { return }
+        runningLock.lock()
+        guard !running else { runningLock.unlock(); return }
         running = true
+        runningLock.unlock()
         setPhase(.starting)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.run(rung: rung)
@@ -90,18 +94,18 @@ final class LiveStream {
     }
 
     func stop() {
-        guard running else { return }
-        running = false
-        try? session.sendOnService("stream", service: LiveStream.svcStream, type: StreamType.control,
-                                    payload: Self.controlStream(nonce: Self.nonce(), action: 2))
-        try? session.sendOnService("app", service: Status.service, type: 2002,
-                                   payload: PB.uint(1, 3))   // stop the livestream app
+        guard finishRunning() else { return }
+        if phase == .running {
+            try? session.sendOnService("stream", service: Self.svcStream, type: StreamType.control,
+                                       payload: Self.controlStream(nonce: Self.nonce(), action: 2))
+        }
+        try? session.sendOnService("status", service: Status.service, type: 2002, payload: PB.uint(1, 3))
         setPhase(.idle)
     }
 
     /// Asks the glasses for one still while the session runs; the answer arrives as HEIC.
     func requestPhoto() {
-        guard running else { return }
+        guard isRunning, phase == .running else { return }
         do {
             try session.sendOnService("stream", service: LiveStream.svcStream, type: StreamType.userEvent,
                                       payload: PB.uint(2, 4))
@@ -115,12 +119,68 @@ final class LiveStream {
 
     // MARK: the session
 
+    private var isRunning: Bool {
+        runningLock.lock()
+        defer { runningLock.unlock() }
+        return running
+    }
+
+    private func finishRunning() -> Bool {
+        runningLock.lock()
+        defer { runningLock.unlock() }
+        let wasRunning = running
+        running = false
+        return wasRunning
+    }
+
+    private func waitForAnswer(_ serviceName: String, service: Int, type: UInt16,
+                               payload: Data, answerType: UInt16, nonce: UInt16? = nil,
+                               timeout: TimeInterval) throws -> Data? {
+        guard isRunning else { throw CancellationError() }
+        let mirror = session.serviceChannel(serviceName, service: service) ^ 0x8000
+        if service == Self.svcStream { streamChannels.insert(mirror) }
+        try session.sendOnService(serviceName, service: service, type: type, payload: payload)
+        let deadline = Date().addingTimeInterval(timeout)
+        while isRunning, deadline.timeIntervalSinceNow > 0 {
+            let message: DataX.Message
+            do {
+                message = try session.nextMessage(timeout: min(0.5, deadline.timeIntervalSinceNow))
+            } catch LinkError.unexpected(_) {
+                continue
+            }
+            if message.channel == mirror {
+                if let code = message.error, code != Int(AirShield.stOK), code != Int(AirShield.stSuccess) {
+                    if service == Self.svcStream, code == 0xC001 {
+                        throw LinkError.unexpected("眼镜未在当前蓝牙连接上提供取景服务（0xC001）")
+                    }
+                    throw LinkError.serviceError("取景请求", UInt16(truncatingIfNeeded: code))
+                }
+                if message.type == Int(answerType) {
+                    if let nonce {
+                        let fields = try PB.parse(message.payload)
+                        guard (fields[1]?.first as? Int) == Int(nonce) else { continue }
+                    }
+                    return message.payload
+                }
+            }
+            try consumeStreamMessage(message)
+        }
+        guard isRunning else { throw CancellationError() }
+        return nil
+    }
+
     private func run(rung: LiveRung) {
         do {
             // 1. the glasses-side app that owns a live session (3 = livestream).
             log("starting livestream app")
-            _ = try? session.askOnService("app", service: Status.service, type: 2000,
-                                          payload: PB.uint(1, 3), answerType: 2001, timeout: 6)
+            if let started = try waitForAnswer("status", service: Status.service, type: 2000,
+                                               payload: PB.uint(1, 3), answerType: 2001, timeout: 6) {
+                let code = (try PB.parse(started))[1]?.first as? Int
+                guard code == 1 || code == 12 else {
+                    throw LinkError.unexpected("眼镜无法启动取景（结果 \(code ?? 0)）")
+                }
+            }
+            guard isRunning else { return }
 
             // 2. session settings: timers, application type 3 (demo), and the overrides the Meta app sends.
             let settings = PB.bytes(3, PB.uint(1, 30) + PB.uint(2, 600))
@@ -138,9 +198,9 @@ final class LiveStream {
                            + PB.uint(5, UInt64(rung.frameRate)) + PB.uint(6, 1)
                            + PB.uint(7, 1) + PB.uint(8, UInt64(rung.frameRate)))
                 + PB.uint(3, 1)
-            let answer = try? session.askOnService("stream", service: LiveStream.svcStream,
-                                                   type: StreamType.configureVideo, payload: video,
-                                                   answerType: StreamType.configureVideoAck, timeout: 8)
+            let answer = try waitForAnswer("stream", service: Self.svcStream,
+                                           type: StreamType.configureVideo, payload: video,
+                                           answerType: StreamType.configureVideoAck, nonce: nonce, timeout: 8)
             log("configure video \(rung.words): \(Self.answerWords(answer))")
 
             // 4. audio: 48 kHz stereo AAC-LC, the format the glasses' microphones run at.
@@ -149,64 +209,80 @@ final class LiveStream {
                 + PB.bytes(2, PB.string(1, "audio/mp4a-latm") + PB.uint(2, 48_000) + PB.uint(3, 96_000)
                            + PB.uint(4, 2) + PB.uint(5, 0))
                 + PB.uint(3, 1)
-            let ack = try? session.askOnService("stream", service: LiveStream.svcStream,
-                                                type: StreamType.configureAudio, payload: audio,
-                                                answerType: StreamType.configureAudioAck, timeout: 6)
+            let ack = try waitForAnswer("stream", service: Self.svcStream,
+                                        type: StreamType.configureAudio, payload: audio,
+                                        answerType: StreamType.configureAudioAck, nonce: anonce, timeout: 6)
             log("configure audio: \(Self.answerWords(ack))")
 
             // 5. go.
-            let start = try session.askOnService("stream", service: LiveStream.svcStream,
-                                                 type: StreamType.control,
-                                                 payload: Self.controlStream(nonce: Self.nonce(), action: 1),
-                                                 answerType: StreamType.controlAck, timeout: 8)
+            let startNonce = Self.nonce()
+            let start = try waitForAnswer("stream", service: Self.svcStream, type: StreamType.control,
+                                          payload: Self.controlStream(nonce: startNonce, action: 1),
+                                          answerType: StreamType.controlAck, nonce: startNonce, timeout: 8)
             log("start: \(Self.answerWords(start))")
+            if let start, Self.answerWords(start) != "ok" {
+                throw LinkError.unexpected("眼镜拒绝取景（\(Self.answerWords(start))）")
+            }
+            try readLoop()
         } catch {
-            log("live start failed: \(error)")
-            lastError = "\(error)"
+            guard finishRunning() else { return }
+            log("live failed: \(error)")
+            if case LinkError.unexpected(let reason) = error {
+                lastError = reason
+            } else {
+                lastError = "\(error)"
+            }
             setPhase(.failed)
-            running = false
-            return
         }
-        readLoop()
     }
 
     /// Owns the link while streaming: everything on the stream channel lands here.
-    private func readLoop() {
-        while running {
+    private func readLoop() throws {
+        lastFrameAt = Date()
+        while isRunning {
+            if Date().timeIntervalSince(lastFrameAt) > 12 {
+                throw LinkError.unexpected("眼镜没有返回取景画面")
+            }
             let message: DataX.Message
             do {
                 message = try session.nextMessage(timeout: 1.5)
-            } catch {
-                if running { lastError = "\(error)"; log("stream read: \(error)") }
+            } catch LinkError.unexpected(_) {
                 continue
             }
-            guard message.service == LiveStream.svcStream || message.type == Int(StreamType.stopped) else { continue }
-            guard let type = message.type else { continue }
-            switch UInt16(truncatingIfNeeded: type) {
-            case StreamType.codecConfig:
-                takeCodecConfig(message.payload)
-            case StreamType.videoBuffer:
-                frameBuf.append(message.payload)
-                meter(message.payload.count)
-            case StreamType.videoEnd:
-                frameBuf.append(message.payload)
-                meter(message.payload.count)
-                finishFrame()
-            case StreamType.photoBuffer:
-                photoBuf.append(message.payload)
-            case StreamType.photoEnd:
-                photoBuf.append(message.payload)
-                finishPhoto()
-            case StreamType.stopped:
-                log("glasses stopped the stream (reason \(message.payload.count)B)")
-                running = false
-                setPhase(.failed)
-                lastError = "stream stopped by the glasses"
-            case StreamType.lifecycle:
-                log("lifecycle event")
-            default:
-                break
-            }
+            try consumeStreamMessage(message)
+        }
+    }
+
+    private func consumeStreamMessage(_ message: DataX.Message) throws {
+        guard isRunning, message.error == nil else { return }
+        if let service = message.service {
+            guard service == Self.svcStream else { return }
+            streamChannels.insert(message.channel)
+        }
+        guard streamChannels.contains(message.channel) else { return }
+        if let type = message.type { streamTypes[message.channel] = UInt16(truncatingIfNeeded: type) }
+        guard let type = streamTypes[message.channel] else { return }
+        switch type {
+        case StreamType.codecConfig:
+            takeCodecConfig(message.payload)
+        case StreamType.videoBuffer:
+            frameBuf.append(message.payload)
+            meter(message.payload.count)
+        case StreamType.videoEnd:
+            frameBuf.append(message.payload)
+            meter(message.payload.count)
+            finishFrame()
+        case StreamType.photoBuffer:
+            photoBuf.append(message.payload)
+        case StreamType.photoEnd:
+            photoBuf.append(message.payload)
+            finishPhoto()
+        case StreamType.stopped:
+            throw LinkError.unexpected("眼镜停止了取景")
+        case StreamType.lifecycle:
+            log("lifecycle event")
+        default:
+            break
         }
     }
 
@@ -235,14 +311,15 @@ final class LiveStream {
         }
         let annex = whole.subdata(in: 8..<whole.count)
         let units = Self.annexBUnits(annex)
-        guard !units.isEmpty, let fmt = format else { return }
+        guard let time = CMTimeValue(exactly: UInt64(littleEndian: pts)), !units.isEmpty, let fmt = format,
+              let sample = Self.sampleBuffer(units: units, format: fmt,
+                                             pts: CMTime(value: time, timescale: 1_000_000)) else { return }
+        if layer.status == .failed { layer.flush() }
+        layer.enqueue(sample)
         lastFrameAt = Date()
         frames += 1
         windowFrames += 1
         if phase != .running { setPhase(.running) }
-        guard let sample = Self.sampleBuffer(units: units, format: fmt, pts: CMTime(value: CMTimeValue(pts), timescale: 1_000_000)) else { return }
-        if layer.status == .failed { layer.flush() }
-        layer.enqueue(sample)
         if let dims = CMSampleBufferGetFormatDescription(sample).map(CMVideoFormatDescriptionGetDimensions) {
             decodedSize = CGSize(width: Int(dims.width), height: Int(dims.height))
         }
@@ -257,7 +334,7 @@ final class LiveStream {
         let data = bare ? whole : whole.subdata(in: 8..<whole.count)
         let heic = String(data: data.prefix(12), encoding: .ascii)?.contains("ftyp") ?? false
         log("photo: \(data.count)B \(heic ? "HEIC" : "")")
-        onPhoto?(LivePhoto(data: data, isHeic: heic))
+        DispatchQueue.main.async { self.onPhoto?(LivePhoto(data: data, isHeic: heic)) }
     }
 
     // MARK: stats

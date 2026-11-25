@@ -21,7 +21,9 @@ final class SDUStream: NSObject, StreamDelegate {
     private var buf: [UInt8] = []
     private var frames: [Data] = []
     private var closed = false
-    private var lastError: Error?
+    private var opened = false
+    private var terminalFailure: LinkError?
+    private var failureHandler: ((LinkError) -> Void)?
     private let cond = NSCondition()
 
     private var writeHook: ((Data) throws -> Void)?
@@ -42,6 +44,7 @@ final class SDUStream: NSObject, StreamDelegate {
         input = nil
         output = nil
         super.init()
+        opened = true
     }
 
     private func startReader() {
@@ -56,35 +59,34 @@ final class SDUStream: NSObject, StreamDelegate {
     /// caller does can re-enter it. Frames are handed over through `frames`.
     private func readLoop() {
         guard let input else { return }
+        cond.lock()
+        guard !closed else { cond.unlock(); return }
         input.open()
         output?.open()
+        opened = true
+        cond.broadcast()
+        cond.unlock()
         var chunk = [UInt8](repeating: 0, count: 4096)
         while true {
             let n = input.read(&chunk, maxLength: chunk.count)
-            if n <= 0 { break }
+            if n <= 0 {
+                finish(Self.ioError(input, fallback: "input stream ended"))
+                return
+            }
             ingest(Array(chunk[0 ..< n]))
         }
-        cond.lock()
-        closed = true
-        lastError = input.streamError
-        cond.broadcast()
-        cond.unlock()
     }
 
     private func ingest(_ bytes: [UInt8]) {
         cond.lock()
+        defer { cond.unlock() }
+        guard !closed else { return }
         buf.append(contentsOf: bytes)
-        while let need = Self.frameLength(buf), need <= 8192, buf.count >= need {
+        while let need = Self.frameLength(buf), buf.count >= need {
             frames.append(Data(buf[0 ..< need]))
             buf.removeFirst(need)
         }
-        if let need = Self.frameLength(buf), need > 8192 {
-            let note = "resync: header claimed \(need)B, dropping a byte"
-            onLog?(note)
-            if !buf.isEmpty { buf.removeFirst() }
-        }
         cond.broadcast()
-        cond.unlock()
     }
 
     static func loopbackPair() -> (a: SDUStream, b: SDUStream) {
@@ -99,22 +101,37 @@ final class SDUStream: NSObject, StreamDelegate {
     func feed(_ data: Data) { ingest([UInt8](data)) }
 
     func write(_ data: Data) throws {
+        try checkOpen()
+        guard !data.isEmpty else { return }
         if let hook = writeHook {
-            cond.lock(); let dead = closed; cond.unlock()
-            if dead { throw LinkError.io("stream closed") }
             try hook(data)
             return
         }
         guard let output else { throw LinkError.io("no output stream") }
         try data.withUnsafeBytes { raw in
             var sent = 0
-            let base = raw.bindMemory(to: UInt8.self).baseAddress!
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
             while sent < data.count {
+                try checkOpen()
                 let n = output.write(base.advanced(by: sent), maxLength: data.count - sent)
-                if n <= 0 { throw LinkError.io("write failed") }
+                if n <= 0 {
+                    throw finish(Self.ioError(output, fallback: "output stream stopped accepting bytes"))
+                }
                 sent += n
             }
         }
+    }
+
+    private func checkOpen() throws {
+        cond.lock()
+        defer { cond.unlock() }
+        let deadline = Date().addingTimeInterval(3)
+        while !opened, !closed {
+            if !cond.wait(until: deadline), !opened, !closed {
+                throw LinkError.io("蓝牙数据流打开超时")
+            }
+        }
+        if closed { throw terminalFailure ?? LinkError.io("stream closed") }
     }
 
     static func frameLength(_ b: [UInt8]) -> Int? {
@@ -140,10 +157,9 @@ final class SDUStream: NSObject, StreamDelegate {
         defer { cond.unlock() }
         while frames.isEmpty {
             if closed {
-                let why = lastError.map { ": \($0)" } ?? ""
-                throw LinkError.io("stream closed\(why)")
+                throw terminalFailure ?? LinkError.io("stream closed")
             }
-            if !cond.wait(until: deadline) {
+            if !cond.wait(until: deadline), frames.isEmpty, !closed {
                 throw LinkError.unexpected("timeout waiting for a frame (folded? out of range?)")
             }
         }
@@ -151,21 +167,48 @@ final class SDUStream: NSObject, StreamDelegate {
     }
 
     func close() {
+        finish()
+    }
+
+    /// Reports the first transport failure, including one that occurred before registration.
+    func setFailureHandler(_ handler: @escaping (LinkError) -> Void) {
         cond.lock()
+        let failure = terminalFailure
+        if !closed { failureHandler = handler }
+        cond.unlock()
+        if let failure { handler(failure) }
+    }
+
+    @discardableResult
+    private func finish(_ error: LinkError? = nil) -> LinkError {
+        cond.lock()
+        if closed {
+            let first = terminalFailure ?? LinkError.io("stream closed")
+            cond.unlock()
+            return first
+        }
         closed = true
+        buf.removeAll()
+        frames.removeAll()
+        terminalFailure = error
+        let handler = failureHandler
+        failureHandler = nil
         cond.broadcast()
         cond.unlock()
         input?.close()
         output?.close()
+        if let error { handler?(error) }
+        return error ?? LinkError.io("stream closed")
+    }
+
+    private static func ioError(_ source: Stream, fallback: String) -> LinkError {
+        let detail = source.streamError.map { String(describing: $0) } ?? fallback
+        return .io("stream closed: \(detail)")
     }
 
     func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
-        if eventCode == .errorOccurred {
-            cond.lock()
-            closed = true
-            lastError = aStream.streamError
-            cond.broadcast()
-            cond.unlock()
+        if eventCode == .errorOccurred || eventCode == .endEncountered {
+            finish(Self.ioError(aStream, fallback: "stream ended"))
         }
     }
 
@@ -270,7 +313,10 @@ final class Session {
     static let capRecord: UInt16 = 6
     static let capEnd: UInt16 = 2
     static let capRequestAsset: UInt16 = 0x83
+    static let capAssetQueued: UInt16 = 0x84
+    static let capAssetGone: UInt16 = 0x85
     static let capSetLink: UInt16 = 0x86
+    static let capLinkSet: UInt16 = 0x87
 
     static let airOffer: UInt16 = 1
     static let airCursor: UInt16 = 2
@@ -504,15 +550,18 @@ final class Session {
         return messages
     }
 
-    private func recvMessage(timeout: TimeInterval, includePending: Bool = true) throws -> DataX.Message {
+    private func recvMessage(timeout: TimeInterval, includePending: Bool = true,
+                             handlesAirshipOffers: Bool = false) throws -> DataX.Message {
         let deadline = Date().addingTimeInterval(timeout)
         receiveLock.lock()
         defer { receiveLock.unlock() }
-        if includePending, !pendingSetupMessages.isEmpty {
-            return pendingSetupMessages.removeFirst()
-        }
         while true {
-            guard let msg = decodedMessages.popFirst() else {
+            let msg: DataX.Message
+            if includePending, !pendingSetupMessages.isEmpty {
+                msg = pendingSetupMessages.removeFirst()
+            } else if let decoded = decodedMessages.popFirst() {
+                msg = decoded
+            } else {
                 let sdu = try stream.nextFrame(timeout: max(0, deadline.timeIntervalSinceNow))
                 decodedMessages = try decodeFrame(sdu)[...]
                 continue
@@ -535,6 +584,7 @@ final class Session {
                 try? sendStatus(msg.channel, 0xC001)
                 continue
             }
+            if !handlesAirshipOffers, try rejectUnrequestedAirshipOffer(msg) { continue }
             return msg
         }
     }
@@ -975,7 +1025,12 @@ final class Session {
     func requestAsset(handle: String, assetID: String) throws {
         let payload = Data("\(handle):\(assetID)".utf8)
         try sendOnService("captures", service: Self.svcCaptures, type: Self.capRequestAsset, payload: payload)
+        // A full capture is queued on the Bluetooth link. The asset request also covers an
+        // asset the glasses have delivered before, which the capture request may skip.
+        try sendOnService("captures", service: Self.svcCaptures, type: Self.capSetLink,
+                          payload: Data("\(handle):1".utf8))
         requestedCaptureAsset = UUID(uuidString: assetID)
+        emit("media: requested selected asset over Bluetooth")
     }
 
     static func parseCapture(_ body: Data) -> Capture? {
@@ -1017,11 +1072,46 @@ final class Session {
 
     struct Transfer { let name: String; let size: Int; let data: Data }
 
+    struct AirshipOffer {
+        let channel: UInt16
+        let id: Data
+        let name: String
+        let namespace: String
+        let size: Int
+
+        var mirror: UInt16 { channel ^ 0x8000 }
+    }
+
+    static func airshipOffer(_ message: DataX.Message) throws -> AirshipOffer? {
+        guard message.channel & 0x8000 != 0, message.error == nil, message.service == Self.svcAirship,
+              message.type == Int(Self.airOffer) || message.type == Int(Self.airOfferMultiscope)
+        else { return nil }
+        let fields = try PB.parse(message.payload)
+        let size = fields[2]?.first as? Int ?? 0
+        guard let id = fields[1]?.first as? Data, id.count == 16, size >= 0 else {
+            throw LinkError.unexpected("invalid Airship file offer")
+        }
+        let name = fields[4]?.first as? Data
+        let namespace = fields[3]?.first as? Data ?? Data()
+        return AirshipOffer(channel: message.channel, id: id,
+                            name: name.map { String(decoding: $0, as: UTF8.self) } ?? "capture.bin",
+                            namespace: String(decoding: namespace, as: UTF8.self), size: size)
+    }
+
+    private func rejectUnrequestedAirshipOffer(_ message: DataX.Message) throws -> Bool {
+        guard serviceChannels["captures"] != nil, let offer = try Self.airshipOffer(message) else { return false }
+        // Drop answers this queue entry. Deleting a capture is a separate svc18 command.
+        try sendAirshipReply(Self.airDrop, on: offer.mirror, payload: PB.bytes(1, offer.id))
+        emit("media: declined an unrequested Airship offer")
+        return true
+    }
+
     /// The glasses open the transfer channel. Cursor and Drop use its mirror.
     func receiveFile(timeout: TimeInterval = 120, onBytes: ((Int, Int) -> Void)? = nil) throws -> Transfer? {
         let wantedID = requestedCaptureAsset.map { asset in withUnsafeBytes(of: asset.uuid) { Data($0) } }
         requestedCaptureAsset = nil
-        var offer: (channel: UInt16, id: Data, name: String, size: Int)?
+        let capturesMirror = serviceChannels["captures"].map { $0 ^ 0x8000 }
+        var accepted: AirshipOffer?
         var lastType: Int?
         var buf = Data()
         var checksum: UInt32 = 1
@@ -1029,30 +1119,33 @@ final class Session {
         while true {
             let left = deadline.timeIntervalSinceNow
             if left <= 0 { throw LinkError.unexpected("file transfer did not complete") }
-            let m = try recvMessage(timeout: left)
+            let m = try recvMessage(timeout: left, handlesAirshipOffers: true)
+            if m.channel == capturesMirror {
+                if m.type == Int(Self.capAssetGone) {
+                    throw LinkError.unexpected("the selected asset is no longer on the glasses")
+                }
+                if m.type == Int(Self.capAssetQueued) || m.type == Int(Self.capLinkSet) {
+                    emit("media: glasses acknowledged the transfer request")
+                }
+                continue
+            }
             guard m.channel & 0x8000 != 0, m.error == nil else { continue }
             let mirror = m.channel ^ 0x8000
-            if m.service == Self.svcAirship,
-               m.type == Int(Self.airOffer) || m.type == Int(Self.airOfferMultiscope) {
-                let f = try PB.parse(m.payload)
-                let id = f[1]?.first as? Data ?? Data()
-                let size = f[2]?.first as? Int ?? 0
-                let namespace = String(decoding: f[3]?.first as? Data ?? Data(), as: UTF8.self)
-                guard offer == nil || (offer?.channel == m.channel && offer?.id == id),
-                      id.count == 16, size >= 0, namespace == "namespace_media",
-                      wantedID == nil || wantedID == id else {
-                    try sendAirshipReply(Self.airDrop, on: mirror, payload: PB.bytes(1, id))
+            if let offer = try Self.airshipOffer(m) {
+                guard accepted == nil || (accepted?.channel == m.channel && accepted?.id == offer.id),
+                      offer.namespace == "namespace_media", wantedID == nil || wantedID == offer.id else {
+                    try sendAirshipReply(Self.airDrop, on: mirror, payload: PB.bytes(1, offer.id))
                     continue
                 }
-                let name = f[4]?.first as? Data
-                offer = (m.channel, id, name.map { String(decoding: $0, as: UTF8.self) } ?? "capture.bin", size)
+                accepted = offer
                 lastType = m.type
                 buf.removeAll(keepingCapacity: true)
                 checksum = 1
                 try sendAirshipReply(Self.airCursor, on: mirror, payload: PB.uint(2, 1))
+                emit("media: accepted selected Airship offer (\(offer.size)B)")
                 continue
             }
-            guard let offer, m.channel == offer.channel else { continue }
+            guard let offer = accepted, m.channel == offer.channel else { continue }
             if let type = m.type { lastType = type }
             guard let t = lastType else { continue }
             switch UInt16(t) {
@@ -1080,7 +1173,15 @@ final class Session {
                 buf.removeAll(keepingCapacity: true)
                 checksum = 1
                 onBytes?(0, offer.size)
-            case Self.airDrop, Self.airRemoved, Self.airStopped:
+            case Self.airStopped:
+                // Large Bluetooth files may be offered again after the glasses pause them.
+                accepted = nil
+                lastType = nil
+                buf.removeAll(keepingCapacity: false)
+                checksum = 1
+                onBytes?(0, offer.size)
+                emit("media: glasses paused the transfer; waiting for a new offer")
+            case Self.airDrop, Self.airRemoved:
                 throw LinkError.unexpected("transfer aborted by the glasses (\(t))")
             default:
                 continue
@@ -1108,29 +1209,66 @@ final class Session {
 
     // MARK: svc33 RLDrive — the settings store
 
+    private var drivePeerChannels: Set<UInt16> = []
+
+    private func driveReply(_ message: DataX.Message, on channel: UInt16, namespace: String,
+                            requestID: String, assembler: Drive.Assembler) throws -> Drive.Reply? {
+        if let service = message.service {
+            guard service == Drive.service else {
+                drivePeerChannels.remove(message.channel)
+                return nil
+            }
+            if message.channel & 0x8000 != 0 { drivePeerChannels.insert(message.channel) }
+        }
+        let mirror = channel ^ 0x8000
+        guard message.channel == channel || message.channel == mirror || drivePeerChannels.contains(message.channel) else {
+            return nil
+        }
+        if let code = message.error {
+            if message.channel == mirror, code != Int(AirShield.stOK), code != Int(AirShield.stSuccess) {
+                throw LinkError.serviceError("设置同步", UInt16(truncatingIfNeeded: code))
+            }
+            return nil
+        }
+        guard message.type == nil || message.type == Int(Drive.syncMessage),
+              let whole = assembler.add(message.payload), let reply = Drive.decode(whole),
+              reply.namespace == namespace, reply.requestID == requestID else { return nil }
+        return reply
+    }
+
     /// Every object the glasses keep in `namespace`; settings live in `Drive.deviceSettings`.
-    /// Round 0 asks for the whole namespace, so one round is normally enough.
     func driveObjects(namespace: String = Drive.deviceSettings,
                       types: [String] = Drive.defaultTypes,
                       timeout: TimeInterval = 8) throws -> [Drive.Object] {
-        let ch = channel(named: "drive") ?? allocChannel("drive")
+        let ch = serviceChannel("drive", service: Drive.service)
         let requestID = UUID().uuidString.lowercased()
         let sync = Drive.build(namespace: namespace, requestID: requestID, round: 0, types: types)
-        try sendAny(DataX.message(ch, tags: [DataX.tag(1, UInt16(Drive.service), last: false),
-                                             DataX.tag(2, Drive.syncMessage, last: true)], payload: sync))
+        try sendOnService("drive", service: Drive.service, type: Drive.syncMessage, payload: sync)
         let assembler = Drive.Assembler()
         var collected: [Drive.Object] = []
+        var receivedValues = false
         let deadline = Date().addingTimeInterval(timeout)
         while true {
             let left = deadline.timeIntervalSinceNow
             if left <= 0 { break }
-            let m = try recvMessage(timeout: left)
-            if m.channel != ch { continue }
-            guard m.type == Int(Drive.syncMessage) else { continue }
-            guard let whole = assembler.add(m.payload), let reply = Drive.decode(whole) else { continue }
-            collected += reply.objects
+            let m: DataX.Message
+            do { m = try recvMessage(timeout: left) }
+            catch LinkError.unexpected(_) where receivedValues { break }
+            guard let reply = try driveReply(m, on: ch, namespace: namespace,
+                                             requestID: requestID, assembler: assembler) else { continue }
+            if reply.round == 1 {
+                collected += reply.objects
+                if !receivedValues {
+                    let replyTypes = Set(reply.types.keys).union([Drive.kv]).sorted()
+                    let acknowledgement = Drive.build(namespace: namespace, requestID: requestID, round: 2,
+                                                      known: reply.types, types: replyTypes, usecaseTag: reply.usecaseTag)
+                    try sendOnService("drive", service: Drive.service, type: Drive.syncMessage, payload: acknowledgement)
+                    receivedValues = true
+                }
+            }
             if reply.terminated { break }
         }
+        guard receivedValues else { throw LinkError.unexpected("眼镜没有返回此设置读取的值") }
         emit("drive \(namespace): \(collected.count) objects")
         return collected
     }
@@ -1140,7 +1278,7 @@ final class Session {
     @discardableResult
     func driveWrite(key: String, value: String, namespace: String = Drive.deviceSettings,
                     timeout: TimeInterval = 8) throws -> Bool {
-        let ch = channel(named: "drive") ?? allocChannel("drive")
+        let ch = serviceChannel("drive", service: Drive.service)
         let known = try driveObjects(namespace: namespace, timeout: timeout)
         var versions: Drive.Versions = [:]
         for object in known {
@@ -1150,29 +1288,32 @@ final class Session {
         let object = Drive.Object(uri: key, type: Drive.kv, data: value, deleted: false, raw: Data())
         let sync = Drive.build(namespace: namespace, requestID: requestID, round: 1,
                                known: versions, types: [Drive.kv], objects: [object])
-        try sendAny(DataX.message(ch, tags: [DataX.tag(1, UInt16(Drive.service), last: false),
-                                             DataX.tag(2, Drive.syncMessage, last: true)], payload: sync))
+        try sendOnService("drive", service: Drive.service, type: Drive.syncMessage, payload: sync)
         let assembler = Drive.Assembler()
         let deadline = Date().addingTimeInterval(timeout)
         while true {
             let left = deadline.timeIntervalSinceNow
             if left <= 0 { break }
             let m = try recvMessage(timeout: left)
-            if m.channel != ch || m.type != Int(Drive.syncMessage) { continue }
-            if let whole = assembler.add(m.payload), let reply = Drive.decode(whole), reply.terminated { break }
+            if let reply = try driveReply(m, on: ch, namespace: namespace,
+                                          requestID: requestID, assembler: assembler), reply.terminated { break }
         }
         let after = try driveObjects(namespace: namespace, timeout: timeout)
-        return after.contains { $0.uri == key && $0.data == value }
+        return after.contains { $0.uri == key && !$0.deleted && $0.data == value }
     }
 
     // MARK: svc28 device state
 
     private func statusChannel() -> UInt16 { serviceChannel("status", service: Status.service) }
 
-    private func isDeviceStatus(_ message: DataX.Message, channel: UInt16) -> Bool {
-        guard let type = message.type, Status.isStateType(type), message.error == nil else { return false }
-        if let service = message.service { return service == Status.service }
-        return message.channel == (channel ^ 0x8000)
+    private static let cameraStateType = 2009
+
+    private func deviceStatusType(_ message: DataX.Message, channel: UInt16, lastType: inout Int?) -> Int? {
+        guard message.channel == (channel ^ 0x8000), message.error == nil,
+              message.service == nil || message.service == Status.service else { return nil }
+        if let type = message.type { lastType = type }
+        guard let type = lastType, Status.isStateType(type) else { return nil }
+        return type
     }
 
     /// Subscribes (or re-asks on the existing channel) and merges pushes until the snapshot has
@@ -1183,13 +1324,14 @@ final class Session {
         statusSubscribed = true
 
         var state = GlassesState()
+        var lastType: Int?
         let deadline = Date().addingTimeInterval(timeout)
         while true {
             let left = deadline.timeIntervalSinceNow
             if left <= 0 { break }
             let m: DataX.Message
             do { m = try recvMessage(timeout: left) } catch LinkError.unexpected(_) { break }
-            guard isDeviceStatus(m, channel: ch) else { continue }
+            guard deviceStatusType(m, channel: ch, lastType: &lastType) != nil else { continue }
             Status.merge(m.payload, into: &state)
             if state.batteryPercent != nil && state.storageFreeMb != nil { break }
         }
@@ -1204,6 +1346,7 @@ final class Session {
 
         let deadline = Date().addingTimeInterval(5)
         var state = GlassesState()
+        var lastType: Int?
         while deadline.timeIntervalSinceNow > 0 {
             let message: DataX.Message
             do { message = try recvMessage(timeout: deadline.timeIntervalSinceNow) }
@@ -1212,9 +1355,9 @@ final class Session {
                code != Int(AirShield.stOK), code != Int(AirShield.stSuccess) {
                 throw LinkError.serviceError("拍摄请求", UInt16(truncatingIfNeeded: code))
             }
-            guard isDeviceStatus(message, channel: ch) else { continue }
+            guard let type = deviceStatusType(message, channel: ch, lastType: &lastType) else { continue }
             Status.merge(message.payload, into: &state)
-            guard let camera = Status.cameraCode(message.payload) else { continue }
+            guard type == Self.cameraStateType, let camera = Status.cameraCode(message.payload) else { continue }
             if camera == 4 || camera == 6 { throw LinkError.unexpected("眼镜报告拍摄失败") }
             if confirmed(camera) { return state }
         }

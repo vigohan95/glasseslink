@@ -5,20 +5,31 @@ import UniformTypeIdentifiers
 /// Four screens organised by what you are trying to do — look at media, shoot, talk to the
 /// assistant, or deal with the device — instead of by which protocol service answered.
 struct RootView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var g = Glasses()
+    @State private var selectedTab: Tab = .album
+
+    private enum Tab: Hashable { case album, camera, assistant, device }
 
     var body: some View {
-        TabView {
-            AlbumTab(g: g)
+        TabView(selection: $selectedTab) {
+            AlbumTab(g: g, openDevice: { selectedTab = .device })
                 .tabItem { Label("相册", systemImage: "photo.stack") }
-            ShootTab(g: g)
+                .tag(Tab.album)
+            ShootTab(g: g, openDevice: { selectedTab = .device })
                 .tabItem { Label("拍摄", systemImage: "camera") }
-            AssistantTab(g: g)
+                .tag(Tab.camera)
+            AssistantTab(g: g, openDevice: { selectedTab = .device })
                 .tabItem { Label("助手", systemImage: "waveform") }
+                .tag(Tab.assistant)
             DeviceTab(g: g)
                 .tabItem { Label("设备", systemImage: "eyeglasses") }
+                .tag(Tab.device)
         }
-        .tint(.cyan)
+        .tint(GlassesTheme.accent)
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { g.autoReconnect() }
+        }
         // One-time setup lives at the root, not inside a NavigationLink.
         // A sheet presented from a pushed destination dies the moment `g` publishes
         // (the stack rebuilds and the presenter goes away) — which is why the login
@@ -40,6 +51,33 @@ struct RootView: View {
                 }
             }
         }
+    }
+}
+
+private enum GlassesTheme {
+    static let page = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.04, green: 0.07, blue: 0.09, alpha: 1)
+            : UIColor(red: 0.94, green: 0.96, blue: 0.97, alpha: 1)
+    })
+    static let surface = Color(uiColor: .secondarySystemGroupedBackground)
+    static let accent = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.39, green: 0.88, blue: 0.85, alpha: 1)
+            : UIColor(red: 0.00, green: 0.36, blue: 0.39, alpha: 1)
+    })
+    static let console = Color(red: 0.04, green: 0.11, blue: 0.15)
+    static let edge = Color.primary.opacity(0.09)
+}
+
+private extension View {
+    func glassesPanel(padding: CGFloat = 16) -> some View {
+        self.padding(padding)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(GlassesTheme.surface, in: RoundedRectangle(cornerRadius: 20))
+            .overlay {
+                RoundedRectangle(cornerRadius: 20).strokeBorder(GlassesTheme.edge).allowsHitTesting(false)
+            }
     }
 }
 
@@ -85,24 +123,40 @@ private func sizeText(_ n: Int) -> String {
     return "\(n) B"
 }
 
+private let mediaDateFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "MM-dd HH:mm"
+    return formatter
+}()
+
 private func clockText(_ ns: Int?) -> String {
     guard let ns else { return "" }
-    let f = DateFormatter()
-    f.dateFormat = "MM-dd HH:mm"
-    return f.string(from: Date(timeIntervalSince1970: Double(ns) / 1_000_000_000))
+    return mediaDateFormatter.string(from: Date(timeIntervalSince1970: Double(ns) / 1_000_000_000))
 }
 
 // MARK: - 相册
 
 struct AlbumTab: View {
     @ObservedObject var g: Glasses
+    let openDevice: () -> Void
+    @Environment(\.dynamicTypeSize) private var typeSize
     @State private var filter: Filter = .all
     @State private var imported: Set<String> = []
     @State private var inFlight: String?
     @State private var failed: Set<String> = []
-    @State private var showDevice = false
+    @State private var preview: ThumbnailPreview?
 
     enum Filter: String, CaseIterable { case all = "全部", pending = "未导入", done = "已导入" }
+
+    private struct ThumbnailPreview: Identifiable {
+        let id: String
+        let image: UIImage
+        let isPhoto: Bool
+    }
+
+    private var columns: [GridItem] {
+        [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 245 : 146), spacing: 12, alignment: .top)]
+    }
 
     private var captures: [Capture] {
         var seen = Set<String>()
@@ -122,7 +176,7 @@ struct AlbumTab: View {
     }
 
     private var emptyMessage: String {
-        if !g.canUseGlasses { return "已导入的媒体可在系统「照片」中查看。" }
+        if !g.canUseGlasses { return "导入过的照片和视频也可以在 iPhone 的「照片」里查看。" }
         switch filter {
         case .all: return "眼镜里还没有照片或视频。"
         case .pending: return "没有待导入的媒体。"
@@ -133,65 +187,68 @@ struct AlbumTab: View {
     var body: some View {
         let visibleRows = rows
         NavigationStack {
-            List {
-                if !g.canUseGlasses {
-                    Section {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(g.connected ? "请先验证主人身份" : "眼镜未连接").font(.headline)
-                            Button(g.connected ? "去验证" : "去连接") { showDevice = true }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-                        }
-                        .padding(.vertical, 4)
-                    }
-                } else {
-                    Section {
-                        Picker("筛选", selection: $filter) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    galleryHeader
+                    if g.canUseGlasses {
+                        Picker("导入状态", selection: $filter) {
                             ForEach(Filter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                         }
                         .pickerStyle(.segmented)
+                    }
 
-                        if inFlight != nil {
-                            ProgressView(g.mediaMessage ?? "正在导入…").controlSize(.small)
-                        } else if !pending.isEmpty {
-                            HStack {
-                                Text("\(pending.count) 项未导入").font(.caption)
-                                Spacer()
-                                Button("全部导入") { importCaptures(pending) }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
-                                    .disabled(!canImport)
+                    if inFlight != nil {
+                        ProgressView(g.mediaMessage ?? "正在导入…")
+                            .font(.footnote)
+                            .glassesPanel(padding: 12)
+                    } else if let message = g.mediaMessage {
+                        Text(message)
+                            .font(.footnote)
+                            .glassesPanel(padding: 12)
+                    }
+
+                    if visibleRows.isEmpty {
+                        VStack(spacing: 10) {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .font(.system(size: 32, weight: .light))
+                                .foregroundStyle(GlassesTheme.accent)
+                                .accessibilityHidden(true)
+                            Text(emptyMessage)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(.vertical, 24)
+                        .frame(maxWidth: .infinity)
+                        .glassesPanel()
+                    } else {
+                        LazyVGrid(columns: columns, spacing: 12) {
+                            ForEach(visibleRows, id: \.id) { capture in
+                                let thumb = g.thumbs[capture.id]
+                                CaptureTile(capture: capture,
+                                            thumbnail: thumb,
+                                            imported: imported.contains(capture.id),
+                                            working: inFlight == capture.id,
+                                            failed: failed.contains(capture.id),
+                                            fraction: g.progress[capture.id] ?? 0,
+                                            canImport: canImport,
+                                            onPreview: {
+                                                if let thumb {
+                                                    preview = ThumbnailPreview(id: capture.id, image: thumb, isPhoto: capture.isPhoto)
+                                                }
+                                            },
+                                            onImport: { importCaptures([capture]) })
                             }
                         }
                     }
                 }
-
-                if inFlight == nil, let message = g.mediaMessage {
-                    Section { Text(message).font(.footnote) }
-                }
-
-                Section {
-                    if visibleRows.isEmpty { Text(emptyMessage).font(.footnote).foregroundStyle(.secondary) }
-                    ForEach(visibleRows, id: \.id) { capture in
-                        CaptureRow(capture: capture,
-                                   thumb: g.thumbs[capture.id],
-                                   imported: imported.contains(capture.id),
-                                   working: inFlight == capture.id,
-                                   failed: failed.contains(capture.id),
-                                   fraction: g.progress[capture.id] ?? 0,
-                                   canImport: canImport) {
-                            importCaptures([capture])
-                        }
-                    }
-                } header: {
-                    Text(g.canUseGlasses && filter != .done ? "眼镜里的媒体" : "已导入")
-                }
+                .padding(18)
             }
+            .background(GlassesTheme.page.ignoresSafeArea())
             .navigationTitle("相册")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    StatusCapsule(g: g) { showDevice = true }
-                }
+                ToolbarItem(placement: .topBarLeading) { StatusCapsule(g: g) { openDevice() } }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { g.loadCaptures() } label: {
                         Image(systemName: "arrow.clockwise")
@@ -200,10 +257,67 @@ struct AlbumTab: View {
                     .disabled(!canImport)
                 }
             }
-            .sheet(isPresented: $showDevice) { DeviceSheet(g: g) }
-            .onChange(of: g.canUseGlasses, initial: true) { _, canUse in
-                if canUse && g.captures.isEmpty && !g.busy { g.loadCaptures() }
+            .sheet(item: $preview) { item in
+                NavigationStack {
+                    Image(uiImage: item.image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .padding(12)
+                        .background(Color.black.ignoresSafeArea())
+                        .navigationTitle(item.isPhoto ? "照片预览图" : "视频封面")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button("完成") { preview = nil }
+                            }
+                        }
+                }
+                .preferredColorScheme(.dark)
             }
+            .onChange(of: g.canUseGlasses, initial: true) { _, canUse in
+                if canUse && !g.busy { g.loadCaptures() }
+            }
+        }
+    }
+
+    private var galleryHeader: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .bottom, spacing: 10) {
+                galleryTitle
+                Spacer(minLength: 10)
+                galleryAction
+            }
+            VStack(alignment: .leading, spacing: 12) {
+                galleryTitle
+                galleryAction
+            }
+        }
+    }
+
+    private var galleryTitle: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(g.canUseGlasses ? "眼镜相册" : "媒体")
+                .font(.system(.largeTitle, design: .rounded, weight: .bold))
+            Text(g.canUseGlasses
+                 ? "\(captures.count) 项媒体 · \(pending.count) 项未导入"
+                 : (g.connected ? "连接已建立，等待主人验证" : "连接眼镜后查看原始照片和视频"))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var galleryAction: some View {
+        if !g.canUseGlasses {
+            Button(g.connected ? "去验证" : "连接眼镜") { openDevice() }
+                .buttonStyle(.borderedProminent)
+        } else if !pending.isEmpty {
+            Button { importCaptures(pending) } label: {
+                Label("全部导入", systemImage: "arrow.down")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!canImport)
         }
     }
 
@@ -226,69 +340,108 @@ struct AlbumTab: View {
     }
 }
 
-struct CaptureRow: View {
+private struct CaptureTile: View {
     let capture: Capture
-    let thumb: UIImage?
+    let thumbnail: UIImage?
     let imported: Bool
     let working: Bool
     let failed: Bool
-    /// 0…1 while transferring; the glasses tell us the real total, so this is not an estimate.
     let fraction: Double
     let canImport: Bool
-    var onImport: () -> Void
+    let onPreview: () -> Void
+    let onImport: () -> Void
+
+    private var progress: Double { fraction.isFinite ? min(1, max(0, fraction)) : 0 }
 
     var body: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.secondary.opacity(0.15))
-                    .frame(width: 56, height: 56)
-                if let thumb {
-                    Image(uiImage: thumb)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: 56, height: 56)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                } else {
-                    Image(systemName: capture.isPhoto ? "photo" : "video")
-                        .font(.title3)
-                        .foregroundStyle(capture.isPhoto ? Color.cyan : Color.orange)
-                }
+        VStack(alignment: .leading, spacing: 0) {
+            if thumbnail != nil {
+                Button(action: onPreview) { cover }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(capture.isPhoto ? "打开照片预览图" : "查看视频封面")
+            } else {
+                cover
             }
-            VStack(alignment: .leading, spacing: 3) {
-                Text(clockText(capture.timestampNS)).font(.subheadline)
-                Text("\(capture.isPhoto ? "照片" : "视频") · \(sizeText(capture.assets.reduce(0) { $0 + $1.size }))")
+            VStack(alignment: .leading, spacing: 9) {
+                let time = clockText(capture.timestampNS)
+                Text(time.isEmpty ? mediaKind : time)
+                    .font(.subheadline.weight(.semibold))
+                Text(sizeText(capture.assets.reduce(0) { $0 + $1.size }))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                importControl
             }
-            Spacer()
-            if working {
-                VStack(alignment: .trailing, spacing: 2) {
-                    ProgressView()
-                        .controlSize(.small)
-                    if fraction > 0 {
-                        Text("\(Int(fraction * 100))%")
-                            .font(.caption2)
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                    }
+            .padding(11)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(GlassesTheme.surface, in: RoundedRectangle(cornerRadius: 16))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .overlay { RoundedRectangle(cornerRadius: 16).strokeBorder(GlassesTheme.edge).allowsHitTesting(false) }
+    }
+
+    private var mediaKind: String { capture.isPhoto ? "照片" : "视频" }
+
+    private var cover: some View {
+        LinearGradient(
+            colors: [GlassesTheme.console, capture.isPhoto ? Color(red: 0.13, green: 0.44, blue: 0.45)
+                     : Color(red: 0.24, green: 0.27, blue: 0.47)],
+            startPoint: .topLeading, endPoint: .bottomTrailing
+        )
+        .aspectRatio(1.15, contentMode: .fit)
+        .overlay {
+            if let thumbnail {
+                GeometryReader { bounds in
+                    Image(uiImage: thumbnail)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: bounds.size.width, height: bounds.size.height)
+                        .clipped()
                 }
-            } else if imported {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green.opacity(0.8))
-                    .accessibilityLabel("已导入")
             } else {
-                Button(action: onImport) {
-                    Image(systemName: failed ? "arrow.clockwise.circle" : "arrow.down.circle")
-                        .foregroundStyle(failed ? Color.orange : Color.cyan)
-                }
-                .accessibilityLabel(failed ? "导入失败，重试" : "导入")
-                .buttonStyle(.plain)
-                .disabled(!canImport)
+                Image(systemName: capture.isPhoto ? "photo" : "video")
+                    .font(.system(size: 28, weight: .light))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .accessibilityHidden(true)
             }
         }
-        .contentShape(Rectangle())
-        .onTapGesture { if canImport && !imported { onImport() } }
+        .overlay(alignment: .topLeading) {
+            Text(mediaKind)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(.black.opacity(0.7), in: Capsule())
+                .padding(8)
+        }
+    }
+
+    @ViewBuilder
+    private var importControl: some View {
+        if working {
+            if progress > 0 {
+                ProgressView(value: progress) {
+                    Text("导入中 \(Int(progress * 100))%")
+                        .font(.caption.monospacedDigit())
+                }
+            } else {
+                ProgressView("导入中").font(.caption)
+            }
+        } else if imported {
+            Label("已导入", systemImage: "checkmark.circle.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(GlassesTheme.accent)
+                .frame(minHeight: 44, alignment: .leading)
+        } else {
+            Button(action: onImport) {
+                Label(failed ? "重试导入" : "导入原件",
+                      systemImage: failed ? "arrow.clockwise" : "arrow.down")
+                    .font(.caption.weight(.semibold))
+                    .frame(maxWidth: .infinity, minHeight: 36)
+            }
+            .buttonStyle(.bordered)
+            .tint(failed ? .orange : GlassesTheme.accent)
+            .disabled(!canImport)
+        }
     }
 }
 
@@ -296,67 +449,184 @@ struct CaptureRow: View {
 
 struct ShootTab: View {
     @ObservedObject var g: Glasses
-    @State private var showDevice = false
+    let openDevice: () -> Void
+    @State private var mode: CaptureMode = .photo
+
+    private enum CaptureMode: String, CaseIterable {
+        case photo = "照片"
+        case video = "视频"
+    }
+
+    private var cameraTitle: String {
+        if g.recording { return "正在录像" }
+        if g.canUseGlasses { return "蓝牙拍摄已就绪" }
+        return g.connected ? "拍摄需要验证主人身份" : "眼镜未连接"
+    }
+
+    private var shutterTitle: String {
+        if g.recording { return "停止录像" }
+        return mode == .photo ? "拍照" : "开始录像"
+    }
+
+    private var shutterColor: Color { mode == .video || g.recording ? .red : .white }
+    private var lastReceivedPhoto: UIImage? {
+        g.captures.lazy.filter(\.isPhoto).compactMap { g.thumbs[$0.id] }.first
+    }
 
     var body: some View {
         NavigationStack {
-            List {
-                if g.canUseGlasses {
-                    Section("眼镜相机") {
-                        Button { g.snap() } label: {
-                            Label("拍照", systemImage: "camera.aperture")
-                        }
-                        .disabled(g.busy)
-                        Button { g.toggleRecording() } label: {
-                            Label(g.recording ? "停止录像" : "开始录像",
-                                  systemImage: g.recording ? "stop.circle" : "record.circle")
-                        }
-                        .disabled(g.busy)
+            ScrollView {
+                VStack(spacing: 14) {
+                    cameraStage
+                    if g.canUseGlasses {
+                        shutterControls
+                    } else {
+                        Button(g.connected ? "验证主人身份" : "连接眼镜") { openDevice() }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.large)
+                            .frame(maxWidth: .infinity)
+                            .glassesPanel()
                     }
-                    Section("录像设置") {
-                        Picker("最长录制", selection: $g.maxRecordSeconds) {
-                            Text("不限").tag(0)
-                            Text("30 秒").tag(30)
-                            Text("1 分钟").tag(60)
-                            Text("3 分钟").tag(180)
-                            Text("5 分钟").tag(300)
-                        }
-                        .disabled(g.recording)
-                        if let deadline = g.recordDeadline {
-                            TimelineView(.periodic(from: .now, by: 1)) { context in
-                                Text(timerText(deadline, now: context.date))
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                    if let message = g.mediaMessage {
+                        HStack(alignment: .firstTextBaseline, spacing: 9) {
+                            if g.busy {
+                                ProgressView().controlSize(.small)
                             }
+                            Text(message).font(.footnote)
                         }
-                    }
-                } else {
-                    Section {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Label(g.connected ? "请先验证主人身份" : "眼镜未连接", systemImage: "eyeglasses")
-                                .font(.headline)
-                            Button(g.connected ? "去验证" : "去连接") { showDevice = true }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-                        }
-                        .padding(.vertical, 4)
+                        .glassesPanel(padding: 13)
                     }
                 }
-                if let message = g.mediaMessage {
-                    Section { Text(message).font(.footnote) }
-                }
+                .padding(18)
             }
+            .background(GlassesTheme.page.ignoresSafeArea())
             .navigationTitle("拍摄")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { StatusCapsule(g: g) { showDevice = true } }
+                ToolbarItem(placement: .topBarLeading) { StatusCapsule(g: g) { openDevice() } }
             }
-            .sheet(isPresented: $showDevice) { DeviceSheet(g: g) }
+            .onChange(of: g.recording, initial: true) { _, recording in
+                if recording { mode = .video }
+            }
         }
+    }
+
+    private var cameraStage: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label(cameraTitle, systemImage: g.recording ? "record.circle.fill" : "eyeglasses")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(g.recording ? Color(red: 1, green: 0.49, blue: 0.49) : .white)
+                Spacer(minLength: 8)
+                if g.recording, let deadline = g.recordDeadline {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(timerText(deadline, now: context.date))
+                            .font(.subheadline.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.white)
+                            .accessibilityLabel("倒计时，\(timerText(deadline, now: context.date))")
+                    }
+                }
+            }
+
+            if let photo = lastReceivedPhoto {
+                Color.black
+                    .aspectRatio(1.7, contentMode: .fit)
+                    .overlay {
+                        GeometryReader { bounds in
+                            Image(uiImage: photo)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: bounds.size.width, height: bounds.size.height)
+                                .clipped()
+                        }
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 13))
+                    .overlay(alignment: .bottomLeading) {
+                        Text("最近接收的照片")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 6)
+                            .background(.black.opacity(0.75), in: Capsule())
+                            .padding(9)
+                    }
+            } else {
+                VStack(spacing: 8) {
+                    Image(systemName: g.recording ? "video.fill" : "camera.aperture")
+                        .font(.system(size: 42, weight: .light))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .accessibilityHidden(true)
+                    Text("实时取景仍在测试")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.72))
+                }
+                .frame(maxWidth: .infinity, minHeight: 160)
+                .padding(.vertical, 12)
+                .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 13))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 13)
+                        .strokeBorder(Color.white.opacity(0.2), style: StrokeStyle(lineWidth: 1, dash: [5, 6]))
+                }
+            }
+        }
+        .padding(15)
+        .background {
+            LinearGradient(colors: [GlassesTheme.console, Color(red: 0.07, green: 0.24, blue: 0.26)],
+                           startPoint: .topLeading, endPoint: .bottomTrailing)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+    }
+
+    private var shutterControls: some View {
+        VStack(spacing: 14) {
+            Picker("拍摄模式", selection: $mode) {
+                ForEach(CaptureMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .disabled(g.busy || g.recording)
+
+            if mode == .video {
+                Picker("最长录制", selection: $g.maxRecordSeconds) {
+                    Text("不限").tag(0)
+                    Text("30 秒").tag(30)
+                    Text("1 分钟").tag(60)
+                    Text("3 分钟").tag(180)
+                    Text("5 分钟").tag(300)
+                }
+                .pickerStyle(.menu)
+                .disabled(g.busy || g.recording)
+            }
+
+            Button {
+                if g.recording || mode == .video { g.toggleRecording() }
+                else { g.snap() }
+            } label: {
+                VStack(spacing: 7) {
+                    ZStack {
+                        Circle()
+                            .fill(GlassesTheme.console)
+                            .frame(width: 78, height: 78)
+                        Circle()
+                            .strokeBorder(shutterColor, lineWidth: 2)
+                            .frame(width: 67, height: 67)
+                        RoundedRectangle(cornerRadius: g.recording ? 5 : 26)
+                            .fill(shutterColor)
+                            .frame(width: g.recording ? 26 : 52, height: g.recording ? 26 : 52)
+                    }
+                    .accessibilityHidden(true)
+                    Text(shutterTitle).font(.subheadline.weight(.semibold))
+                }
+            }
+            .buttonStyle(.plain)
+            .disabled(g.busy)
+            .opacity(g.busy ? 0.50 : 1)
+        }
+        .glassesPanel()
     }
 
     private func timerText(_ deadline: Date, now: Date) -> String {
         let left = max(0, Int(deadline.timeIntervalSince(now).rounded()))
-        return String(format: "%d:%02d 后停止", left / 60, left % 60)
+        return String(format: "%d:%02d", left / 60, left % 60)
     }
 }
 
@@ -364,9 +634,9 @@ struct ShootTab: View {
 
 struct AssistantTab: View {
     @ObservedObject var g: Glasses
+    let openDevice: () -> Void
     @State private var question = ""
     @State private var showModel = false
-    @State private var showDevice = false
     @FocusState private var typing: Bool
 
     var body: some View {
@@ -380,9 +650,10 @@ struct AssistantTab: View {
                         typing = false
                         g.ask(question)
                     } label: {
-                        Label(g.busy ? "正在问…" : "带上最近一张照片问", systemImage: "paperplane")
+                        Label(g.askingModel ? "正在问…" : "带上最近一张照片问", systemImage: "paperplane")
                     }
-                    .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || g.busy || g.lastPhoto == nil)
+                    .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || g.askingModel || g.lastPhoto == nil)
                     if g.lastPhoto == nil {
                         Text("先拍摄或导入一张照片。").font(.footnote).foregroundStyle(.secondary)
                     }
@@ -396,101 +667,12 @@ struct AssistantTab: View {
             }
             .navigationTitle("助手")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { StatusCapsule(g: g) { showDevice = true } }
+                ToolbarItem(placement: .topBarLeading) { StatusCapsule(g: g) { openDevice() } }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("模型") { showModel = true }
                 }
             }
             .sheet(isPresented: $showModel) { ModelSheet(g: g) }
-            .sheet(isPresented: $showDevice) { DeviceSheet(g: g) }
-        }
-    }
-}
-
-struct ModelSheet: View {
-    @ObservedObject var g: Glasses
-    @Environment(\.dismiss) private var dismiss
-
-    /// Presets first: most people run one of these and only need to paste a key.
-    private struct Preset: Identifiable {
-        let id = UUID()
-        let label: String
-        let base: String
-        let model: String
-        let hint: String
-    }
-    private let presets: [Preset] = [
-        .init(label: "本地 Ollama", base: "http://192.168.3.90:11434/v1", model: "gemma3:4b",
-              hint: "电脑上跑 ollama serve；模型名填 ollama list 里的名字"),
-        .init(label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-mini",
-              hint: "key 填 sk-… 开头那个"),
-        .init(label: "DeepSeek", base: "https://api.deepseek.com/v1", model: "deepseek-chat",
-              hint: "key 在 platform.deepseek.com 里建"),
-        .init(label: "OpenRouter", base: "https://openrouter.ai/api/v1", model: "google/gemini-2.5-flash",
-              hint: "一个 key 走很多家模型"),
-        .init(label: "自建 / 其他", base: "", model: "", hint: "任何 OpenAI 兼容的 /v1/chat/completions"),
-    ]
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("选择服务") {
-                    ForEach(presets) { p in
-                        Button {
-                            if !p.base.isEmpty { g.modelBaseURL = p.base }
-                            if !p.model.isEmpty { g.modelName = p.model }
-                        } label: {
-                            HStack {
-                                Text(p.label)
-                                Spacer()
-                                if g.modelBaseURL == p.base, !p.base.isEmpty {
-                                    Image(systemName: "checkmark").foregroundStyle(.cyan)
-                                }
-                            }
-                        }
-                    }
-                }
-                Section("地址（OpenAI 兼容）") {
-                    TextField("https://…/v1", text: Binding(
-                        get: { g.modelBaseURL }, set: { g.modelBaseURL = $0 }))
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.URL)
-                }
-                Section("模型名") {
-                    TextField("模型名", text: Binding(
-                        get: { g.modelName }, set: { g.modelName = $0 }))
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                    SecureField("API key（本地 Ollama 可留空）", text: Binding(
-                        get: { g.modelKey }, set: { g.modelKey = $0 }))
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                }
-                Section {
-                    Text(presets.first { $0.base == g.modelBaseURL }?.hint
-                         ?? "任何兼容 /v1/chat/completions 的服务都能用；带图的模型才能看图。")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-                Section {
-                    Button {
-                        g.testModel()
-                    } label: {
-                        HStack {
-                            Text("测试连通性")
-                            Spacer()
-                            if g.testingModel { ProgressView().controlSize(.small) }
-                        }
-                    }
-                    if !g.modelTestLine.isEmpty {
-                        Text(g.modelTestLine).font(.footnote)
-                            .foregroundStyle(g.modelTestOK ? Color.green : Color.orange)
-                    }
-                }
-            }
-            .navigationTitle("模型")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
         }
     }
 }
@@ -518,6 +700,7 @@ struct DeviceTab: View {
         NavigationStack {
             DeviceTabBody(g: g)
                 .navigationTitle("设备")
+                .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
                         Text(BuildInfo.short)
@@ -529,22 +712,6 @@ struct DeviceTab: View {
     }
 }
 
-/// Sheet version of the device page, so any tab can open the connection UI without leaving.
-struct DeviceSheet: View {
-    @ObservedObject var g: Glasses
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            DeviceTabBody(g: g)
-                .navigationTitle("设备")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } } }
-        }
-    }
-}
-
-/// The list body, shared by the tab and the sheet.
 /// One question, one answer: does the glasses accept the key this phone holds?
 struct OwnerBadge: View {
     @ObservedObject var g: Glasses
@@ -609,6 +776,7 @@ struct OwnerBadge: View {
 
 struct DeviceTabBody: View {
     @ObservedObject var g: Glasses
+    @Environment(\.dynamicTypeSize) private var typeSize
     @State private var showSettings = false
     @State private var showQuick = false
     @State private var showDiagnostics = false
@@ -619,140 +787,204 @@ struct DeviceTabBody: View {
     }
 
     private var connectionTitle: String {
-        if g.connected && !g.canUseGlasses { return "已连接，待验证主人身份" }
+        if g.canUseGlasses { return "眼镜已连接" }
+        if g.connected { return "等待主人验证" }
         if case .failed = g.phase { return "连接失败" }
         return g.phaseText
     }
 
     var body: some View {
-        let deviceCandidates = candidates
-        List {
-            Section {
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(connectionTitle).font(.headline)
-                        if g.glassesLine != connectionTitle {
-                            Text(g.glassesLine).font(.caption).foregroundStyle(.secondary)
-                        }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 15) {
+                connectionPanel
+                if !g.connected { nearbyPanel }
+                if g.canUseGlasses {
+                    statusPanel
+                    actionRow("常用眼镜设置", icon: "slider.horizontal.3") { showQuick = true }
+                        .disabled(g.busy)
+                        .glassesPanel(padding: 14)
+                } else {
+                    VStack(alignment: .leading, spacing: 12) {
+                        OwnerBadge(g: g)
+                        Button("设置主人身份") { g.route = .ownerSetup }
+                            .buttonStyle(.bordered)
                     }
-                    Spacer()
-                    if g.phaseBusy {
-                        Button("取消连接") { g.disconnect() }.buttonStyle(.bordered).controlSize(.small)
-                    } else if g.connected {
-                        Button("断开") { g.disconnect() }.buttonStyle(.bordered).controlSize(.small)
-                    } else if g.scanning {
-                        Button("停止扫描") { g.stopScan() }.buttonStyle(.bordered).controlSize(.small)
-                    } else if g.hasSavedGlasses {
-                        Button("重新连接上次眼镜") { g.reconnectLastGlasses() }
-                            .buttonStyle(.borderedProminent).controlSize(.small)
-                    } else {
-                        Button("扫描眼镜") { g.startScan() }
-                            .buttonStyle(.borderedProminent).controlSize(.small)
-                    }
+                    .glassesPanel()
                 }
+                advancedPanel
             }
-            if !g.connected {
-                Section {
-                    if let message = g.discoveryMessage {
-                        Text(message).font(.footnote).foregroundStyle(.secondary)
-                    } else if deviceCandidates.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Label(g.scanning ? "正在扫描眼镜…" : "还没找到眼镜", systemImage: "eyeglasses")
-                                .font(.subheadline.weight(.semibold))
-                            if g.hasSavedGlasses && !g.scanning {
-                                Text("眼镜开机并在手机附近时，可以直接重连。")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                            } else {
-                                Text("折叠两侧镜腿，按住拍摄键，直到镜框内侧的指示灯闪蓝。")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                    ForEach(deviceCandidates) { device in
-                        candidateRow(device)
-                    }
-                    if g.hasSavedGlasses && !g.scanning && !g.phaseBusy {
-                        Button("扫描眼镜") { g.startScan() }
-                    }
-                } header: {
-                    Text("已知与附近设备")
-                } footer: {
-                    if g.scanning && !deviceCandidates.isEmpty { Text("仍在扫描附近的眼镜。") }
-                }
-            }
-
-            if g.canUseGlasses {
-                Section("设备状态") {
-                    if let battery = g.status.batteryPercent {
-                        LabeledContent("电量", value: g.status.charging == true ? "\(battery)% · 充电中" : "\(battery)%")
-                    }
-                    if let free = g.status.storageFreeMb {
-                        LabeledContent("可用空间", value: "\(free) MB")
-                    }
-                    if let volume = g.status.volumePercent {
-                        LabeledContent("音量", value: "\(volume)%")
-                    }
-                    Button { g.refreshStatus() } label: {
-                        Label("刷新设备状态", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(g.busy)
-                }
-                Section("眼镜设置") {
-                    Button { showQuick = true } label: {
-                        Label("音量、指示灯和提示音", systemImage: "dial.medium")
-                    }
-                    .disabled(g.busy)
-                }
-            } else {
-                Section("主人身份") {
-                    OwnerBadge(g: g)
-                    Button("设置主人身份") { g.route = .ownerSetup }
-                }
-            }
-
-            Section("高级") {
-                DisclosureGroup("设备详细设置") {
-                    Button("完整设置列表") { showSettings = true }
-                        .disabled(!g.canUseGlasses || g.busy)
-                    if g.canUseGlasses {
-                        Button("管理主人身份") { g.route = .ownerSetup }
-                    }
-                    Toggle("拦截固件升级", isOn: Binding(
-                        get: { Glasses.blockOTA },
-                        set: { Glasses.blockOTA = $0 }
-                    ))
-                    Button("关闭眼镜云端自动更新") {
-                        g.writeSetting("cloud_ota_enabled", "false")
-                    }
-                    .disabled(!g.canUseGlasses || g.busy)
-                }
-                Button { showDiagnostics = true } label: {
-                    Label("诊断与实验功能", systemImage: "wrench.and.screwdriver")
-                }
-                Button { showAbout = true } label: {
-                    Label("关于 · 许可 · 隐私", systemImage: "info.circle")
-                }
-            }
+            .padding(18)
         }
+        .background(GlassesTheme.page.ignoresSafeArea())
         .sheet(isPresented: $showQuick) { NavigationStack { QuickPanel(g: g) } }
         .sheet(isPresented: $showSettings) { SettingsView(g: g) }
         .sheet(isPresented: $showDiagnostics) { NavigationStack { ContentView(g: g) } }
         .sheet(isPresented: $showAbout) { AboutView() }
     }
 
+    private var connectionPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 13) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 15).fill(GlassesTheme.accent.opacity(0.13))
+                    Image(systemName: "eyeglasses")
+                        .font(.system(size: 28, weight: .medium))
+                        .foregroundStyle(GlassesTheme.accent)
+                }
+                .frame(width: 57, height: 57)
+                .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(connectionTitle)
+                        .font(.system(.title2, design: .rounded, weight: .bold))
+                    if g.glassesLine != connectionTitle && g.glassesLine != "未连接" {
+                        Text(g.glassesLine)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+                if g.phaseBusy { ProgressView().controlSize(.small) }
+            }
+            if g.phaseBusy {
+                Button("取消连接") { g.disconnect() }.buttonStyle(.bordered)
+            } else if g.connected {
+                Button("断开") { g.disconnect() }.buttonStyle(.bordered)
+            } else if g.scanning {
+                Button("停止扫描") { g.stopScan() }.buttonStyle(.bordered)
+            } else if g.hasSavedGlasses {
+                Button("重新连接上次眼镜") { g.reconnectLastGlasses() }
+                    .buttonStyle(.borderedProminent)
+            } else {
+                Button("扫描眼镜") { g.startScan() }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .glassesPanel()
+    }
+
+    private var nearbyPanel: some View {
+        let nearby = candidates
+        return VStack(alignment: .leading, spacing: 12) {
+            Text("已知与附近设备").font(.headline)
+            if let message = g.discoveryMessage {
+                Text(message).font(.footnote).foregroundStyle(.secondary)
+            } else if nearby.isEmpty {
+                if g.scanning {
+                    ProgressView("扫描附近的眼镜…").font(.footnote)
+                }
+                Text(g.hasSavedGlasses && !g.scanning
+                     ? "眼镜开机并在手机附近时，可以直接重连。"
+                     : "首次连接时，折叠两侧镜腿，按住拍摄键直到镜框内侧的指示灯闪蓝。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(nearby) { device in candidateRow(device) }
+            if g.hasSavedGlasses && !g.scanning && !g.phaseBusy {
+                Button("扫描眼镜") { g.startScan() }.buttonStyle(.bordered)
+            }
+        }
+        .glassesPanel()
+    }
+
+    private var statusPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("设备状态").font(.headline)
+                Spacer()
+                Button { g.refreshStatus() } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .frame(minWidth: 44, minHeight: 30)
+                }
+                .accessibilityLabel("刷新设备状态")
+                .disabled(g.busy)
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 180 : 89), spacing: 8)], spacing: 8) {
+                statusMetric("电量", value: g.status.batteryPercent.map { "\($0)%" },
+                             icon: g.status.charging == true ? "bolt.fill" : "battery.100")
+                statusMetric("可用空间", value: g.status.storageFreeMb.map(storageText), icon: "internaldrive")
+                statusMetric("眼镜音量", value: g.status.volumePercent.map { "\($0)%" }, icon: "speaker.wave.2")
+            }
+        }
+        .glassesPanel()
+    }
+
+    private func statusMetric(_ title: String, value: String?, icon: String) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Image(systemName: icon)
+                .foregroundStyle(GlassesTheme.accent)
+                .accessibilityHidden(true)
+            Text(value ?? "暂无数据")
+                .font(.system(.headline, design: .rounded, weight: .semibold))
+                .monospacedDigit()
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(GlassesTheme.page, in: RoundedRectangle(cornerRadius: 13))
+        .accessibilityElement(children: .combine)
+    }
+
+    private func storageText(_ mb: Int) -> String {
+        mb >= 1024 ? String(format: "%.1f GB", Double(mb) / 1024) : "\(mb) MB"
+    }
+
+    private var advancedPanel: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 13) {
+                actionRow("完整设置列表", icon: "list.bullet") { showSettings = true }
+                    .disabled(!g.canUseGlasses || g.busy)
+                if g.canUseGlasses {
+                    actionRow("管理主人身份", icon: "checkmark.shield") { g.route = .ownerSetup }
+                }
+                actionRow("诊断与实验功能", icon: "wrench.and.screwdriver") { showDiagnostics = true }
+                actionRow("关于 · 许可 · 隐私", icon: "info.circle") { showAbout = true }
+                Divider()
+                Toggle("拦截固件升级", isOn: Binding(
+                    get: { Glasses.blockOTA },
+                    set: { Glasses.blockOTA = $0 }
+                ))
+                Button("关闭眼镜云端自动更新") {
+                    g.writeSetting("cloud_ota_enabled", "false")
+                }
+                .disabled(!g.canUseGlasses || g.busy)
+            }
+            .padding(.top, 12)
+        } label: {
+            Label("高级", systemImage: "gearshape")
+                .font(.headline)
+        }
+        .glassesPanel(padding: 14)
+    }
+
+    private func actionRow(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Label(title, systemImage: icon).foregroundStyle(.primary)
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
+            .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
     private func candidateRow(_ device: ScanEntry) -> some View {
         Button { g.connect(device.id) } label: {
             HStack(spacing: 12) {
                 Image(systemName: device.isGlasses ? "eyeglasses" : "dot.radiowaves.left.and.right")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(GlassesTheme.accent)
                     .frame(width: 22)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(device.displayName).foregroundStyle(.primary)
+                    Text(device.displayName).font(.subheadline.weight(.semibold))
                     Text(device.sourceLabel).font(.caption).foregroundStyle(.secondary)
                 }
-                Spacer()
+                Spacer(minLength: 6)
                 if g.phaseBusy && g.connectingID == device.id {
                     ProgressView().controlSize(.small)
                         .accessibilityLabel(Text(g.phaseText))
@@ -760,7 +992,12 @@ struct DeviceTabBody: View {
                     Text(signal).font(.caption).foregroundStyle(.secondary)
                 }
             }
+            .padding(10)
+            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+            .background(GlassesTheme.page, in: RoundedRectangle(cornerRadius: 13))
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .disabled(g.phaseBusy)
     }
 }

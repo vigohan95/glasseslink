@@ -62,6 +62,7 @@ final class Glasses: NSObject, ObservableObject {
     enum Phase: Equatable {
         case idle
         case connecting      // CoreBluetooth connect + L2CAP open
+        case reconnecting(Int)
         case handshaking     // ECDH, keys, trust
         case connected
         case failed(String)
@@ -72,6 +73,7 @@ final class Glasses: NSObject, ObservableObject {
         switch phase {
         case .idle: return "未连接"
         case .connecting: return "连接中…"
+        case .reconnecting(let attempt): return "自动重连中（\(attempt)/\(Self.reconnectDelays.count)）"
         case .handshaking: return "握手中…"
         case .connected: return "已连接"
         case .failed(let why): return "失败：\(why)"
@@ -79,9 +81,10 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     var phaseBusy: Bool {
-        if case .connecting = phase { return true }
-        if case .handshaking = phase { return true }
-        return false
+        switch phase {
+        case .connecting, .reconnecting, .handshaking: return true
+        default: return false
+        }
     }
 
     @Published var devices: [ScanEntry] = []
@@ -101,6 +104,7 @@ final class Glasses: NSObject, ObservableObject {
     @Published var connected = false
     private var connecting = false
     private var connectionAttempt: UUID?
+    private var connectionStartedAt: Date?
     private var retriedL2CAP = false
     @Published var busy = false
     @Published private(set) var mediaMessage: String?
@@ -117,9 +121,7 @@ final class Glasses: NSObject, ObservableObject {
 
     @Published var modelBaseURL = UserDefaults.standard.string(forKey: "modelBaseURL") ?? "http://192.168.3.90:11434/v1"
     @Published var modelName = UserDefaults.standard.string(forKey: "modelName") ?? "gemma3:4b"
-    @Published var modelKey = UserDefaults.standard.string(forKey: "modelKey") ?? "" {
-        didSet { UserDefaults.standard.set(modelKey, forKey: "modelKey") }
-    }
+    @Published private(set) var askingModel = false
     @Published var testingModel = false
     @Published var modelTestLine = ""
     @Published var modelTestOK = false
@@ -140,6 +142,12 @@ final class Glasses: NSObject, ObservableObject {
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
     private var reconnectAfterDisconnect: (id: UUID, forRegistration: Bool)?
+    private static let reconnectDelays: [UInt64] = [350_000_000, 2_000_000_000, 5_000_000_000]
+    private var recoveryTask: Task<Void, Never>?
+    private var recoveringID: UUID?
+    private var recoveryAttempts = 0
+    private var verifiedAt: ContinuousClock.Instant?
+    private var autoReconnectSuppressed = false
     private var connectingForRegistration = false
     private var channel: CBL2CAPChannel?
     private var stream: SDUStream?
@@ -164,6 +172,7 @@ final class Glasses: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        ModelCredentials.migrateLegacyKey(for: modelBaseURL)
         central = CBCentralManager(delegate: self, queue: .main,
                                    options: [CBCentralManagerOptionRestoreIdentifierKey: "dev.local.glasseslink.central"])
         if let k = OwnerMaterial.loadFromKeychain() {
@@ -323,6 +332,13 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     func connect(_ id: UUID, forRegistration: Bool = false) {
+        guard !phaseBusy, channel == nil else { return }
+        resetRecovery()
+        autoReconnectSuppressed = false
+        beginConnection(id, forRegistration: forRegistration)
+    }
+
+    private func beginConnection(_ id: UUID, forRegistration: Bool = false) {
         guard central.state == .poweredOn else {
             discoveryMessage = bluetoothUnavailableMessage
             return
@@ -340,17 +356,20 @@ final class Glasses: NSObject, ObservableObject {
         }
         connecting = true
         connectingID = id
-        phase = .connecting
-        note("▶︎ 已收到点击，开始连接 …")
-        guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
-            connecting = false
-            connectingID = nil
-            phase = .failed("找不到这台眼镜")
+        if recoveringID != id {
+            phase = .connecting
+            glassesLine = "正在打开蓝牙连接"
+        }
+        let knownPeripheral = peripheral?.identifier == id ? peripheral : nil
+        guard let p = knownPeripheral ?? central.retrievePeripherals(withIdentifiers: [id]).first else {
+            clearLink()
+            let reason = "找不到上次的眼镜，正在搜索附近设备。"
+            finishRecoveryOrShowFailure(id, reason: reason)
             // Visor issue #114: after the glasses reboot, the cached identifier can go stale and
             // every connect attempt says "Out of reach" while Bluetooth audio stays fine. Rescan
             // instead of making the user guess.
             note("找不到这台设备（可能刚重启过），自动重新扫描…")
-            startScan()
+            if recoveryTask == nil { startScan() }
             return
         }
         stopScan()
@@ -362,8 +381,10 @@ final class Glasses: NSObject, ObservableObject {
         note("连接 \(p.name ?? "?") …")
         let attempt = UUID()
         connectionAttempt = attempt
+        connectionStartedAt = Date()
+        let automatic = recoveringID == id
         Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            try? await Task.sleep(nanoseconds: automatic ? 9_000_000_000 : 15_000_000_000)
             guard let self, self.connectionAttempt == attempt else { return }
             let reason = p.state == .connected ? "打开眼镜蓝牙通道超时" : "蓝牙连接眼镜超时"
             self.failConnection(reason, peripheral: p)
@@ -380,7 +401,8 @@ final class Glasses: NSObject, ObservableObject {
     /// The glasses stay paired at the iOS level, so a cold launch can go straight back to
     /// the same peripheral without scanning — that is what makes "打开就能用" work.
     func autoReconnect() {
-        guard central.state == .poweredOn else { return }
+        guard !connected, !phaseBusy, central.state == .poweredOn, !autoReconnectSuppressed else { return }
+        if case .rejected = ownerState { return }
         if UserDefaults.standard.bool(forKey: "linkInFlight") {
             // Last launch died inside the handshake. Reconnecting automatically would replay
             // the same crash, so this launch waits for an explicit tap.
@@ -413,6 +435,12 @@ final class Glasses: NSObject, ObservableObject {
         let s = SDUStream(channel: ch)
         s.onLog = { [weak self] in self?.note($0) }
         stream = s
+        s.setFailureHandler { [weak self, weak s] error in
+            Task { @MainActor in
+                guard let self, let s, self.stream === s, let p = self.peripheral else { return }
+                self.failConnection("眼镜蓝牙数据通道已中断。", peripheral: p, underlying: error)
+            }
+        }
         // No key yet is not a dead end: the setup link only needs *a* key pair so the
         // handshake can run, and provisioning replaces it with the real one afterwards.
         if owner == nil {
@@ -441,6 +469,7 @@ final class Glasses: NSObject, ObservableObject {
             connectingID = nil
             phase = .connected
             if trust {
+                verifiedAt = ContinuousClock.now
                 UserDefaults.standard.set(true, forKey: "isOwner")
                 trustLine = "已验证（这台 iPhone 是主人）"
                 ownerState = .verified
@@ -449,25 +478,27 @@ final class Glasses: NSObject, ObservableObject {
                 ownerState = .unverified
             }
             glassesLine = "已连上 · serial \(sess.peerSerial)"
-            note("✅ 握手完成（quirks=\(sess.quirks)）")
+            mediaMessage = nil
+            let elapsed = connectionStartedAt.map { Int(Date().timeIntervalSince($0) * 1000) }
+            note("✅ 握手完成 · \(elapsed.map(String.init) ?? "未知") ms（quirks=\(sess.quirks)）")
+            connectionStartedAt = nil
             UserDefaults.standard.set(trust ? "verified" : "unverified", forKey: "ownerState")
             UserDefaults.standard.set(Self.ts(), forKey: "ownerStateAt")
         } catch {
             guard session === sess else { return }
             trustLine = Glasses.explain(error)
-            phase = .failed(Glasses.explain(error))
             note("❌ 握手中断：\(error)")
-            glassesLine = "握手失败：\(Glasses.explain(error))"
             if case LinkError.trustRejected(let code) = error {
+                resetRecovery()
                 ownerState = .rejected(code)
                 UserDefaults.standard.set("rejected:\(code)", forKey: "ownerState")
                 UserDefaults.standard.set(Self.ts(), forKey: "ownerStateAt")
             }
             // Release the link on failure: otherwise the next tap only reports
             // "链路已经打开了" and the user is stuck until the app is killed.
-            clearLink()
-            if let p = peripheral { central.cancelPeripheralConnection(p) }
-            note("已释放连接，可以重试")
+            if let p = peripheral {
+                failConnection("握手失败 · \(Glasses.explain(error))", peripheral: p)
+            }
         }
     }
 
@@ -518,40 +549,90 @@ final class Glasses: NSObject, ObservableObject {
         stream = nil
         channel = nil
         connected = false
+        verifiedAt = nil
         connecting = false
         connectingID = nil
         connectingForRegistration = false
         connectionAttempt = nil
+        connectionStartedAt = nil
         retriedL2CAP = false
         ownerRegistrationCompleted = false
         busy = false
         settingsLoading = false
+        settings = [:]
+        status = GlassesState()
         recording = false
+        recordStartedAt = nil
         recordDeadline = nil
         autoStopTask?.cancel()
         autoStopTask = nil
         liveTicker?.invalidate()
         liveTicker = nil
         live = nil
+        assistantRef?.stop()
         assistantRef = nil
         assistantOn = false
     }
 
-    private func failConnection(_ reason: String, peripheral p: CBPeripheral) {
+    private func failConnection(_ reason: String, peripheral p: CBPeripheral, underlying: Error? = nil) {
+        allowRecoveryForUnexpectedLoss(of: p.identifier)
         reconnectAfterDisconnect = nil
         clearLink()
-        phase = .failed(reason)
-        glassesLine = reason
-        note(reason)
         if p.state != .disconnected { central.cancelPeripheralConnection(p) }
+        if let underlying { note("蓝牙通道错误：\(underlying)") }
+        finishRecoveryOrShowFailure(p.identifier, reason: reason)
+    }
+
+    private func allowRecoveryForUnexpectedLoss(of id: UUID) {
+        guard let verifiedAt, canUseGlasses, savedGlassesID == id else { return }
+        if verifiedAt.duration(to: ContinuousClock.now) >= .seconds(30) { recoveryAttempts = 0 }
+        recoveringID = id
+    }
+
+    private func finishRecoveryOrShowFailure(_ id: UUID, reason: String) {
+        note(reason)
+        guard let attempt = scheduleRecovery(id) else {
+            phase = .failed(reason)
+            glassesLine = reason
+            mediaMessage = reason + " 可在设备页重新连接。"
+            return
+        }
+        phase = .reconnecting(attempt)
+        connectingID = id
+        glassesLine = reason
+        mediaMessage = "连接中断，正在自动重连。请在连接恢复后重新发起操作。"
+    }
+
+    private func scheduleRecovery(_ id: UUID) -> Int? {
+        guard recoveringID == id, !autoReconnectSuppressed, central.state == .poweredOn,
+              recoveryAttempts < Self.reconnectDelays.count else { return nil }
+        let delay = Self.reconnectDelays[recoveryAttempts]
+        recoveryAttempts += 1
+        recoveryTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: delay) } catch { return }
+            guard let self, !Task.isCancelled, self.recoveringID == id else { return }
+            self.recoveryTask = nil
+            self.beginConnection(id)
+        }
+        return recoveryAttempts
+    }
+
+    private func resetRecovery() {
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        recoveringID = nil
+        recoveryAttempts = 0
     }
 
     func disconnect() {
+        autoReconnectSuppressed = true
+        resetRecovery()
         reconnectAfterDisconnect = nil
         clearLink()
         if let p = peripheral { central.cancelPeripheralConnection(p) }
         phase = .idle
         glassesLine = "未连接"
+        mediaMessage = nil
         note("已断开，可以重新点了")
     }
 
@@ -560,6 +641,7 @@ final class Glasses: NSObject, ObservableObject {
     private func reconnect(forRegistration: Bool) {
         guard !phaseBusy else { return }
         guard let p = peripheral else { startScan(); return }
+        resetRecovery()
         clearLink()
         if p.state == .disconnected {
             connect(p.identifier, forRegistration: forRegistration)
@@ -712,12 +794,15 @@ final class Glasses: NSObject, ObservableObject {
                     autoStopTask?.cancel()
                     autoStopTask = nil
                     recordDeadline = nil
-                    mediaMessage = "眼镜已确认停止录像。可在相册中导入。"
+                    mediaMessage = "眼镜已确认停止录像，正在查询新视频…"
+                    note("眼镜确认停止录像")
+                    await verifyStoppedVideo(on: active)
                 } else {
+                    recordStartedAt = Date()
                     scheduleAutoStop()
                     mediaMessage = nil
+                    note("眼镜确认开始录像")
                 }
-                note(stopping ? "眼镜确认停止录像" : "眼镜确认开始录像")
             }
         }
     }
@@ -732,8 +817,35 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
     @Published var recordDeadline: Date?
+    private var recordStartedAt: Date?
 
     private var autoStopTask: Task<Void, Never>?
+
+    private func verifyStoppedVideo(on active: Session) async {
+        let started = recordStartedAt
+        recordStartedAt = nil
+        let known = Set(captures.map(\.id))
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        guard session === active else { return }
+        do {
+            let list = try await onGlassesQueue { try active.captureList() }
+            try checkActive(active)
+            updateCaptures(list)
+            let newVideo = list.contains { item in
+                guard item.kind == 3074, !known.contains(item.id), let started,
+                      let timestamp = item.timestampNS else { return false }
+                let recorded = Date(timeIntervalSince1970: Double(timestamp) / 1_000_000_000)
+                return recorded >= started.addingTimeInterval(-10) && recorded <= Date().addingTimeInterval(10)
+            }
+            mediaMessage = newVideo
+                ? "眼镜相册已出现新视频，可以导入播放。"
+                : "眼镜已停止录像，暂未找到带时间的新视频。"
+        } catch {
+            guard session === active else { return }
+            mediaMessage = "眼镜已停止录像。相册暂时读不到，请稍后刷新。"
+            note("停止录像后读取相册失败：\(error)")
+        }
+    }
 
     /// Stops the take when the chosen limit is reached, and shows the countdown in the UI.
     private func scheduleAutoStop() {
@@ -780,6 +892,15 @@ final class Glasses: NSObject, ObservableObject {
                 let current = try await onGlassesQueue { try active.subscribeStatus() }
                 try checkActive(active)
                 status = current
+                if let camera = current.camera {
+                    recording = camera == Status.cameraName(Status.videoStarted)
+                    if !recording {
+                        recordStartedAt = nil
+                        recordDeadline = nil
+                        autoStopTask?.cancel()
+                        autoStopTask = nil
+                    }
+                }
             }
         }
     }
@@ -795,33 +916,44 @@ final class Glasses: NSObject, ObservableObject {
               !recording, live == nil, assistantRef == nil else { return }
         let a = Assistant(session: sess)
         a.log = { [weak self] line in self?.note("asst: \(line)") }
-        a.onTurn = { [weak self] interaction in
-            guard let self else { return }
-            let client = ModelClient(baseURL: self.modelBaseURL, model: self.modelName)
+        a.onTurn = { [weak self, weak a] interaction in
+            guard let self, let a else { return }
             Task {
+                guard self.assistantRef === a else { return }
+                let client = self.configuredModel
                 let q = "用户刚唤醒智能眼镜。只用一句不超过 20 字的简体中文回应用户。"
-                let text = (try? await client.ask(question: q, jpeg: Data())) ?? "我在。"
+                let text = (try? await client.ask(question: q)) ?? "我在。"
+                guard self.assistantRef === a else { return }
                 a.complete(interaction: interaction, text: text)
             }
         }
         // The glasses' own speech recognition finished a sentence: answer it with the model.
-        a.onTranscript = { [weak self] transcript, interaction in
-            guard let self else { return }
-            let client = ModelClient(baseURL: self.modelBaseURL, model: self.modelName)
+        a.onTranscript = { [weak self, weak a] transcript, interaction in
+            guard let self, let a else { return }
             Task {
+                guard self.assistantRef === a else { return }
+                let client = self.configuredModel
                 let q = "用户戴着智能眼镜说：“\(transcript)”。用不超过 40 字的简体中文直接回答，不用复述问题。"
-                let text = (try? await client.ask(question: q, jpeg: Data())) ?? "我没听清，再说一遍？"
+                let text = (try? await client.ask(question: q)) ?? "模型暂时无法连接。"
+                guard self.assistantRef === a else { return }
                 a.complete(interaction: interaction, text: text)
             }
         }
-        do {
-            try a.register()
-            a.startLoop()
-            assistantRef = a
-            assistantOn = true
-            note("助手接管已开启")
-        } catch {
-            note("助手接管失败：\(error)")
+        assistantRef = a
+        busy = true
+        Task {
+            defer { if self.session === sess { self.busy = false } }
+            do {
+                try await onGlassesQueue { try a.register() }
+                guard session === sess, assistantRef === a else { return }
+                a.startLoop()
+                assistantOn = true
+                note("助手接管已开启")
+            } catch {
+                guard session === sess, assistantRef === a else { return }
+                assistantRef = nil
+                reportOperationError(error, session: sess)
+            }
         }
     }
 
@@ -977,16 +1109,34 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     // MARK: ask your own model
+    private var configuredModel: ModelClient {
+        ModelClient(baseURL: modelBaseURL, model: modelName, apiKey: ModelCredentials.read(for: modelBaseURL))
+    }
+
+    func saveModelSettings(baseURL: String, model: String, key: String) throws {
+        guard let address = ModelClient.baseComponents(baseURL)?.string else {
+            throw LinkError.io("请填写有效的服务地址。")
+        }
+        let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else { throw LinkError.io("请填写模型 ID。") }
+        try ModelCredentials.save(key, for: address)
+        UserDefaults.standard.removeObject(forKey: "modelKey")
+        modelBaseURL = address
+        modelName = model
+        UserDefaults.standard.set(address, forKey: "modelBaseURL")
+        UserDefaults.standard.set(model, forKey: "modelName")
+    }
+
     func testModel() {
-        UserDefaults.standard.set(modelBaseURL, forKey: "modelBaseURL")
-        UserDefaults.standard.set(modelName, forKey: "modelName")
+        guard !testingModel else { return }
+        let client = configuredModel
         testingModel = true
         modelTestLine = ""
         Task {
             defer { testingModel = false }
             let started = Date()
             do {
-                let raw = try await ModelClient(baseURL: modelBaseURL, model: modelName).ping()
+                let raw = try await client.ping()
                 let ms = Int(Date().timeIntervalSince(started) * 1000)
                 let snippet = raw.replacingOccurrences(of: "\n", with: " ").prefix(60)
                 modelTestOK = true
@@ -998,19 +1148,17 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
-    func ask(_ question: String) {        guard let photo = lastPhoto else { note("先拍一张"); return }
-        UserDefaults.standard.set(modelBaseURL, forKey: "modelBaseURL")
-        UserDefaults.standard.set(modelName, forKey: "modelName")
-        busy = true
+    func ask(_ question: String) {
+        guard !askingModel, let photo = lastPhoto, !question.isEmpty else { return }
+        let client = configuredModel
+        askingModel = true
+        answer = ""
         Task {
-            defer { busy = false }
+            defer { askingModel = false }
             do {
-                let text = try await ModelClient(baseURL: modelBaseURL, model: modelName,
-                                                 log: { [weak self] in self?.note($0) })
-                    .ask(question: question, jpeg: photo)
-                answer = text
+                answer = try await client.ask(question: question, image: photo)
             } catch {
-                note("模型调用失败：\(error)")
+                answer = "模型调用失败 · \(Glasses.explain(error))"
             }
         }
     }
@@ -1221,7 +1369,7 @@ final class Glasses: NSObject, ObservableObject {
                         // Read-back is only meaningful where RLDrive mirrors the same key.
                         let after = try sess.driveObjects()
                         let mirrored = after.first { $0.uri == key }
-                        ok = mirrored.map { $0.data == value } ?? true
+                        ok = mirrored?.data == value
                     }
                 } else {
                     ok = try sess.driveWrite(key: key, value: value)
@@ -1259,7 +1407,12 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
                 autoReconnect()
             case .unauthorized, .poweredOff, .unsupported:
                 stopScan()
+                resetRecovery()
+                reconnectAfterDisconnect = nil
+                clearLink()
                 discoveryMessage = bluetoothUnavailableMessage
+                phase = .failed(bluetoothUnavailableMessage)
+                glassesLine = bluetoothUnavailableMessage
                 note(bluetoothUnavailableMessage)
             default: note("central state \(c.state.rawValue)")
             }
@@ -1273,7 +1426,8 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
         }
         Task { @MainActor in
             guard !connecting, channel == nil else { return }
-            UserDefaults.standard.set(restored.identifier.uuidString, forKey: "lastPeripheral")
+            guard restored.identifier == savedGlassesID, !autoReconnectSuppressed else { return }
+            peripheral = restored
             if c.state == .poweredOn { autoReconnect() }
         }
     }
@@ -1339,16 +1493,12 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         Task { @MainActor in
             guard self.peripheral?.identifier == p.identifier, p.state == .disconnected else { return }
-            let reconnect = self.reconnectAfterDisconnect
-            self.reconnectAfterDisconnect = nil
-            self.clearLink()
-            if self.phaseBusy || self.phase == .connected {
-                self.phase = .idle
-                self.glassesLine = "断开"
-            }
-            self.note("断开：\(error?.localizedDescription ?? "正常")")
-            if let reconnect, reconnect.id == p.identifier {
-                self.connect(reconnect.id, forRegistration: reconnect.forRegistration)
+            if let reconnect = self.reconnectAfterDisconnect, reconnect.id == p.identifier {
+                self.reconnectAfterDisconnect = nil
+                self.clearLink()
+                self.beginConnection(reconnect.id, forRegistration: reconnect.forRegistration)
+            } else if self.channel != nil || self.connecting {
+                self.failConnection("眼镜蓝牙已断开。", peripheral: p, underlying: error)
             }
         }
     }
@@ -1356,12 +1506,8 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
         Task { @MainActor in
             guard self.connectingID == p.identifier, p.state == .disconnected else { return }
-            let reconnect = self.reconnectAfterDisconnect
             let reason = error?.localizedDescription ?? "蓝牙连接未建立"
             self.failConnection("连接失败：\(reason)", peripheral: p)
-            if let reconnect, reconnect.id == p.identifier {
-                self.connect(reconnect.id, forRegistration: reconnect.forRegistration)
-            }
         }
     }
 
@@ -1405,79 +1551,8 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
                                 error: Error?) {
         Task { @MainActor in
             guard let channel, self.channel === channel else { return }
-            self.failConnection("L2CAP 关闭（\(error?.localizedDescription ?? "正常")）", peripheral: p)
+            self.failConnection("眼镜蓝牙数据通道已关闭。", peripheral: p, underlying: error)
         }
-    }
-}
-
-// MARK: - model client
-
-struct ModelClient {
-    let baseURL: String
-    let model: String
-    var log: (String) -> Void = { _ in }
-
-    /// Text-only round trip, used by the "测试连通性" button: it answers "is the address right,
-    /// is the key right, does the model exist" in one second instead of during a camera question.
-    func ping() async throws -> String {
-        guard var comps = URLComponents(string: baseURL) else { throw LinkError.io("bad base URL") }
-        comps.path = (comps.path.hasSuffix("/") ? comps.path : comps.path + "/") + "chat/completions"
-        guard let url = comps.url else { throw LinkError.io("bad base URL") }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 30
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let key = UserDefaults.standard.string(forKey: "modelKey") ?? ""
-        if !key.isEmpty { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
-        let body: [String: Any] = [
-            "model": model,
-            "max_tokens": 16,
-            "messages": [["role": "user", "content": "Reply with the single word: ok"]],
-        ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse else { throw LinkError.io("没有 HTTP 响应") }
-        let text = String(data: data, encoding: .utf8) ?? ""
-        guard http.statusCode == 200 else {
-            throw LinkError.io("HTTP \(http.statusCode)：\(text.prefix(160))")
-        }
-        return text
-    }
-
-    func ask(question: String, jpeg: Data) async throws -> String {
-        guard var comps = URLComponents(string: baseURL) else { throw LinkError.io("bad base URL") }
-        comps.path = (comps.path.hasSuffix("/") ? comps.path : comps.path + "/") + "chat/completions"
-        guard let url = comps.url else { throw LinkError.io("bad base URL") }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 180
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("Bearer \(UserDefaults.standard.string(forKey: "modelKey") ?? "none")",
-                     forHTTPHeaderField: "Authorization")
-        let b64 = jpeg.base64EncodedString()
-        let body: [String: Any] = [
-            "model": model,
-            "max_tokens": 400,
-            "messages": [[
-                "role": "user",
-                "content": [
-                    ["type": "text", "text": question],
-                    ["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(b64)"]],
-                ],
-            ]],
-        ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        log("POST \(url.absoluteString) model=\(model) img=\(jpeg.count)B")
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        guard status / 100 == 2,
-              let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = obj["choices"] as? [[String: Any]],
-              let msg = choices.first?["message"] as? [String: Any],
-              let text = msg["content"] as? String else {
-            throw LinkError.io("model \(status): \(String(decoding: data, as: UTF8.self).prefix(300))")
-        }
-        return text
     }
 }
 
@@ -1608,7 +1683,7 @@ struct ContentView: View {
                         .textInputAutocapitalization(.never).font(.footnote)
                     TextField("model", text: $g.modelName).font(.footnote)
                     TextField("问题", text: $question, axis: .vertical).lineLimit(1 ... 3)
-                    Button("看图问答") { g.ask(question) }.disabled(g.lastPhoto == nil || g.busy)
+                    Button("看图问答") { g.ask(question) }.disabled(g.lastPhoto == nil || g.askingModel)
                     if !g.answer.isEmpty { Text(g.answer).font(.callout) }
                 }
 

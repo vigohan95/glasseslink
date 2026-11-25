@@ -97,6 +97,36 @@ final class SessionLoopbackTests: XCTestCase {
         XCTAssertEqual(b.debugBufferCount, 0)
     }
 
+    func testTransportReportsUnexpectedEndOnceAndPreservesItsCause() throws {
+        let (a, _) = SDUStream.loopbackPair()
+        var failures: [String] = []
+        a.setFailureHandler { failures.append($0.description) }
+        let empty = InputStream(data: Data())
+        a.stream(empty, handle: .endEncountered)
+        a.stream(empty, handle: .errorOccurred)
+        a.close()
+        XCTAssertEqual(failures.count, 1)
+        let failure = try XCTUnwrap(failures.first)
+        XCTAssertThrowsError(try a.nextFrame(timeout: 5)) { XCTAssertEqual(String(describing: $0), failure) }
+        XCTAssertThrowsError(try a.write(Data([1]))) { XCTAssertEqual(String(describing: $0), failure) }
+
+        let (b, _) = SDUStream.loopbackPair()
+        b.setFailureHandler { _ in XCTFail("A manual close must not trigger recovery") }
+        b.close()
+        b.stream(empty, handle: .endEncountered)
+    }
+
+    func testTransportReadsLargestDocumentedDataXFrameAcrossReads() throws {
+        let (a, b) = SDUStream.loopbackPair()
+        let payload = Data(repeating: 0x5A, count: 0x3FFF)
+        let frame = DataX.header(DataX.chSetup, payload.count, hasExtension: false) + payload
+        try a.write(Data(frame.prefix(8_192)))
+        XCTAssertEqual(b.debugBufferCount, 8_192)
+        try a.write(Data(frame.dropFirst(8_192)))
+        XCTAssertEqual(try b.nextFrame(timeout: 0), frame)
+        XCTAssertEqual(b.debugBufferCount, 0)
+    }
+
     func testFullHandshakeCaptureListAndTransfer() throws {
 
         // The fake peer still does not complete its side of the link; the signer it uses is
