@@ -5,6 +5,7 @@ import Foundation
 enum Status {
     static let service = 28
     static let mtInit: UInt16 = 1000
+    static let mtInitAck = 1001
     static let mtDeviceStateStart = 2005
     static let subscriptionDeviceState: UInt64 = 1
     static let photoStarted = 1
@@ -32,7 +33,9 @@ enum Status {
         func number(_ f: [Int: [Any]]?, _ field: Int) -> Int? { f?[field]?.first as? Int }
 
         if let battery = inner(1) {
-            if let percent = number(battery, 3) { state.batteryPercent = percent }
+            if let percent = number(battery, 3) {
+                state.batteryPercent = (0 ... 100).contains(percent) ? percent : nil
+            }
             if let charge = number(battery, 2) { state.charging = [1, 2, 3].contains(charge) }
             if let milli = number(battery, 4) { state.batteryTempC = Double(milli) / 1000 }
             if let milli = number(battery, 5) { state.volts = Double(milli) / 1000 }
@@ -46,8 +49,11 @@ enum Status {
         }
         if let streaming = number(top, 17) { state.streaming = streaming != 0 }
         if let storage = inner(21) {
-            if let free = number(storage, 1) { state.storageFreeMb = free }
-            if let total = number(storage, 2) { state.storageTotalMb = total }
+            if let free = number(storage, 1) { state.storageFreeMb = free >= 0 ? free : nil }
+            if let total = number(storage, 2) { state.storageTotalMb = total > 0 ? total : nil }
+            if let free = state.storageFreeMb, let total = state.storageTotalMb, free > total {
+                state.storageFreeMb = nil
+            }
         }
         if let volume = inner(25) {
             state.receivedVolume = true
@@ -100,6 +106,38 @@ struct GlassesState {
     var volumeLevel: Int?
     var volumeStream: String?
     var receivedVolume = false
+
+    var hasReportedState: Bool {
+        batteryPercent != nil || charging != nil || batteryTempC != nil || volts != nil
+            || camera != nil || hinge != nil || mount != nil || thermalC != nil || throttling != nil
+            || streaming != nil || storageFreeMb != nil || storageTotalMb != nil || receivedVolume
+    }
+
+    mutating func mergeReported(from update: GlassesState) {
+        batteryPercent = update.batteryPercent ?? batteryPercent
+        charging = update.charging ?? charging
+        batteryTempC = update.batteryTempC ?? batteryTempC
+        volts = update.volts ?? volts
+        camera = update.camera ?? camera
+        hinge = update.hinge ?? hinge
+        mount = update.mount ?? mount
+        thermalC = update.thermalC ?? thermalC
+        throttling = update.throttling ?? throttling
+        streaming = update.streaming ?? streaming
+        storageFreeMb = update.storageFreeMb ?? storageFreeMb
+        storageTotalMb = update.storageTotalMb ?? storageTotalMb
+        if let free = storageFreeMb, let total = storageTotalMb, free > total {
+            // Do not pair a fresh reading with an older, conflicting one.
+            if update.storageTotalMb != nil { storageFreeMb = nil }
+            else { storageTotalMb = nil }
+        }
+        if update.receivedVolume {
+            volumePercent = update.volumePercent
+            volumeLevel = update.volumeLevel
+            volumeStream = update.volumeStream
+            receivedVolume = true
+        }
+    }
 
     var lines: [String] {
         var out: [String] = []

@@ -419,11 +419,12 @@ final class Session {
         try sendAny(DataX.status(channel, code))
     }
 
-    private func sendAny(_ data: Data) throws {
+    private func sendAny(_ data: Data, tracePayload: Bool = true) throws {
         sendLock.lock()
         defer { sendLock.unlock() }
         if let s = send {
-            emit("sealed", data)
+            if tracePayload { emit("sealed", data) }
+            else { emit("sealed service message (\(data.count)B)") }
             try stream.write(try s.seal(data))
         } else {
             try sendPlain(data)
@@ -533,7 +534,7 @@ final class Session {
         return plain
     }
 
-    private func decodeFrame(_ sdu: Data) throws -> [DataX.Message] {
+    private func decodeFrame(_ sdu: Data, bulkChannel: UInt16? = nil, tracePayload: Bool = true) throws -> [DataX.Message] {
         let plain = resolveFirstIV(try openFrame(sdu), frame: sdu)
         let available = dataXCarry.count + plain.count
         let packets = DataX.splitMessages(plain, carry: &dataXCarry)
@@ -541,8 +542,12 @@ final class Session {
         let messages = packets.map { packet in
             let msg = packet.message
             consumed += msg.consumed
-            emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
-                 packet.wire, inbound: true)
+            let bulk = msg.channel == bulkChannel && msg.error == nil
+                && (msg.type == nil || msg.type == Int(Self.airData))
+            if !bulk {
+                emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
+                     tracePayload && msg.service != Int(Assistant.service) ? packet.wire : nil, inbound: true)
+            }
             return msg
         }
         let skipped = available - consumed - dataXCarry.count
@@ -551,7 +556,8 @@ final class Session {
     }
 
     private func recvMessage(timeout: TimeInterval, includePending: Bool = true,
-                             handlesAirshipOffers: Bool = false) throws -> DataX.Message {
+                             handlesAirshipOffers: Bool = false, bulkChannel: UInt16? = nil,
+                             tracePayload: Bool = true) throws -> DataX.Message {
         let deadline = Date().addingTimeInterval(timeout)
         receiveLock.lock()
         defer { receiveLock.unlock() }
@@ -563,7 +569,7 @@ final class Session {
                 msg = decoded
             } else {
                 let sdu = try stream.nextFrame(timeout: max(0, deadline.timeIntervalSinceNow))
-                decodedMessages = try decodeFrame(sdu)[...]
+                decodedMessages = try decodeFrame(sdu, bulkChannel: bulkChannel, tracePayload: tracePayload)[...]
                 continue
             }
 
@@ -849,14 +855,14 @@ final class Session {
             servicesNamed.insert(ch)
         }
         tags.append(DataX.tag(2, type, last: true))
-        try sendAny(DataX.message(ch, tags: tags, payload: payload))
+        try sendAny(DataX.message(ch, tags: tags, payload: payload), tracePayload: service != Int(Assistant.service))
     }
 
     private var servicesNamed: Set<UInt16> = []
 
     /// The next message from any channel, for a reader loop that owns the link.
-    func nextMessage(timeout: TimeInterval) throws -> DataX.Message {
-        try recvMessage(timeout: timeout)
+    func nextMessage(timeout: TimeInterval, tracePayload: Bool = true) throws -> DataX.Message {
+        try recvMessage(timeout: timeout, tracePayload: tracePayload)
     }
 
     /// Sends and waits for the answer of one type on the same channel.
@@ -1114,7 +1120,8 @@ final class Session {
     }
 
     /// The glasses open the transfer channel. Cursor and Drop use its mirror.
-    func receiveFile(timeout: TimeInterval = 120, onBytes: ((Int, Int) -> Void)? = nil) throws -> Transfer? {
+    func receiveFile(timeout: TimeInterval = 120, maximumDuration: TimeInterval? = nil,
+                     onBytes: ((Int, Int) -> Void)? = nil) throws -> Transfer? {
         let wantedID = requestedCaptureAsset.map { asset in withUnsafeBytes(of: asset.uuid) { Data($0) } }
         requestedCaptureAsset = nil
         let capturesMirror = serviceChannels["captures"].map { $0 ^ 0x8000 }
@@ -1122,11 +1129,17 @@ final class Session {
         var lastType: Int?
         var buf = Data()
         var checksum: UInt32 = 1
-        let deadline = Date().addingTimeInterval(timeout)
+        let maximumDeadline = maximumDuration.map { Date().addingTimeInterval($0) } ?? .distantFuture
+        var idleDeadline = Date().addingTimeInterval(timeout)
         while true {
-            let left = deadline.timeIntervalSinceNow
-            if left <= 0 { throw LinkError.unexpected("file transfer did not complete") }
-            let m = try recvMessage(timeout: left, handlesAirshipOffers: true)
+            let left = min(idleDeadline, maximumDeadline).timeIntervalSinceNow
+            if left <= 0 { throw LinkError.unexpected("眼镜文件传输超时，请重试。") }
+            let m: DataX.Message
+            do {
+                m = try recvMessage(timeout: left, handlesAirshipOffers: true, bulkChannel: accepted?.channel)
+            } catch LinkError.unexpected(let reason) where reason.hasPrefix("timeout waiting for a frame") {
+                throw LinkError.unexpected("眼镜文件传输暂停过久，请重试。")
+            }
             if m.channel == capturesMirror {
                 if m.type == Int(Self.capAssetGone) {
                     throw LinkError.unexpected("the selected asset is no longer on the glasses")
@@ -1144,6 +1157,7 @@ final class Session {
                     try sendAirshipReply(Self.airDrop, on: mirror, payload: PB.bytes(1, offer.id))
                     continue
                 }
+                if accepted == nil { idleDeadline = Date().addingTimeInterval(timeout) }
                 accepted = offer
                 lastType = m.type
                 buf.removeAll(keepingCapacity: true)
@@ -1162,6 +1176,7 @@ final class Session {
                     throw LinkError.unexpected("file data exceeds the offered size")
                 }
                 buf.append(m.payload)
+                if !m.payload.isEmpty { idleDeadline = Date().addingTimeInterval(timeout) }
                 checksum = Self.updateAdler32(checksum, with: m.payload)
                 onBytes?(buf.count, offer.size)
             case Self.airCheck:
@@ -1325,10 +1340,10 @@ final class Session {
 
     /// Subscribes (or re-asks on the existing channel) and merges pushes until the snapshot has
     /// battery and storage, allowing one short grace window for a separate volume push.
-    func subscribeStatus(timeout: TimeInterval = 4) throws -> GlassesState {
+    func subscribeStatus(timeout: TimeInterval = 4, requireReport: Bool = true) throws -> GlassesState {
         let ch = statusChannel()
+        let mirror = ch ^ 0x8000
         try sendOnService("status", service: Status.service, type: Status.mtInit, payload: Status.subscribePayload())
-        statusSubscribed = true
 
         var state = GlassesState()
         var lastType: Int?
@@ -1339,19 +1354,31 @@ final class Session {
             if left <= 0 { break }
             let m: DataX.Message
             do { m = try recvMessage(timeout: left) } catch LinkError.unexpected(_) { break }
+            guard m.channel == mirror, m.service == nil || m.service == Status.service else { continue }
+            if let code = m.error {
+                guard code == Int(AirShield.stOK) || code == Int(AirShield.stSuccess) else {
+                    throw LinkError.serviceError("设备状态", UInt16(truncatingIfNeeded: code))
+                }
+                continue
+            }
+            if m.type == Status.mtInitAck { statusSubscribed = true }
             guard deviceStatusType(m, channel: ch, lastType: &lastType) != nil else { continue }
             Status.merge(m.payload, into: &state)
+            if state.hasReportedState { statusSubscribed = true }
             if state.batteryPercent != nil, state.storageFreeMb != nil {
                 if state.receivedVolume { break }
                 if volumeDeadline == nil { volumeDeadline = Date().addingTimeInterval(0.3) }
             }
+        }
+        if requireReport, !state.hasReportedState {
+            throw LinkError.unexpected("眼镜没有返回设备状态")
         }
         emit("status: \(state.lines.joined(separator: " / "))")
         return state
     }
 
     func confirmedShutter(_ payload: Data, matching confirmed: (Int) -> Bool) throws -> GlassesState {
-        if !statusSubscribed { _ = try subscribeStatus(timeout: 2) }
+        if !statusSubscribed { _ = try subscribeStatus(timeout: 2, requireReport: false) }
         let ch = statusChannel()
         try sendOnService("status", service: Shutter.service, type: Shutter.mtSnIntent, payload: payload)
 

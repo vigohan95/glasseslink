@@ -12,6 +12,10 @@ targets:
     sources:
       - App.swift
       - RootView.swift
+      - AlbumMediaView.swift
+      - AudioOutput.swift
+      - MicrophoneCheckView.swift
+      - LocalMediaLibrary.swift
       - ModelClient.swift
       - ModelSheet.swift
       - AboutView.swift
@@ -56,11 +60,12 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "0.95"
-        CFBundleVersion: "95"
+        CFBundleShortVersionString: "0.96"
+        CFBundleVersion: "96"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
+        NSMicrophoneUsageDescription: 在你主动测试时检查眼镜麦克风，测试录音仅保存在本机。
         NSLocalNetworkUsageDescription: 连接你配置的局域网模型或桥接服务。
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true

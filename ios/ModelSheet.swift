@@ -189,7 +189,7 @@ struct ModelSheet: View {
             do {
                 _ = try await draft.ping()
                 responseOK = true
-                response = "模型已返回回复 · \(Int(Date().timeIntervalSince(start) * 1000)) ms"
+                response = "模型已返回回复 · \(Int(Date().timeIntervalSince(start) * 1000)) ms。点「保存」用于助手。"
             } catch {
                 responseOK = false
                 response = Glasses.explain(error)

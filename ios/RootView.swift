@@ -7,28 +7,31 @@ import UniformTypeIdentifiers
 struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var g = Glasses()
-    @State private var selectedTab: Tab = .album
+    @State private var selectedTab: Tab = .device
 
     private enum Tab: Hashable { case album, camera, assistant, device }
 
     var body: some View {
         TabView(selection: $selectedTab) {
+            DeviceTab(g: g)
+                .tabItem { Label("眼镜", systemImage: "eyeglasses") }
+                .tag(Tab.device)
             AlbumTab(g: g, openDevice: { selectedTab = .device })
                 .tabItem { Label("相册", systemImage: "photo.stack") }
                 .tag(Tab.album)
-            ShootTab(g: g, openDevice: { selectedTab = .device })
+            ShootTab(g: g, openDevice: { selectedTab = .device }, openAlbum: { selectedTab = .album })
                 .tabItem { Label("拍摄", systemImage: "camera") }
                 .tag(Tab.camera)
             AssistantTab(g: g, openDevice: { selectedTab = .device })
                 .tabItem { Label("助手", systemImage: "waveform") }
                 .tag(Tab.assistant)
-            DeviceTab(g: g)
-                .tabItem { Label("设备", systemImage: "eyeglasses") }
-                .tag(Tab.device)
         }
         .tint(GlassesTheme.accent)
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { g.autoReconnect() }
+            if phase == .active {
+                g.readAudioOutput()
+                g.autoReconnect()
+            }
         }
         // One-time setup lives at the root, not inside a NavigationLink.
         // A sheet presented from a pushed destination dies the moment `g` publishes
@@ -125,7 +128,7 @@ private func sizeText(_ n: Int) -> String {
 
 private let mediaDateFormatter: DateFormatter = {
     let formatter = DateFormatter()
-    formatter.dateFormat = "MM-dd HH:mm"
+    formatter.dateFormat = "HH:mm"
     return formatter
 }()
 
@@ -140,105 +143,75 @@ struct AlbumTab: View {
     @ObservedObject var g: Glasses
     let openDevice: () -> Void
     @Environment(\.dynamicTypeSize) private var typeSize
+    @State private var library: Library = .glasses
     @State private var filter: Filter = .all
     @State private var inFlight: String?
     @State private var failed: Set<String> = []
-    @State private var preview: ThumbnailPreview?
+    @State private var preview: AlbumMediaSelection?
 
-    enum Filter: String, CaseIterable { case all = "全部", pending = "未导入", done = "已导入" }
+    private enum Library: String, CaseIterable { case glasses = "眼镜", local = "本机" }
+    private enum Filter: String, CaseIterable { case all = "全部", photo = "照片", video = "视频", pending = "未导入" }
 
-    private struct ThumbnailPreview: Identifiable {
-        let id: String
-        let image: UIImage
-        let isPhoto: Bool
+    private struct MediaDay: Identifiable {
+        let id: Date
+        let captures: [Capture]
     }
 
     private var columns: [GridItem] {
-        [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 245 : 146), spacing: 12, alignment: .top)]
+        [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 245 : 140), spacing: 10, alignment: .top)]
     }
 
+    private var displayedLibrary: Library { g.canUseGlasses ? library : .local }
+    private var canStartTransfer: Bool { g.canUseGlasses && inFlight == nil && !g.busy }
+
     private var captures: [Capture] {
-        var seen = Set<String>()
-        let records = g.captures + Array(g.importedCaptures.values)
+        var seen: Set<String> = []
+        let records = displayedLibrary == .glasses
+            ? g.captures
+            : g.localCaptures + Array(g.importedCaptures.values)
         return records.filter { seen.insert($0.id).inserted }
             .sorted { ($0.timestampNS ?? 0) > ($1.timestampNS ?? 0) }
     }
 
-    private var pending: [Capture] { captures.filter { g.importedCaptures[$0.id] == nil } }
-    private var canImport: Bool { g.canUseGlasses && inFlight == nil && !g.busy }
-
     private var rows: [Capture] {
-        if !g.canUseGlasses { return captures.filter { g.importedCaptures[$0.id] != nil } }
         switch filter {
         case .all: return captures
-        case .pending: return pending
-        case .done: return captures.filter { g.importedCaptures[$0.id] != nil }
+        case .photo: return captures.filter(\.isPhoto)
+        case .video: return captures.filter { !$0.isPhoto }
+        case .pending:
+            return displayedLibrary == .glasses ? captures.filter { g.importedCaptures[$0.id] == nil } : captures
         }
     }
 
-    private var emptyMessage: String {
-        if !g.canUseGlasses { return "导入过的照片和视频也可以在 iPhone 的「照片」里查看。" }
-        switch filter {
-        case .all: return "眼镜里还没有照片或视频。"
-        case .pending: return "没有待导入的媒体。"
-        case .done: return "这里还没有导入过的媒体。"
+    private var days: [MediaDay] {
+        let groups = Dictionary(grouping: rows) { capture -> Date in
+            guard let ns = capture.timestampNS else { return .distantPast }
+            return Calendar.current.startOfDay(for: Date(timeIntervalSince1970: Double(ns) / 1_000_000_000))
         }
+        return groups.keys.sorted(by: >).map { MediaDay(id: $0, captures: groups[$0] ?? []) }
     }
 
     var body: some View {
-        let visibleRows = rows
+        let mediaDays = days
+        let eyeIDs = Set(g.captures.map(\.id))
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                LazyVStack(alignment: .leading, spacing: 17) {
                     galleryHeader
-                    if g.canUseGlasses {
-                        Picker("导入状态", selection: $filter) {
-                            ForEach(Filter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                        }
-                        .pickerStyle(.segmented)
-                    }
-
-                    if inFlight != nil {
-                        ProgressView(g.mediaMessage ?? "正在导入…")
-                            .font(.footnote)
-                            .glassesPanel(padding: 12)
-                    } else if let message = g.mediaMessage {
-                        Text(message)
-                            .font(.footnote)
-                            .glassesPanel(padding: 12)
-                    }
-
-                    if visibleRows.isEmpty {
-                        VStack(spacing: 10) {
-                            Image(systemName: "photo.on.rectangle.angled")
-                                .font(.system(size: 32, weight: .light))
-                                .foregroundStyle(GlassesTheme.accent)
-                                .accessibilityHidden(true)
-                            Text(emptyMessage)
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                        }
-                        .padding(.vertical, 24)
-                        .frame(maxWidth: .infinity)
-                        .glassesPanel()
+                    filters
+                    transferStatus
+                    if mediaDays.isEmpty {
+                        emptyPanel
                     } else {
-                        LazyVGrid(columns: columns, spacing: 12) {
-                            ForEach(visibleRows, id: \.id) { capture in
-                                let thumb = g.thumbs[capture.id]
-                                CaptureTile(capture: capture,
-                                            thumbnail: thumb,
-                                            imported: g.importedCaptures[capture.id] != nil,
-                                            working: inFlight == capture.id,
-                                            failed: failed.contains(capture.id),
-                                            fraction: g.progress[capture.id] ?? 0,
-                                            canImport: canImport,
-                                            onPreview: {
-                                                if let thumb {
-                                                    preview = ThumbnailPreview(id: capture.id, image: thumb, isPhoto: capture.isPhoto)
-                                                }
-                                            },
-                                            onImport: { importCaptures([capture]) })
+                        ForEach(mediaDays) { day in
+                            Text(day.id == .distantPast ? "日期未知" : day.id.formatted(date: .long, time: .omitted))
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .accessibilityAddTraits(.isHeader)
+                            LazyVGrid(columns: columns, spacing: 12) {
+                                ForEach(day.captures, id: \.id) { capture in
+                                    mediaTile(capture, presentOnGlasses: eyeIDs.contains(capture.id))
+                                }
                             }
                         }
                     }
@@ -255,85 +228,153 @@ struct AlbumTab: View {
                         Image(systemName: "arrow.clockwise")
                     }
                     .accessibilityLabel("刷新眼镜相册")
-                    .disabled(!canImport)
+                    .disabled(!canStartTransfer)
                 }
             }
-            .sheet(item: $preview) { item in
-                NavigationStack {
-                    Image(uiImage: item.image)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .padding(12)
-                        .background(Color.black.ignoresSafeArea())
-                        .navigationTitle(item.isPhoto ? "照片预览图" : "视频封面")
-                        .navigationBarTitleDisplayMode(.inline)
-                        .toolbar {
-                            ToolbarItem(placement: .confirmationAction) {
-                                Button("完成") { preview = nil }
-                            }
-                        }
-                }
-                .preferredColorScheme(.dark)
+            .fullScreenCover(item: $preview) { item in
+                AlbumMediaView(g: g, media: item)
             }
-            .onChange(of: g.canUseGlasses, initial: true) { _, canUse in
-                if canUse && !g.busy { g.loadCaptures() }
+            .onChange(of: displayedLibrary) { _, source in
+                if source == .local && filter == .pending { filter = .all }
             }
         }
     }
 
-    private var galleryHeader: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .bottom, spacing: 10) {
-                galleryTitle
-                Spacer(minLength: 10)
-                galleryAction
+    private var filters: some View {
+        HStack(spacing: 12) {
+            if g.canUseGlasses {
+                Picker("相册来源", selection: $library) {
+                    ForEach(Library.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
             }
-            VStack(alignment: .leading, spacing: 12) {
+            Menu {
+                Picker("筛选媒体", selection: $filter) {
+                    ForEach(Filter.allCases.filter { displayedLibrary == .glasses || $0 != .pending }, id: \.self) {
+                        Text($0.rawValue).tag($0)
+                    }
+                }
+            } label: {
+                Label(filter.rawValue, systemImage: "line.3.horizontal.decrease.circle")
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(GlassesTheme.surface, in: Capsule())
+            }
+            .accessibilityHint("选择要显示的媒体")
+        }
+    }
+
+    private var galleryHeader: some View {
+        let pending = rows.filter { g.importedCaptures[$0.id] == nil }
+        return ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: 12) {
                 galleryTitle
-                galleryAction
+                Spacer(minLength: 8)
+                galleryAction(pending: pending)
+            }
+            VStack(alignment: .leading, spacing: 10) {
+                galleryTitle
+                galleryAction(pending: pending)
             }
         }
     }
 
     private var galleryTitle: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(g.canUseGlasses ? "眼镜相册" : "媒体")
+        VStack(alignment: .leading, spacing: 3) {
+            Text(displayedLibrary == .glasses ? "眼镜相册" : "本机相册")
                 .font(.system(.largeTitle, design: .rounded, weight: .bold))
-            Text(g.canUseGlasses
-                 ? "\(captures.count) 项媒体 · \(pending.count) 项未导入"
-                 : (g.connected ? "连接已建立，等待主人验证" : "连接眼镜后查看原始照片和视频"))
-                .font(.subheadline)
+            Text("\(rows.count) 项")
+                .font(.subheadline.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
     }
 
     @ViewBuilder
-    private var galleryAction: some View {
+    private func galleryAction(pending: [Capture]) -> some View {
         if !g.canUseGlasses {
             Button(g.connected ? "去验证" : "连接眼镜") { openDevice() }
-                .buttonStyle(.borderedProminent)
-        } else if !pending.isEmpty {
-            Button { importCaptures(pending) } label: {
-                Label("全部导入", systemImage: "arrow.down")
+                .buttonStyle(.bordered)
+        } else if displayedLibrary == .glasses && !pending.isEmpty {
+            Button { transfer(pending) } label: {
+                Label("导入 \(pending.count) 项", systemImage: "arrow.down")
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!canImport)
+            .disabled(!canStartTransfer)
         }
     }
 
-    private func importCaptures(_ queue: [Capture]) {
-        guard canImport, let first = queue.first else { return }
+    @ViewBuilder
+    private var transferStatus: some View {
+        if inFlight != nil {
+            VStack(alignment: .leading, spacing: 7) {
+                ProgressView(g.mediaMessage ?? "正在传输…").font(.footnote)
+                if let detail = g.transferDetail {
+                    Text(detail)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .glassesPanel(padding: 12)
+        } else if let message = g.mediaMessage {
+            Text(message)
+                .font(.footnote)
+                .glassesPanel(padding: 12)
+        }
+    }
+
+    private var emptyPanel: some View {
+        VStack(spacing: 9) {
+            Image(systemName: displayedLibrary == .glasses ? "photo.on.rectangle" : "tray")
+                .font(.system(size: 31, weight: .light))
+                .foregroundStyle(GlassesTheme.accent)
+                .accessibilityHidden(true)
+            Text(emptyMessage)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(.vertical, 20)
+        .frame(maxWidth: .infinity)
+        .glassesPanel()
+    }
+
+    private var emptyMessage: String {
+        if filter != .all { return "没有符合筛选条件的媒体。" }
+        if displayedLibrary == .local { return "导入的照片和视频会显示在这里。" }
+        return g.busy ? "等待眼镜返回相册…" : "眼镜相册没有可显示的媒体。"
+    }
+
+    private func mediaTile(_ capture: Capture, presentOnGlasses: Bool) -> some View {
+        let item = AlbumMediaSelection(id: capture.id, isPhoto: capture.isPhoto,
+                                       original: g.localMediaURL(for: capture), thumbnail: g.thumbs[capture.id])
+        let saved = g.importedCaptures[capture.id] != nil
+        return CaptureTile(capture: capture,
+                           media: item,
+                           imported: saved,
+                           working: inFlight == capture.id,
+                           failed: failed.contains(capture.id),
+                           fraction: g.progress[capture.id] ?? 0,
+                           canFetch: canStartTransfer && presentOnGlasses,
+                           presentOnGlasses: g.canUseGlasses && presentOnGlasses,
+                           onOpen: { preview = item },
+                           onTransfer: { transfer([capture], originalOnly: saved) })
+    }
+
+    private func transfer(_ queue: [Capture], originalOnly: Bool = false) {
+        guard canStartTransfer, let first = queue.first else { return }
         inFlight = first.id
         Task { @MainActor in
             defer { inFlight = nil }
-            for capture in queue where g.importedCaptures[capture.id] == nil {
+            for capture in queue {
                 guard g.canUseGlasses, !Task.isCancelled else { break }
+                if !originalOnly && g.importedCaptures[capture.id] != nil { continue }
                 inFlight = capture.id
                 failed.remove(capture.id)
-                if !(await g.importCapture(capture)) {
-                    failed.insert(capture.id)
-                }
+                let ok: Bool
+                if originalOnly { ok = await g.cacheOriginal(capture) }
+                else { ok = await g.importCapture(capture) }
+                if !ok { failed.insert(capture.id) }
             }
         }
     }
@@ -341,54 +382,58 @@ struct AlbumTab: View {
 
 private struct CaptureTile: View {
     let capture: Capture
-    let thumbnail: UIImage?
+    let media: AlbumMediaSelection
     let imported: Bool
     let working: Bool
     let failed: Bool
     let fraction: Double
-    let canImport: Bool
-    let onPreview: () -> Void
-    let onImport: () -> Void
+    let canFetch: Bool
+    let presentOnGlasses: Bool
+    let onOpen: () -> Void
+    let onTransfer: () -> Void
 
     private var progress: Double { fraction.isFinite ? min(1, max(0, fraction)) : 0 }
+    private var hasOriginal: Bool { media.original != nil }
+    private var canOpen: Bool { hasOriginal || media.thumbnail != nil || imported }
+    private var mediaKind: String { capture.isPhoto ? "照片" : "视频" }
+    private var openTitle: String {
+        if hasOriginal { return capture.isPhoto ? "查看原图" : "播放视频" }
+        if media.thumbnail != nil { return capture.isPhoto ? "看预览图" : "看视频封面" }
+        return "查看详情"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if thumbnail != nil {
-                Button(action: onPreview) { cover }
+            if canOpen {
+                Button(action: onOpen) { cover }
                     .buttonStyle(.plain)
-                    .accessibilityLabel(capture.isPhoto ? "打开照片预览图" : "查看视频封面")
+                    .accessibilityLabel(Text(openTitle))
             } else {
                 cover
             }
-            VStack(alignment: .leading, spacing: 9) {
+            VStack(alignment: .leading, spacing: 7) {
                 let time = clockText(capture.timestampNS)
                 Text(time.isEmpty ? mediaKind : time)
                     .font(.subheadline.weight(.semibold))
                 Text(sizeText(capture.assets.reduce(0) { $0 + $1.size }))
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                importControl
+                primaryControl
             }
-            .padding(11)
+            .padding(10)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(GlassesTheme.surface, in: RoundedRectangle(cornerRadius: 16))
-        .clipShape(RoundedRectangle(cornerRadius: 16))
-        .overlay { RoundedRectangle(cornerRadius: 16).strokeBorder(GlassesTheme.edge).allowsHitTesting(false) }
+        .background(GlassesTheme.surface, in: RoundedRectangle(cornerRadius: 14))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(GlassesTheme.edge).allowsHitTesting(false) }
     }
 
-    private var mediaKind: String { capture.isPhoto ? "照片" : "视频" }
-
     private var cover: some View {
-        LinearGradient(
-            colors: [GlassesTheme.console, capture.isPhoto ? Color(red: 0.13, green: 0.44, blue: 0.45)
-                     : Color(red: 0.24, green: 0.27, blue: 0.47)],
-            startPoint: .topLeading, endPoint: .bottomTrailing
-        )
-        .aspectRatio(1.15, contentMode: .fit)
+        LinearGradient(colors: [GlassesTheme.console, Color(red: 0.10, green: 0.35, blue: 0.36)],
+                       startPoint: .topLeading, endPoint: .bottomTrailing)
+        .aspectRatio(1.18, contentMode: .fit)
         .overlay {
-            if let thumbnail {
+            if let thumbnail = media.thumbnail {
                 GeometryReader { bounds in
                     Image(uiImage: thumbnail)
                         .resizable()
@@ -398,8 +443,16 @@ private struct CaptureTile: View {
                 }
             } else {
                 Image(systemName: capture.isPhoto ? "photo" : "video")
-                    .font(.system(size: 28, weight: .light))
+                    .font(.system(size: 26, weight: .light))
                     .foregroundStyle(.white.opacity(0.8))
+                    .accessibilityHidden(true)
+            }
+            if !capture.isPhoto && hasOriginal {
+                Image(systemName: "play.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .padding(11)
+                    .background(.black.opacity(0.7), in: Circle())
+                    .foregroundStyle(.white)
                     .accessibilityHidden(true)
             }
         }
@@ -407,40 +460,51 @@ private struct CaptureTile: View {
             Text(mediaKind)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.white)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(.black.opacity(0.7), in: Capsule())
-                .padding(8)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(.black.opacity(0.72), in: Capsule())
+                .padding(7)
         }
     }
 
     @ViewBuilder
-    private var importControl: some View {
+    private var primaryControl: some View {
         if working {
             if progress > 0 {
                 ProgressView(value: progress) {
-                    Text("导入中 \(Int(progress * 100))%")
-                        .font(.caption.monospacedDigit())
+                    Text("传输中 \(Int(progress * 100))%").font(.caption.monospacedDigit())
                 }
             } else {
-                ProgressView("导入中").font(.caption)
+                ProgressView("处理中").font(.caption)
             }
-        } else if imported {
-            Label("已导入", systemImage: "checkmark.circle.fill")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(GlassesTheme.accent)
-                .frame(minHeight: 44, alignment: .leading)
-        } else {
-            Button(action: onImport) {
-                Label(failed ? "重试导入" : "导入原件",
-                      systemImage: failed ? "arrow.clockwise" : "arrow.down")
+        } else if imported && hasOriginal {
+            Button(action: onOpen) {
+                Label(openTitle, systemImage: capture.isPhoto ? "arrow.up.left.and.arrow.down.right" : "play")
                     .font(.caption.weight(.semibold))
-                    .frame(maxWidth: .infinity, minHeight: 36)
+                    .frame(maxWidth: .infinity, minHeight: 33)
             }
             .buttonStyle(.bordered)
-            .tint(failed ? .orange : GlassesTheme.accent)
-            .disabled(!canImport)
+        } else if imported {
+            Text(media.thumbnail == nil ? "已导入系统照片" : (capture.isPhoto ? "仅有预览图" : "仅有视频封面"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if presentOnGlasses { transferButton(failed ? "重试下载" : "获取原件") }
+        } else if presentOnGlasses {
+            transferButton(failed ? "重试导入" : "导入原件")
+        } else if hasOriginal {
+            Label("已保存在 App", systemImage: "internaldrive").font(.caption).foregroundStyle(.secondary)
         }
+    }
+
+    private func transferButton(_ title: String) -> some View {
+        Button(action: onTransfer) {
+            Label(title, systemImage: failed ? "arrow.clockwise" : "arrow.down")
+                .font(.caption.weight(.semibold))
+                .frame(maxWidth: .infinity, minHeight: 33)
+        }
+        .buttonStyle(.bordered)
+        .tint(failed ? .orange : GlassesTheme.accent)
+        .disabled(!canFetch)
     }
 }
 
@@ -449,6 +513,7 @@ private struct CaptureTile: View {
 struct ShootTab: View {
     @ObservedObject var g: Glasses
     let openDevice: () -> Void
+    let openAlbum: () -> Void
     @State private var mode: CaptureMode = .photo
     @State private var showLive = false
 
@@ -478,14 +543,7 @@ struct ShootTab: View {
             ScrollView {
                 VStack(spacing: 14) {
                     cameraStage
-                    if g.canUseGlasses {
-                        shutterControls
-                        Button { showLive = true } label: {
-                            Label("实时取景（实验）", systemImage: "viewfinder")
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(g.busy || g.recording || g.assistantOn)
-                    } else {
+                    if !g.canUseGlasses {
                         Button(g.connected ? "验证主人身份" : "连接眼镜") { openDevice() }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.large)
@@ -505,6 +563,14 @@ struct ShootTab: View {
                 .padding(18)
             }
             .background(GlassesTheme.page.ignoresSafeArea())
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if g.canUseGlasses {
+                    shutterControls
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 8)
+                        .background(.ultraThinMaterial)
+                }
+            }
             .navigationTitle("拍摄")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -603,31 +669,58 @@ struct ShootTab: View {
                 .disabled(g.busy || g.recording)
             }
 
-            Button {
-                if g.recording || mode == .video { g.toggleRecording() }
-                else { g.snap() }
-            } label: {
-                VStack(spacing: 7) {
-                    ZStack {
-                        Circle()
-                            .fill(GlassesTheme.console)
-                            .frame(width: 78, height: 78)
-                        Circle()
-                            .strokeBorder(shutterColor, lineWidth: 2)
-                            .frame(width: 67, height: 67)
-                        RoundedRectangle(cornerRadius: g.recording ? 5 : 26)
-                            .fill(shutterColor)
-                            .frame(width: g.recording ? 26 : 52, height: g.recording ? 26 : 52)
+            HStack(alignment: .center, spacing: 12) {
+                Button(action: openAlbum) {
+                    VStack(spacing: 6) {
+                        Image(systemName: "photo.on.rectangle")
+                            .font(.title3.weight(.medium))
+                        Text("相册").font(.caption)
                     }
-                    .accessibilityHidden(true)
-                    Text(shutterTitle).font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity, minHeight: 48)
                 }
+                .buttonStyle(.plain)
+
+                shutterButton
+
+                Button { showLive = true } label: {
+                    VStack(spacing: 6) {
+                        Image(systemName: "viewfinder")
+                            .font(.title3.weight(.medium))
+                        Text("实验取景").font(.caption)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 48)
+                }
+                .buttonStyle(.plain)
+                .disabled(g.busy || g.recording || g.assistantOn)
             }
-            .buttonStyle(.plain)
-            .disabled(g.busy)
-            .opacity(g.busy ? 0.50 : 1)
         }
-        .glassesPanel()
+        .glassesPanel(padding: 12)
+    }
+
+    private var shutterButton: some View {
+        Button {
+            if g.recording || mode == .video { g.toggleRecording() }
+            else { g.snap() }
+        } label: {
+            VStack(spacing: 6) {
+                ZStack {
+                    Circle()
+                        .fill(GlassesTheme.console)
+                        .frame(width: 72, height: 72)
+                    Circle()
+                        .strokeBorder(shutterColor, lineWidth: 2)
+                        .frame(width: 63, height: 63)
+                    RoundedRectangle(cornerRadius: g.recording ? 5 : 24)
+                        .fill(shutterColor)
+                        .frame(width: g.recording ? 25 : 48, height: g.recording ? 25 : 48)
+                }
+                .accessibilityHidden(true)
+                Text(shutterTitle).font(.subheadline.weight(.semibold))
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(g.busy || g.assistantOn)
+        .opacity(g.busy || g.assistantOn ? 0.5 : 1)
     }
 
     private func timerText(_ deadline: Date, now: Date) -> String {
@@ -643,55 +736,122 @@ struct AssistantTab: View {
     let openDevice: () -> Void
     @State private var question = ""
     @State private var showModel = false
+    @State private var includePhoto = false
     @FocusState private var typing: Bool
 
     var body: some View {
         NavigationStack {
-            List {
-                Section("眼镜语音") {
-                    Button {
-                        if g.assistantOn { g.stopAssistant() } else { g.startAssistant() }
-                    } label: {
-                        Label(g.assistantOn ? "停止眼镜语音" : "启用眼镜语音",
-                              systemImage: g.assistantOn ? "mic.slash" : "mic")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    modelCard
+                    voiceCard
+                    if !g.assistantAnswer.isEmpty {
+                        responseCard(title: "眼镜语音回复", text: g.assistantAnswer)
                     }
-                    .disabled(!g.canUseGlasses || g.busy || g.recording || g.live != nil)
-                    if let message = g.mediaMessage, g.canUseGlasses {
-                        Text(message).font(.footnote).foregroundStyle(.secondary)
-                    }
-                }
-                Section("照片问答") {
-                    TextField("这是什么？前面有台阶吗？", text: $question, axis: .vertical)
-                        .lineLimit(1...4)
-                        .focused($typing)
-                    Button {
-                        typing = false
-                        g.ask(question)
-                    } label: {
-                        Label(g.askingModel ? "正在问…" : "带上最近一张照片问", systemImage: "paperplane")
-                    }
-                    .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              || g.askingModel || g.lastPhoto == nil)
-                    if g.lastPhoto == nil {
-                        Text("先拍摄或导入一张照片。").font(.footnote).foregroundStyle(.secondary)
+                    if g.askingModel {
+                        ProgressView("正在请求 \(g.modelName)…").glassesPanel()
+                    } else if !g.answer.isEmpty {
+                        responseCard(title: "输入问答", text: g.answer)
                     }
                 }
-
-                if !g.answer.isEmpty {
-                    Section("回答") {
-                        Text(g.answer).textSelection(.enabled)
-                    }
-                }
+                .padding(18)
             }
+            .background(GlassesTheme.page.ignoresSafeArea())
+            .scrollDismissesKeyboard(.interactively)
+            .safeAreaInset(edge: .bottom) { composer }
             .navigationTitle("助手")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { StatusCapsule(g: g) { openDevice() } }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("模型") { showModel = true }
-                }
             }
             .sheet(isPresented: $showModel) { ModelSheet(g: g) }
         }
+    }
+
+    private var modelCard: some View {
+        Button {
+            showModel = true
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "sparkle").foregroundStyle(GlassesTheme.accent)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("当前模型").font(.caption).foregroundStyle(.secondary)
+                    Text(g.modelName.isEmpty ? "选择模型" : g.modelName)
+                        .font(.headline)
+                        .lineLimit(2)
+                }
+                Spacer(minLength: 8)
+                Label("设置", systemImage: "chevron.forward")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(GlassesTheme.accent)
+            }
+            .contentShape(Rectangle())
+            .glassesPanel()
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var voiceCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("眼镜语音", systemImage: "mic")
+                .font(.headline)
+            if g.assistantRegistering {
+                ProgressView("等眼镜确认注册…").font(.subheadline)
+            } else if g.canUseGlasses {
+                Button(g.assistantOn ? "结束眼镜语音" : "启用眼镜语音") {
+                    if g.assistantOn { g.stopAssistant() } else { g.startAssistant() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(!g.assistantOn && !g.canStartAssistant)
+            } else {
+                Button("连接眼镜") { openDevice() }.buttonStyle(.bordered)
+            }
+            if let message = g.assistantMessage {
+                Text(message).font(.subheadline).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassesPanel()
+    }
+
+    private var composer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if g.hasPhotoForModel {
+                Toggle("附上最近一张照片", isOn: $includePhoto)
+                    .font(.footnote)
+            }
+            HStack(alignment: .bottom, spacing: 10) {
+                TextField("输入问题", text: $question, axis: .vertical)
+                    .lineLimit(1...4)
+                    .focused($typing)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(GlassesTheme.surface, in: RoundedRectangle(cornerRadius: 13))
+                Button {
+                    let prompt = question
+                    question = ""
+                    typing = false
+                    g.ask(prompt, includePhoto: includePhoto && g.hasPhotoForModel)
+                } label: {
+                    Image(systemName: "arrow.up").font(.headline.weight(.bold))
+                        .frame(minWidth: 32, minHeight: 30)
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityLabel("发送问题")
+                .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || g.askingModel)
+            }
+        }
+        .padding(14)
+        .background(.regularMaterial)
+    }
+
+    private func responseCard(title: String, text: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(GlassesTheme.accent)
+            Text(text).textSelection(.enabled)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassesPanel()
     }
 }
 
@@ -799,6 +959,7 @@ struct DeviceTabBody: View {
     @State private var showQuick = false
     @State private var showDiagnostics = false
     @State private var showAbout = false
+    @State private var showMicrophoneCheck = false
 
     private var candidates: [ScanEntry] {
         g.primaryDevices.sorted { $0.isListedBefore($1) }
@@ -829,6 +990,7 @@ struct DeviceTabBody: View {
                     }
                     .glassesPanel()
                 }
+                audioPanel
                 advancedPanel
             }
             .padding(18)
@@ -838,6 +1000,7 @@ struct DeviceTabBody: View {
         .sheet(isPresented: $showSettings) { SettingsView(g: g) }
         .sheet(isPresented: $showDiagnostics) { NavigationStack { ContentView(g: g) } }
         .sheet(isPresented: $showAbout) { AboutView() }
+        .sheet(isPresented: $showMicrophoneCheck) { MicrophoneCheckView(glassesName: g.connectedGlassesName) }
     }
 
     private var connectionPanel: some View {
@@ -905,16 +1068,20 @@ struct DeviceTabBody: View {
     }
 
     private var statusPanel: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 13) {
             HStack {
-                Text("设备状态").font(.headline)
+                Text("眼镜状态").font(.headline)
                 Spacer()
+                if g.statusRefreshing {
+                    ProgressView().controlSize(.small)
+                        .accessibilityLabel("正在读取眼镜状态")
+                }
                 Button { g.refreshStatus() } label: {
                     Image(systemName: "arrow.clockwise")
-                        .frame(minWidth: 44, minHeight: 30)
+                        .frame(minWidth: 44, minHeight: 34)
                 }
-                .accessibilityLabel("刷新设备状态")
-                .disabled(g.busy)
+                .accessibilityLabel("刷新眼镜状态")
+                .disabled(g.statusRefreshing)
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 180 : 89), spacing: 8)], spacing: 8) {
                 statusMetric("电量", value: g.status.batteryPercent.map { "\($0)%" },
@@ -922,8 +1089,40 @@ struct DeviceTabBody: View {
                 statusMetric("可用空间", value: g.status.storageFreeMb.map(storageText), icon: "internaldrive")
                 statusMetric("眼镜音量", value: g.status.volumePercent.map { "\($0)%" }, icon: "speaker.wave.2")
             }
+            if let message = g.statusMessage {
+                Text(message).font(.footnote).foregroundStyle(.secondary)
+            }
         }
         .glassesPanel()
+    }
+
+    private var audioPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: g.audioRouteUsesBluetooth ? "headphones" : "speaker.wave.2")
+                    .font(.title3)
+                    .foregroundStyle(GlassesTheme.accent)
+                    .frame(width: 28)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("系统音频输出").font(.headline)
+                    Text(g.audioRouteName)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    if let profile = g.audioMediaProfile {
+                        Text(profile)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+                AudioOutputPicker()
+                    .frame(width: 44, height: 44)
+            }
+            Divider()
+            actionRow("测试眼镜麦克风", icon: "mic") { showMicrophoneCheck = true }
+        }
+        .glassesPanel(padding: 13)
     }
 
     private func statusMetric(_ title: String, value: String?, icon: String) -> some View {

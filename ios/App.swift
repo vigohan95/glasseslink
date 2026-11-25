@@ -7,6 +7,7 @@
 
 import SwiftUI
 import AVFoundation
+import Combine
 import CoreBluetooth
 import CryptoKit
 import Photos
@@ -115,6 +116,7 @@ final class Glasses: NSObject, ObservableObject {
     @Published var trustLine = "未验证"
     /// Per-capture transfer fraction, filled from the glasses' own byte counts.
     @Published var progress: [String: Double] = [:]
+    @Published private(set) var transferDetail: String?
     @Published var glassesLine = "未连接"
     @Published var lastPhoto: Data?
     @Published var answer = ""
@@ -129,14 +131,24 @@ final class Glasses: NSObject, ObservableObject {
     @Published var settings: [String: String] = [:]
     @Published var settingsLoading = false
     @Published var status = GlassesState()
+    @Published private(set) var statusRefreshing = false
+    @Published private(set) var statusMessage: String?
+    private var statusRefreshPending = false
+    private var loadCatalogAfterStatus = false
+    @Published private(set) var audioRouteName = "未检测到媒体输出"
+    @Published private(set) var audioRouteUsesBluetooth = false
+    @Published private(set) var audioMediaProfile: String?
+    private var audioRouteObserver: AnyCancellable?
     @Published var captures: [Capture] = []
     @Published private(set) var importedCaptures: [String: Capture] = {
         guard let data = UserDefaults.standard.data(forKey: "importedCaptureRecords") else { return [:] }
         return (try? JSONDecoder().decode([String: Capture].self, from: data)) ?? [:]
     }()
+    @Published private var localMediaIndex = LocalMediaLibrary.load()
+    var localCaptures: [Capture] { localMediaIndex.values.map(\.capture) }
     @Published var thumbs: [String: UIImage] = [:]
     @Published var recording = false
-    @Published var lastVideo: Data?
+    @Published private(set) var lastVideoURL: URL?
     @Published var live: LiveStream?
     @Published var liveLine = "—"
     @Published var selfTestLines: [SelfTest.Line] = []
@@ -179,6 +191,9 @@ final class Glasses: NSObject, ObservableObject {
     override init() {
         super.init()
         ModelCredentials.migrateLegacyKey(for: modelBaseURL)
+        readAudioOutput()
+        audioRouteObserver = NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)
+            .sink { [weak self] _ in Task { @MainActor in self?.readAudioOutput() } }
         central = CBCentralManager(delegate: self, queue: .main,
                                    options: [CBCentralManagerOptionRestoreIdentifierKey: "dev.local.glasseslink.central"])
         if let k = OwnerMaterial.loadFromKeychain() {
@@ -435,6 +450,7 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     var canUseGlasses: Bool { connected && ownerState == .verified && session != nil }
+    var connectedGlassesName: String? { canUseGlasses ? peripheral?.name : nil }
 
     // MARK: link bring-up
 
@@ -493,6 +509,10 @@ final class Glasses: NSObject, ObservableObject {
             connectionStartedAt = nil
             UserDefaults.standard.set(trust ? "verified" : "unverified", forKey: "ownerState")
             UserDefaults.standard.set(Self.ts(), forKey: "ownerStateAt")
+            if trust {
+                loadCatalogAfterStatus = true
+                refreshStatus()
+            }
         } catch {
             guard session === sess else { return }
             trustLine = Glasses.explain(error)
@@ -577,6 +597,10 @@ final class Glasses: NSObject, ObservableObject {
         ownerRegistrationCompleted = false
         busy = false
         settingsLoading = false
+        loadCatalogAfterStatus = false
+        statusRefreshPending = false
+        statusRefreshing = false
+        statusMessage = nil
         settings = [:]
         status = GlassesState()
         recording = false
@@ -590,6 +614,10 @@ final class Glasses: NSObject, ObservableObject {
         assistantRef?.stop()
         assistantRef = nil
         assistantOn = false
+        assistantRegistering = false
+        assistantMessage = nil
+        assistantAnswer = ""
+        resetVoiceTurn()
     }
 
     private func failConnection(_ reason: String, peripheral p: CBPeripheral, underlying: Error? = nil) {
@@ -701,7 +729,12 @@ final class Glasses: NSObject, ObservableObject {
         }
         busy = true
         mediaMessage = nil
-        defer { if session === active { busy = false } }
+        defer {
+            if session === active {
+                busy = false
+                startPendingStatusRefresh()
+            }
+        }
         do {
             return try await action(active)
         } catch {
@@ -745,9 +778,23 @@ final class Glasses: NSObject, ObservableObject {
         } ?? false
     }
 
+    func localMediaURL(for capture: Capture) -> URL? {
+        localMediaIndex[capture.id].flatMap(LocalMediaLibrary.url(for:))
+    }
+
+    func cacheOriginal(_ capture: Capture) async -> Bool {
+        await withGlassesOperation { active in
+            try await downloadCapture(capture, from: active, save: false)
+        } ?? false
+    }
+
     private func downloadCapture(_ capture: Capture, from active: Session, save: Bool) async throws -> Bool {
         let id = capture.id
         if save, importedCaptures[id] != nil { return true }
+        if let existing = localMediaURL(for: capture) {
+            if save { try await saveImportedCapture(capture, file: existing, transfer: nil, session: active) }
+            return true
+        }
         let candidates = capture.isPhoto ? capture.stills : capture.assets.filter { $0.type == 1 }
         let asset = candidates.max { $0.size < $1.size }
         guard let asset else {
@@ -755,42 +802,81 @@ final class Glasses: NSObject, ObservableObject {
         }
         progress[id] = 0
         mediaMessage = "正在从眼镜导入…"
-        defer { progress.removeValue(forKey: id) }
+        transferDetail = "蓝牙 · 等待文件"
+        defer {
+            progress.removeValue(forKey: id)
+            transferDetail = nil
+        }
+        let started = Date()
         let transfer = try await onGlassesQueue { [weak self] in
             try active.requestAsset(handle: capture.handle, assetID: asset.uuid)
             var lastUpdate = ContinuousClock.now
-            return try active.receiveFile(timeout: 300) { got, total in
+            var sampleStart = Date()
+            let maximumDuration = max(300, Double(asset.size) / 8_192)
+            return try active.receiveFile(timeout: 45, maximumDuration: maximumDuration) { got, total in
                 let now = ContinuousClock.now
-                guard got == total || lastUpdate.duration(to: now) >= .milliseconds(100) else { return }
+                if got == 0 { sampleStart = Date() }
+                guard got == total || lastUpdate.duration(to: now) >= .milliseconds(250) else { return }
                 lastUpdate = now
+                let seconds = Date().timeIntervalSince(sampleStart)
+                let bytesPerSecond = seconds >= 1 && got > 0 ? Double(got) / seconds : 0
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.session === active, self.progress[id] != nil, total > 0 else { return }
                     self.progress[id] = Double(got) / Double(total)
+                    if bytesPerSecond > 0 {
+                        let rate = String(format: "%.0f KB/s", bytesPerSecond / 1_000)
+                        let remaining = Int(min(86_400, ceil(Double(max(0, total - got)) / bytesPerSecond)))
+                        let eta = remaining < 60 ? "\(remaining) 秒" : "\((remaining + 59) / 60) 分钟"
+                        self.transferDetail = "蓝牙 · \(rate) · 约 \(eta)"
+                    } else {
+                        self.transferDetail = "蓝牙 · 正在接收"
+                    }
                 }
             }
         }
         try checkActive(active)
         guard let transfer else { throw LinkError.unexpected("眼镜没有发送文件") }
-        note("收到 \(transfer.name) \(transfer.size)B")
+        let elapsed = Date().timeIntervalSince(started)
+        note("蓝牙导入 \(transfer.size)B · \(String(format: "%.1f", elapsed)) 秒")
+        if session === active { transferDetail = nil }
+        let file: URL?
+        do {
+            let item = try await onGlassesQueue {
+                try LocalMediaLibrary.store(transfer.data, capture: capture, originalName: transfer.name)
+            }
+            localMediaIndex[id] = item
+            LocalMediaLibrary.saveIndex(localMediaIndex)
+            file = LocalMediaLibrary.url(for: item)
+        } catch {
+            guard save else { throw error }
+            note("App 原件缓存失败：\(error.localizedDescription)")
+            file = nil
+        }
         if capture.isPhoto {
             lastPhoto = transfer.data
             rememberThumb(id, transfer.data)
-        } else {
-            lastVideo = transfer.data
-            rememberVideoThumb(id, transfer.data)
+        } else if let file {
+            lastVideoURL = file
+            rememberVideoThumb(id, file)
         }
         guard save else {
-            mediaMessage = "文件已接收。"
+            if session === active { mediaMessage = "原件已保存到 App，可直接打开。" }
             return true
         }
-        mediaMessage = "正在存入 iPhone 相册…"
-        try await persistCapture(transfer.data, isPhoto: capture.isPhoto)
-        importedCaptures[id] = capture
+        try await saveImportedCapture(capture, file: file, transfer: transfer.data, session: active)
+        return true
+    }
+
+    private func saveImportedCapture(_ capture: Capture, file: URL?, transfer: Data?, session active: Session) async throws {
+        if session === active { mediaMessage = "正在存入 iPhone 相册…" }
+        try await persistCapture(transfer, isPhoto: capture.isPhoto, original: file)
+        importedCaptures[capture.id] = capture
         if let data = try? JSONEncoder().encode(importedCaptures) {
             UserDefaults.standard.set(data, forKey: "importedCaptureRecords")
         }
-        if session === active { mediaMessage = "已存入 iPhone 相册。" }
-        return true
+        if session === active {
+            mediaMessage = file == nil ? "已存入 iPhone 相册，App 本机原件未保存。" : "已存入 iPhone 相册，也可在 App 内打开。"
+        }
     }
 
     func snap() {
@@ -922,11 +1008,35 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     func refreshStatus() {
+        guard canUseGlasses, !statusRefreshing else { return }
+        statusRefreshPending = true
+        statusMessage = "将在当前眼镜操作结束后读取。"
+        startPendingStatusRefresh()
+    }
+
+    private func startPendingStatusRefresh() {
+        guard statusRefreshPending, canUseGlasses, let active = session, !busy, !settingsLoading,
+              live == nil, assistantRef == nil else { return }
+        statusRefreshPending = false
+        statusRefreshing = true
+        statusMessage = nil
+        busy = true
+        note("读取眼镜设备状态")
         Task {
-            _ = await withGlassesOperation { active in
+            defer {
+                if session === active {
+                    statusRefreshing = false
+                    busy = false
+                    if loadCatalogAfterStatus {
+                        loadCatalogAfterStatus = false
+                        loadCaptures()
+                    }
+                }
+            }
+            do {
                 let current = try await onGlassesQueue { try active.subscribeStatus() }
                 try checkActive(active)
-                status = current
+                status.mergeReported(from: current)
                 if let camera = current.camera {
                     recording = camera == Status.cameraName(Status.videoStarted)
                     if !recording {
@@ -936,58 +1046,159 @@ final class Glasses: NSObject, ObservableObject {
                         autoStopTask = nil
                     }
                 }
+            } catch {
+                guard session === active else { return }
+                statusMessage = Glasses.explain(error)
+                note("读取设备状态失败：\(error)")
+                if case LinkError.badMAC = error, let p = peripheral {
+                    failConnection("设备状态校验失败，正在恢复连接。", peripheral: p)
+                }
             }
         }
     }
 
     // MARK: assistant takeover
 
-    @Published var assistantOn = false
+    @Published private(set) var assistantOn = false
+    @Published private(set) var assistantRegistering = false
+    @Published private(set) var assistantMessage: String?
+    @Published private(set) var assistantAnswer = ""
     private var assistantRef: Assistant?
+    private var voiceTurn: String?
+    private var submittedVoiceTurn: String?
+    private var voiceWait: Task<Void, Never>?
+    private var voiceAnswer: Task<Void, Never>?
+
+    var canStartAssistant: Bool {
+        canUseGlasses && !busy && !settingsLoading && !recording && live == nil && assistantRef == nil
+    }
+
+    private func resetVoiceTurn() {
+        voiceWait?.cancel()
+        voiceWait = nil
+        voiceAnswer?.cancel()
+        voiceAnswer = nil
+        voiceTurn = nil
+        submittedVoiceTurn = nil
+    }
 
     /// svc15 registration: after this the glasses' own wake word routes to this app.
     func startAssistant() {
-        guard canUseGlasses, let sess = session, !busy, !settingsLoading,
-              !recording, live == nil, assistantRef == nil else { return }
+        guard canStartAssistant, let sess = session else { return }
+        guard ModelClient.baseComponents(modelBaseURL) != nil, !modelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            assistantMessage = "请先选择并保存助手模型。"
+            return
+        }
         let a = Assistant(session: sess)
+        assistantMessage = "正在等眼镜确认语音注册…"
+        assistantAnswer = ""
+        assistantRegistering = true
         a.log = { [weak self] line in self?.note("asst: \(line)") }
         a.onTurn = { [weak self, weak a] interaction in
-            guard let self, let a else { return }
-            Task {
-                guard self.assistantRef === a else { return }
-                let client = self.configuredModel
-                let q = "用户刚唤醒智能眼镜。只用一句不超过 20 字的简体中文回应用户。"
-                let text = (try? await client.ask(question: q)) ?? "我在。"
-                guard self.assistantRef === a else { return }
-                a.complete(interaction: interaction, text: text)
+            Task { @MainActor in
+                guard let self, let a, self.assistantRef === a, self.voiceTurn != interaction else { return }
+                self.resetVoiceTurn()
+                self.voiceTurn = interaction
+                self.assistantMessage = "已收到眼镜唤醒，等待你说完问题…"
+                self.voiceWait = Task { [weak self, weak a] in
+                    do { try await Task.sleep(nanoseconds: 12_000_000_000) } catch { return }
+                    guard let self, let a, self.assistantRef === a, self.voiceTurn == interaction else { return }
+                    self.assistantMessage = "收到唤醒，但没有收到问题文字。可以再说一次，或直接输入。"
+                }
             }
         }
-        // The glasses' own speech recognition finished a sentence: answer it with the model.
         a.onTranscript = { [weak self, weak a] transcript, interaction in
-            guard let self, let a else { return }
-            Task {
-                guard self.assistantRef === a else { return }
-                let client = self.configuredModel
-                let q = "用户戴着智能眼镜说：“\(transcript)”。用不超过 40 字的简体中文直接回答，不用复述问题。"
-                let text = (try? await client.ask(question: q)) ?? "模型暂时无法连接。"
-                guard self.assistantRef === a else { return }
-                a.complete(interaction: interaction, text: text)
+            Task { @MainActor in
+                guard let self, let a, self.assistantRef === a else { return }
+                self.answerVoiceQuestion(transcript, interaction: interaction, assistant: a)
+            }
+        }
+        a.onTurnEnded = { [weak self, weak a] interaction in
+            Task { @MainActor in
+                guard let self, let a, self.assistantRef === a, self.voiceTurn == interaction,
+                      self.submittedVoiceTurn != interaction else { return }
+                self.voiceWait?.cancel()
+                self.assistantMessage = "眼镜已结束这轮语音，App 没收到问题文字。"
+            }
+        }
+        a.onFailure = { [weak self, weak a] error in
+            Task { @MainActor in
+                guard let self, let a, self.assistantRef === a else { return }
+                self.finishAssistantFailure(error, session: sess)
             }
         }
         assistantRef = a
         busy = true
         Task {
-            defer { if self.session === sess { self.busy = false } }
+            defer {
+                if self.session === sess {
+                    self.busy = false
+                    self.assistantRegistering = false
+                    self.startPendingStatusRefresh()
+                }
+            }
             do {
                 try await onGlassesQueue { try a.register() }
                 guard session === sess, assistantRef === a else { return }
                 a.startLoop()
                 assistantOn = true
-                note("助手接管已开启")
+                assistantMessage = "眼镜已确认注册。说「Hey Meta」，听到提示后说出问题。"
+                note("眼镜确认了助手注册")
             } catch {
                 guard session === sess, assistantRef === a else { return }
-                assistantRef = nil
-                reportOperationError(error, session: sess)
+                finishAssistantFailure(error, session: sess)
+            }
+        }
+    }
+
+    private func finishAssistantFailure(_ error: Error, session active: Session) {
+        assistantRef?.stop()
+        assistantRef = nil
+        assistantOn = false
+        assistantRegistering = false
+        resetVoiceTurn()
+        assistantMessage = "眼镜语音未就绪 · \(Glasses.explain(error))"
+        note("眼镜语音故障：\(error)")
+        if case LinkError.badMAC = error, let p = peripheral, session === active {
+            failConnection("眼镜语音连接校验失败。", peripheral: p)
+        } else {
+            startPendingStatusRefresh()
+        }
+    }
+
+    private func answerVoiceQuestion(_ transcript: String, interaction: String, assistant: Assistant) {
+        let question = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty, submittedVoiceTurn != interaction else { return }
+        if voiceTurn != interaction { resetVoiceTurn() }
+        voiceTurn = interaction
+        submittedVoiceTurn = interaction
+        voiceWait?.cancel()
+        assistantAnswer = ""
+        let client = configuredModel
+        assistantMessage = "已收到问题，正在调用 \(client.model)…"
+        voiceAnswer = Task { [weak self, weak assistant] in
+            guard let self, let assistant else { return }
+            let text: String
+            do {
+                text = try await client.ask(question: "请用简洁的口语回答下面的问题，方便眼镜朗读。当前只收到文字，没有图片。\n\n\(question)")
+            } catch {
+                guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
+                self.assistantMessage = "模型请求失败 · \(Glasses.explain(error))"
+                self.note("眼镜语音的模型请求失败")
+                return
+            }
+            guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
+            self.assistantAnswer = text
+            do {
+                try await self.onGlassesQueue {
+                    try assistant.complete(interaction: interaction, text: text, transcript: question)
+                }
+                guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
+                self.assistantMessage = "模型已回复，已将回答发给眼镜。"
+                self.note("将模型回复发给眼镜")
+            } catch {
+                guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
+                self.assistantMessage = "模型已回复，眼镜播报发送失败 · \(Glasses.explain(error))"
             }
         }
     }
@@ -997,6 +1208,7 @@ final class Glasses: NSObject, ObservableObject {
         assistantRef.stop()
         self.assistantRef = nil
         assistantOn = false
+        resetVoiceTurn()
         reconnect(forRegistration: false)
         note("助手接管已关闭")
     }
@@ -1039,20 +1251,46 @@ final class Glasses: NSObject, ObservableObject {
         liveTicker = nil
         self.live = nil
         liveLine = "—"
-        guard live.phase != .failed, live.phase != .idle else { return }
+        guard live.phase != .failed, live.phase != .idle else {
+            startPendingStatusRefresh()
+            return
+        }
         live.stop()
         reconnect(forRegistration: false)
     }
 
     func shareVideo() {
-        guard let data = lastVideo else { note("还没有视频"); return }
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("capture.mp4")
-        do {
-            try data.write(to: url)
-            share = ShareBox(url: url)
-        } catch {
-            note("写临时文件失败：\(error)")
+        guard let url = lastVideoURL else { note("还没有视频"); return }
+        share = ShareBox(url: url)
+    }
+
+    func readAudioOutput() {
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        let route = outputs.map { $0.portType == .builtInSpeaker ? "iPhone 扬声器" : $0.portName }
+            .joined(separator: "、")
+        audioRouteName = route.isEmpty ? "未检测到媒体输出" : route
+        audioRouteUsesBluetooth = outputs.contains {
+            [.bluetoothA2DP, .bluetoothLE, .bluetoothHFP].contains($0.portType)
         }
+        let activeType = outputs.first?.portType
+        switch activeType {
+        case .bluetoothA2DP: audioMediaProfile = "蓝牙立体声 · A2DP"
+        case .bluetoothHFP: audioMediaProfile = "蓝牙通话模式 · HFP"
+        case .bluetoothLE: audioMediaProfile = "蓝牙 LE 音频"
+        default: audioMediaProfile = nil
+        }
+    }
+
+    func beginVideoPlayback() throws {
+        let audio = AVAudioSession.sharedInstance()
+        try audio.setCategory(.playback, mode: .moviePlayback)
+        try audio.setActive(true)
+        readAudioOutput()
+    }
+
+    func endVideoPlayback() {
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        readAudioOutput()
     }
 
     // MARK: thumbnails (kept on disk so the album works offline)
@@ -1101,16 +1339,21 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
-    private func persistCapture(_ data: Data, isPhoto: Bool) async throws {
+    private func persistCapture(_ data: Data?, isPhoto: Bool, original: URL? = nil) async throws {
         let authorization = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
         guard authorization == .authorized || authorization == .limited else {
             throw LinkError.io("请允许 GlassesLink 添加到 iPhone 相册。")
         }
-        if isPhoto {
+        if let original {
+            try await PHPhotoLibrary.shared().performChanges {
+                PHAssetCreationRequest.forAsset().addResource(with: isPhoto ? .photo : .video,
+                                                              fileURL: original, options: nil)
+            }
+        } else if let data, isPhoto {
             try await PHPhotoLibrary.shared().performChanges {
                 PHAssetCreationRequest.forAsset().addResource(with: .photo, data: data, options: nil)
             }
-        } else {
+        } else if let data {
             let file = FileManager.default.temporaryDirectory
                 .appendingPathComponent("import-\(UUID().uuidString).mp4")
             defer { try? FileManager.default.removeItem(at: file) }
@@ -1118,28 +1361,24 @@ final class Glasses: NSObject, ObservableObject {
             try await PHPhotoLibrary.shared().performChanges {
                 PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: file, options: nil)
             }
+        } else {
+            throw LinkError.io("找不到要保存的原件。")
         }
         note("已保存到 iPhone 相册")
     }
 
     /// Poster frame for a clip, using the first decodable frame.
-    func rememberVideoThumb(_ id: String, _ data: Data) {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("thumb-\(Self.safeName(id)).mp4")
-        do { try data.write(to: url) } catch { return }
+    func rememberVideoThumb(_ id: String, _ url: URL) {
         let asset = AVURLAsset(url: url)
         let gen = AVAssetImageGenerator(asset: asset)
         gen.appliesPreferredTrackTransform = true
         gen.maximumSize = CGSize(width: 336, height: 336)
-        let time = CMTime(seconds: 0.3, preferredTimescale: 600)
-        gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { [weak self] _, image, _, _, _ in
-            guard let image else { return }
-            let ui = UIImage(cgImage: image)
-            Task { @MainActor in
-                self?.thumbs[id] = ui
-                if let dir = Self.thumbDir, let jpeg = ui.jpegData(compressionQuality: 0.7) {
-                    try? jpeg.write(to: dir.appendingPathComponent(Self.safeName(id) + ".jpg"))
-                }
+        Task {
+            guard let first = try? await gen.image(at: .zero) else { return }
+            let ui = UIImage(cgImage: first.image)
+            thumbs[id] = ui
+            if let dir = Self.thumbDir, let jpeg = ui.jpegData(compressionQuality: 0.7) {
+                try? jpeg.write(to: dir.appendingPathComponent(Self.safeName(id) + ".jpg"), options: .atomic)
             }
         }
     }
@@ -1184,15 +1423,34 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
-    func ask(_ question: String) {
-        guard !askingModel, let photo = lastPhoto, !question.isEmpty else { return }
+    var hasPhotoForModel: Bool { lastPhoto != nil || latestLocalPhoto != nil }
+
+    private var latestLocalPhoto: URL? {
+        guard let capture = localCaptures.filter(\.isPhoto).max(by: { ($0.timestampNS ?? 0) < ($1.timestampNS ?? 0) }) else {
+            return nil
+        }
+        return localMediaURL(for: capture)
+    }
+
+    func ask(_ question: String, includePhoto: Bool = false) {
+        let question = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !askingModel, !question.isEmpty else { return }
+        let photo = includePhoto ? lastPhoto : nil
+        let photoURL = includePhoto && photo == nil ? latestLocalPhoto : nil
         let client = configuredModel
         askingModel = true
         answer = ""
         Task {
             defer { askingModel = false }
             do {
-                answer = try await client.ask(question: question, image: photo)
+                let image: Data?
+                if let photoURL {
+                    image = try await Task.detached { try Data(contentsOf: photoURL) }.value
+                } else {
+                    image = photo
+                }
+                if includePhoto && image == nil { throw LinkError.io("请先在相册导入一张照片。") }
+                answer = try await client.ask(question: question, image: image)
             } catch {
                 answer = "模型调用失败 · \(Glasses.explain(error))"
             }
@@ -1373,12 +1631,14 @@ final class Glasses: NSObject, ObservableObject {
                     self.settings = map
                     self.settingsLoading = false
                     self.note("设置：读到 \(map.count) 项")
+                    self.startPendingStatusRefresh()
                 }
             } catch {
                 DispatchQueue.main.async {
                     guard let self, self.session === sess else { return }
                     self.settingsLoading = false
                     self.reportOperationError(error, session: sess)
+                    self.startPendingStatusRefresh()
                 }
             }
         }
@@ -1419,12 +1679,14 @@ final class Glasses: NSObject, ObservableObject {
                     } else {
                         self.note("\(key) 写进去了但读回不一致（固件可能拒收）")
                     }
+                    self.startPendingStatusRefresh()
                 }
             } catch {
                 DispatchQueue.main.async {
                     guard let self, self.session === sess else { return }
                     self.settingsLoading = false
                     self.reportOperationError(error, session: sess)
+                    self.startPendingStatusRefresh()
                 }
             }
         }
@@ -1691,7 +1953,7 @@ struct ContentView: View {
                     if let d = g.lastPhoto, let img = UIImage(data: d) {
                         Image(uiImage: img).resizable().scaledToFit().frame(maxHeight: 220)
                     }
-                    if g.lastVideo != nil {
+                    if g.lastVideoURL != nil {
                         Button("分享视频") { g.shareVideo() }
                     }
                 }
@@ -1722,7 +1984,7 @@ struct ContentView: View {
                         .textInputAutocapitalization(.never).font(.footnote)
                     TextField("model", text: $g.modelName).font(.footnote)
                     TextField("问题", text: $question, axis: .vertical).lineLimit(1 ... 3)
-                    Button("看图问答") { g.ask(question) }.disabled(g.lastPhoto == nil || g.askingModel)
+                    Button("看图问答") { g.ask(question, includePhoto: true) }.disabled(!g.hasPhotoForModel || g.askingModel)
                     if !g.answer.isEmpty { Text(g.answer).font(.callout) }
                 }
 

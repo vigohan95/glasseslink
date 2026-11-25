@@ -73,6 +73,23 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(state.volumeStream, "TELEPHONY")
     }
 
+    func testPartialDeviceReportKeepsReadingsAndClearsExplicitlyUnavailableVolume() {
+        var current = GlassesState()
+        let battery = PB.bytes(1, PB.uint(3, 74))
+        let storage = PB.bytes(21, PB.uint(1, 19_000) + PB.uint(2, 21_000))
+        Status.merge(battery + storage + bytes("ca0106080710011823"), into: &current)
+
+        var push = GlassesState()
+        Status.merge(bytes("ca0108100318ffffffff0f"), into: &push)
+        current.mergeReported(from: push)
+
+        XCTAssertEqual(current.batteryPercent, 74)
+        XCTAssertEqual(current.storageFreeMb, 19_000)
+        XCTAssertEqual(current.storageTotalMb, 21_000)
+        XCTAssertNil(current.volumePercent)
+        XCTAssertEqual(current.volumeStream, "CURRENT")
+    }
+
     func testNativeCaptureRecordReadsWrappedFields() throws {
         // The root points to the capture table, which points to an asset vector and 64-bit metadata.
         let payload = bytes("0c00000006000800040000000800000014000000"
@@ -213,6 +230,42 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(drop.payload, PB.bytes(1, id))
     }
 
+    func testMediaImportAllowsActiveTransfersBeyondOneIdleWindow() throws {
+        let (session, peer) = try encryptedLoopback()
+        let id = bytes("00112233445546778999aabbccddeeff")
+        let channel: UInt16 = 0x8008
+        let data = Data("first-second".utf8)
+        try session.requestAsset(handle: "capture-1", assetID: "00112233-4455-4677-8999-aabbccddeeff")
+        try peer.write(mediaOffer(channel: channel, id: id, size: UInt64(data.count)))
+
+        let worker = DispatchQueue(label: "test.airship.active-transfer")
+        let schedule = DispatchTime.now()
+        let dataTag = [DataX.tag(2, Session.airData, last: true)]
+        let completeTag = [DataX.tag(2, Session.airComplete, last: true)]
+        let completed = expectation(description: "The peer sends chunks and completion")
+        worker.asyncAfter(deadline: schedule + .milliseconds(300)) {
+            do {
+                try peer.write(DataX.message(channel, tags: dataTag, payload: Data(data.prefix(5))))
+            } catch { XCTFail("First media chunk failed: \(error)") }
+        }
+        worker.asyncAfter(deadline: schedule + .milliseconds(650)) {
+            do {
+                try peer.write(DataX.message(channel, tags: dataTag, payload: Data(data.dropFirst(5))))
+            } catch { XCTFail("Second media chunk failed: \(error)") }
+        }
+        worker.asyncAfter(deadline: schedule + .milliseconds(950)) {
+            defer { completed.fulfill() }
+            do {
+                let result = PB.uint(1, UInt64(data.count)) + PB.uint(2, UInt64(Session.adler32(data)))
+                try peer.write(DataX.message(channel, tags: completeTag, payload: result))
+            } catch { XCTFail("Media completion failed: \(error)") }
+        }
+
+        let transfer = try? session.receiveFile(timeout: 0.8, maximumDuration: 3)
+        wait(for: [completed], timeout: 2)
+        XCTAssertEqual(transfer?.data, data)
+    }
+
     func testShutterConfirmationUsesCameraEventsOnSubscriptionMirror() throws {
         let (session, peer) = try encryptedLoopback()
         let mirror = Session.chLocalFirst ^ 0x8000
@@ -231,6 +284,35 @@ final class CompatibilityTests: XCTestCase {
         let state = try session.confirmedShutter(Shutter.photoPayload()) { $0 == Status.photoStarted }
         XCTAssertEqual(state.batteryPercent, 61)
         XCTAssertEqual(state.camera, Status.cameraName(Status.photoStarted))
+    }
+
+    func testDeviceStatusRequiresAReportOnTheSubscriptionMirror() throws {
+        let (session, peer) = try encryptedLoopback()
+        let mirror = Session.chLocalFirst ^ 0x8000
+        let ack = DataX.tag(2, UInt16(Status.mtInitAck), last: true)
+        let snapshot = PB.bytes(1, PB.uint(3, 74)) + PB.bytes(21, PB.uint(1, 19_000) + PB.uint(2, 21_000))
+            + PB.bytes(25, PB.uint(2, 1) + PB.uint(3, 35))
+        let report = DataX.tag(2, UInt16(Status.mtDeviceStateStart), last: true)
+        try peer.write(DataX.message(mirror, tags: [ack]))
+        let unrelated = [DataX.tag(1, UInt16(Status.service), last: false), report]
+        try peer.write(DataX.message(mirror + 1, tags: unrelated, payload: snapshot))
+
+        XCTAssertThrowsError(try session.subscribeStatus(timeout: 0.1)) { error in
+            guard case LinkError.unexpected("眼镜没有返回设备状态") = error else {
+                return XCTFail("Expected a missing report, got \(error)")
+            }
+        }
+        let request = try DataX.parse(peer.nextFrame(timeout: 1))
+        XCTAssertEqual(request.channel, Session.chLocalFirst)
+        XCTAssertEqual(request.service, Status.service)
+        XCTAssertEqual(request.type, Int(Status.mtInit))
+
+        try peer.write(DataX.message(mirror, tags: [report], payload: snapshot))
+        let state = try session.subscribeStatus(timeout: 1)
+        XCTAssertEqual(state.batteryPercent, 74)
+        XCTAssertEqual(state.storageFreeMb, 19_000)
+        XCTAssertEqual(state.storageTotalMb, 21_000)
+        XCTAssertEqual(state.volumePercent, 35)
     }
 
     func testSettingsReadMatchesRequestAndFinishesTheSyncOnEitherChannel() throws {

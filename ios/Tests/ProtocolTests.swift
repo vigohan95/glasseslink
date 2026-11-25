@@ -330,6 +330,37 @@ final class ProtocolTests: XCTestCase {
 
     // MARK: - assistant answer
 
+    func testAssistantRegistrationVersions() {
+        XCTAssertEqual(Assistant.registrationVersion(Data()), 0)
+        XCTAssertEqual(Assistant.registrationVersion(Data([2, 0, 0, 0])), 2)
+        let nested = PB.uint(1, 3) + PB.bytes(2, Data([1, 2, 3, 4]))
+        XCTAssertEqual(Assistant.registrationVersion(nested), 3)
+    }
+
+    func testAssistantExtractsActualFinalQuestion() throws {
+        let asr = ThriftWriter().string(1, "  明天天气怎么样？  ").done()
+        let understanding = ThriftWriter().structField(1, asr).done()
+        let body = ThriftWriter().string(1, "turn-1").structField(2, understanding).bool(30, false).done()
+        let fields = try ThriftCompact.loads(body)
+        let request = try XCTUnwrap(Assistant.spokenRequest(fields))
+        XCTAssertEqual(request.interaction, "turn-1")
+        XCTAssertEqual(request.transcript, "明天天气怎么样？")
+        XCTAssertFalse(request.simplified)
+    }
+
+    func testAssistantRejectsWakeOnlyAndImageRequests() throws {
+        let words = ThriftWriter().string(1, "Hey Meta").done()
+        let wakeUnderstanding = ThriftWriter().structField(1, words).done()
+        let wake = ThriftWriter().string(1, "turn-1").structField(2, wakeUnderstanding)
+            .string(23, "IN:WAKE_WORD").done()
+        XCTAssertNil(Assistant.spokenRequest(try ThriftCompact.loads(wake)))
+        let asr = ThriftWriter().string(1, "这是什么？").done()
+        let visual = ThriftWriter().binary(4, Data(repeating: 0x11, count: 101)).done()
+        let understanding = ThriftWriter().structField(1, asr).structField(4, visual).done()
+        let photo = ThriftWriter().string(1, "turn-2").structField(2, understanding).done()
+        XCTAssertNil(Assistant.spokenRequest(try ThriftCompact.loads(photo)))
+    }
+
     func testCompleteLayout() throws {
         let body = Varm.complete(interaction: "turn-1", text: "前面没有台阶。",
                                  expectsAnswer: false, followUp: true)
