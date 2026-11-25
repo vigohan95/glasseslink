@@ -220,14 +220,14 @@ final class SDUStream: NSObject, StreamDelegate {
     }
 }
 
-struct CaptureAsset {
+struct CaptureAsset: Codable {
     let uuid: String
     let type: Int          // 1 video, 2 still, 3 IMU, 4 frame log
     let delivered: Bool
     let size: Int
 }
 
-struct Capture {
+struct Capture: Codable {
     let handle: String
     let kind: Int          // 3073 photo, 3074 video
     let timestampNS: Int?
@@ -1317,7 +1317,7 @@ final class Session {
     }
 
     /// Subscribes (or re-asks on the existing channel) and merges pushes until the snapshot has
-    /// battery and storage, or the timeout runs out.
+    /// battery and storage, allowing one short grace window for a separate volume push.
     func subscribeStatus(timeout: TimeInterval = 4) throws -> GlassesState {
         let ch = statusChannel()
         try sendOnService("status", service: Status.service, type: Status.mtInit, payload: Status.subscribePayload())
@@ -1325,15 +1325,19 @@ final class Session {
 
         var state = GlassesState()
         var lastType: Int?
+        var volumeDeadline: Date?
         let deadline = Date().addingTimeInterval(timeout)
         while true {
-            let left = deadline.timeIntervalSinceNow
+            let left = min(deadline, volumeDeadline ?? deadline).timeIntervalSinceNow
             if left <= 0 { break }
             let m: DataX.Message
             do { m = try recvMessage(timeout: left) } catch LinkError.unexpected(_) { break }
             guard deviceStatusType(m, channel: ch, lastType: &lastType) != nil else { continue }
             Status.merge(m.payload, into: &state)
-            if state.batteryPercent != nil && state.storageFreeMb != nil { break }
+            if state.batteryPercent != nil, state.storageFreeMb != nil {
+                if state.receivedVolume { break }
+                if volumeDeadline == nil { volumeDeadline = Date().addingTimeInterval(0.3) }
+            }
         }
         emit("status: \(state.lines.joined(separator: " / "))")
         return state

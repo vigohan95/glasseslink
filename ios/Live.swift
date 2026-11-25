@@ -173,12 +173,13 @@ final class LiveStream {
         do {
             // 1. the glasses-side app that owns a live session (3 = livestream).
             log("starting livestream app")
-            if let started = try waitForAnswer("status", service: Status.service, type: 2000,
-                                               payload: PB.uint(1, 3), answerType: 2001, timeout: 6) {
-                let code = (try PB.parse(started))[1]?.first as? Int
-                guard code == 1 || code == 12 else {
-                    throw LinkError.unexpected("眼镜无法启动取景（结果 \(code ?? 0)）")
-                }
+            guard let started = try waitForAnswer("status", service: Status.service, type: 2000,
+                                                  payload: PB.uint(1, 3), answerType: 2001, timeout: 6) else {
+                throw LinkError.unexpected("眼镜未确认可以开始实时取景")
+            }
+            let code = (try PB.parse(started))[1]?.first as? Int
+            guard code == 1 || code == 12 else {
+                throw LinkError.unexpected("眼镜无法启动取景（结果 \(code ?? 0)）")
             }
             guard isRunning else { return }
 

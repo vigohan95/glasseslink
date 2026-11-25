@@ -141,7 +141,6 @@ struct AlbumTab: View {
     let openDevice: () -> Void
     @Environment(\.dynamicTypeSize) private var typeSize
     @State private var filter: Filter = .all
-    @State private var imported: Set<String> = []
     @State private var inFlight: String?
     @State private var failed: Set<String> = []
     @State private var preview: ThumbnailPreview?
@@ -160,18 +159,20 @@ struct AlbumTab: View {
 
     private var captures: [Capture] {
         var seen = Set<String>()
-        return g.captures.filter { seen.insert($0.id).inserted }
+        let records = g.captures + Array(g.importedCaptures.values)
+        return records.filter { seen.insert($0.id).inserted }
+            .sorted { ($0.timestampNS ?? 0) > ($1.timestampNS ?? 0) }
     }
 
-    private var pending: [Capture] { captures.filter { !imported.contains($0.id) } }
+    private var pending: [Capture] { captures.filter { g.importedCaptures[$0.id] == nil } }
     private var canImport: Bool { g.canUseGlasses && inFlight == nil && !g.busy }
 
     private var rows: [Capture] {
-        if !g.canUseGlasses { return captures.filter { imported.contains($0.id) } }
+        if !g.canUseGlasses { return captures.filter { g.importedCaptures[$0.id] != nil } }
         switch filter {
         case .all: return captures
         case .pending: return pending
-        case .done: return captures.filter { imported.contains($0.id) }
+        case .done: return captures.filter { g.importedCaptures[$0.id] != nil }
         }
     }
 
@@ -180,7 +181,7 @@ struct AlbumTab: View {
         switch filter {
         case .all: return "眼镜里还没有照片或视频。"
         case .pending: return "没有待导入的媒体。"
-        case .done: return "这次还没有导入媒体。"
+        case .done: return "这里还没有导入过的媒体。"
         }
     }
 
@@ -227,7 +228,7 @@ struct AlbumTab: View {
                                 let thumb = g.thumbs[capture.id]
                                 CaptureTile(capture: capture,
                                             thumbnail: thumb,
-                                            imported: imported.contains(capture.id),
+                                            imported: g.importedCaptures[capture.id] != nil,
                                             working: inFlight == capture.id,
                                             failed: failed.contains(capture.id),
                                             fraction: g.progress[capture.id] ?? 0,
@@ -326,13 +327,11 @@ struct AlbumTab: View {
         inFlight = first.id
         Task { @MainActor in
             defer { inFlight = nil }
-            for capture in queue where !imported.contains(capture.id) {
+            for capture in queue where g.importedCaptures[capture.id] == nil {
                 guard g.canUseGlasses, !Task.isCancelled else { break }
                 inFlight = capture.id
                 failed.remove(capture.id)
-                if await g.importCapture(capture) {
-                    imported.insert(capture.id)
-                } else {
+                if !(await g.importCapture(capture)) {
                     failed.insert(capture.id)
                 }
             }
@@ -451,6 +450,7 @@ struct ShootTab: View {
     @ObservedObject var g: Glasses
     let openDevice: () -> Void
     @State private var mode: CaptureMode = .photo
+    @State private var showLive = false
 
     private enum CaptureMode: String, CaseIterable {
         case photo = "照片"
@@ -480,6 +480,11 @@ struct ShootTab: View {
                     cameraStage
                     if g.canUseGlasses {
                         shutterControls
+                        Button { showLive = true } label: {
+                            Label("实时取景（实验）", systemImage: "viewfinder")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(g.busy || g.recording || g.assistantOn)
                     } else {
                         Button(g.connected ? "验证主人身份" : "连接眼镜") { openDevice() }
                             .buttonStyle(.borderedProminent)
@@ -505,6 +510,7 @@ struct ShootTab: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { StatusCapsule(g: g) { openDevice() } }
             }
+            .sheet(isPresented: $showLive) { LiveView(g: g) }
             .onChange(of: g.recording, initial: true) { _, recording in
                 if recording { mode = .video }
             }
@@ -586,8 +592,8 @@ struct ShootTab: View {
             .disabled(g.busy || g.recording)
 
             if mode == .video {
-                Picker("最长录制", selection: $g.maxRecordSeconds) {
-                    Text("不限").tag(0)
+                Picker("手机端停止计时", selection: $g.maxRecordSeconds) {
+                    Text("手动停止").tag(0)
                     Text("30 秒").tag(30)
                     Text("1 分钟").tag(60)
                     Text("3 分钟").tag(180)
@@ -642,6 +648,18 @@ struct AssistantTab: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("眼镜语音") {
+                    Button {
+                        if g.assistantOn { g.stopAssistant() } else { g.startAssistant() }
+                    } label: {
+                        Label(g.assistantOn ? "停止眼镜语音" : "启用眼镜语音",
+                              systemImage: g.assistantOn ? "mic.slash" : "mic")
+                    }
+                    .disabled(!g.canUseGlasses || g.busy || g.recording || g.live != nil)
+                    if let message = g.mediaMessage, g.canUseGlasses {
+                        Text(message).font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
                 Section("照片问答") {
                     TextField("这是什么？前面有台阶吗？", text: $question, axis: .vertical)
                         .lineLimit(1...4)
@@ -729,7 +747,7 @@ struct OwnerBadge: View {
         switch g.ownerState {
         case .unknown: return "连一次眼镜就会拿到答案。"
         case .unverified: return "\(g.trustLine)。导入或注册钥匙后，点「重新验证」。"
-        case .verified: return "拍照、录像、取照片、改设置都已经解锁。"
+        case .verified: return "本机可以访问眼镜的拍摄、相册和设置。"
         case .rejected(let code):
             return Glasses.explain(LinkError.trustRejected(code))
         }

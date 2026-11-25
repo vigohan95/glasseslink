@@ -106,6 +106,7 @@ final class Glasses: NSObject, ObservableObject {
     private var connectionAttempt: UUID?
     private var connectionStartedAt: Date?
     private var retriedL2CAP = false
+    private var openingL2CAP = false
     @Published var busy = false
     @Published private(set) var mediaMessage: String?
     private let glassesQueue = DispatchQueue(label: "glasseslink.session.operations", qos: .userInitiated)
@@ -129,6 +130,10 @@ final class Glasses: NSObject, ObservableObject {
     @Published var settingsLoading = false
     @Published var status = GlassesState()
     @Published var captures: [Capture] = []
+    @Published private(set) var importedCaptures: [String: Capture] = {
+        guard let data = UserDefaults.standard.data(forKey: "importedCaptureRecords") else { return [:] }
+        return (try? JSONDecoder().decode([String: Capture].self, from: data)) ?? [:]
+    }()
     @Published var thumbs: [String: UIImage] = [:]
     @Published var recording = false
     @Published var lastVideo: Data?
@@ -556,6 +561,7 @@ final class Glasses: NSObject, ObservableObject {
         connectionAttempt = nil
         connectionStartedAt = nil
         retriedL2CAP = false
+        openingL2CAP = false
         ownerRegistrationCompleted = false
         busy = false
         settingsLoading = false
@@ -728,18 +734,23 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     private func downloadCapture(_ capture: Capture, from active: Session, save: Bool) async throws -> Bool {
+        let id = capture.id
+        if save, importedCaptures[id] != nil { return true }
         let candidates = capture.isPhoto ? capture.stills : capture.assets.filter { $0.type == 1 }
         let asset = candidates.max { $0.size < $1.size }
         guard let asset else {
             throw LinkError.unexpected("这条记录没有可导入的原文件")
         }
-        let id = capture.id
         progress[id] = 0
         mediaMessage = "正在从眼镜导入…"
         defer { progress.removeValue(forKey: id) }
         let transfer = try await onGlassesQueue { [weak self] in
             try active.requestAsset(handle: capture.handle, assetID: asset.uuid)
+            var lastUpdate = ContinuousClock.now
             return try active.receiveFile(timeout: 300) { got, total in
+                let now = ContinuousClock.now
+                guard got == total || lastUpdate.duration(to: now) >= .milliseconds(100) else { return }
+                lastUpdate = now
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.session === active, self.progress[id] != nil, total > 0 else { return }
                     self.progress[id] = Double(got) / Double(total)
@@ -762,7 +773,11 @@ final class Glasses: NSObject, ObservableObject {
         }
         mediaMessage = "正在存入 iPhone 相册…"
         try await persistCapture(transfer.data, isPhoto: capture.isPhoto)
-        mediaMessage = "已存入 iPhone 相册。"
+        importedCaptures[id] = capture
+        if let data = try? JSONEncoder().encode(importedCaptures) {
+            UserDefaults.standard.set(data, forKey: "importedCaptureRecords")
+        }
+        if session === active { mediaMessage = "已存入 iPhone 相册。" }
         return true
     }
 
@@ -962,7 +977,7 @@ final class Glasses: NSObject, ObservableObject {
         assistantRef.stop()
         self.assistantRef = nil
         assistantOn = false
-        disconnect()
+        reconnect(forRegistration: false)
         note("助手接管已关闭")
     }
 
@@ -1002,10 +1017,11 @@ final class Glasses: NSObject, ObservableObject {
         guard let live else { return }
         liveTicker?.invalidate()
         liveTicker = nil
-        live.stop()
         self.live = nil
         liveLine = "—"
-        disconnect()
+        guard live.phase != .failed, live.phase != .idle else { return }
+        live.stop()
+        reconnect(forRegistration: false)
     }
 
     func shareVideo() {
@@ -1485,7 +1501,9 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     private func openLink(_ p: CBPeripheral) {
         guard connectingID == p.identifier, connectionAttempt != nil,
-              reconnectAfterDisconnect == nil, channel == nil, p.state == .connected else { return }
+              reconnectAfterDisconnect == nil, channel == nil, !openingL2CAP,
+              p.state == .connected else { return }
+        openingL2CAP = true
         note("打开 L2CAP PSM 0x\(String(psm, radix: 16))")
         p.openL2CAPChannel(psm)
     }
@@ -1525,6 +1543,7 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
                 channel?.outputStream?.close()
                 return
             }
+            self.openingL2CAP = false
             guard let ch = channel else {
                 let reason = error?.localizedDescription ?? "蓝牙通道未建立"
                 if reason.localizedCaseInsensitiveContains("already connected"), !self.retriedL2CAP {

@@ -50,6 +50,7 @@ enum Status {
             if let total = number(storage, 2) { state.storageTotalMb = total }
         }
         if let volume = inner(25) {
+            state.receivedVolume = true
             // The glasses may report UINT32_MAX for a volume that is unavailable.
             let percent = number(volume, 3)
             state.volumePercent = percent.flatMap { (0 ... 100).contains($0) ? $0 : nil }
@@ -98,6 +99,7 @@ struct GlassesState {
     var volumePercent: Int?
     var volumeLevel: Int?
     var volumeStream: String?
+    var receivedVolume = false
 
     var lines: [String] {
         var out: [String] = []
