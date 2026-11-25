@@ -398,17 +398,25 @@ final class Session {
         var seqs: [(String, UInt32)] = [("seq:0", 0), ("seq:ownBase", ownBase)]
         if peerBase != 0 { seqs.append(("seq:peerBase", peerBase)) }
 
+        // The two directions are allowed to use different AirShield variants: whatever the
+        // glasses announce applies to what they *send*, and some firmware announces nothing
+        // while using QCS7 anyway. Try both; the HMAC decides.
+        let variants: [(String, AirShield.Quirk)] = [("", quirks),
+                                                    (quirks == .qcs7 ? " [plain]" : " [qcs7]",
+                                                     quirks == .qcs7 ? .none : .qcs7)]
         var out: [RxCandidate] = []
-        for (pn, nonce, seedValue) in pairs {
-            guard !nonce.isEmpty, !seedValue.isEmpty else { continue }
-            for (ivn, ivValue) in ivs {
-                guard ivValue.count == 16 else { continue }
-                for (sn, seq) in seqs {
-                    guard let k = try? AirShield.deriveKeys(shared: shared, nonce: nonce, seed: seedValue,
-                                                            iv: ivValue, quirks: quirks, multikey: multikey)
-                    else { continue }
-                    out.append(RxCandidate(label: "\(pn) \(ivn) \(sn)",
-                                           dir: Direction(k, seq: seq)))
+        for (vn, q) in variants {
+            for (pn, nonce, seedValue) in pairs {
+                guard !nonce.isEmpty, !seedValue.isEmpty else { continue }
+                for (ivn, ivValue) in ivs {
+                    guard ivValue.count == 16 else { continue }
+                    for (sn, seq) in seqs {
+                        guard let k = try? AirShield.deriveKeys(shared: shared, nonce: nonce, seed: seedValue,
+                                                                iv: ivValue, quirks: q, multikey: multikey)
+                        else { continue }
+                        out.append(RxCandidate(label: "\(pn) \(ivn) \(sn)\(vn)",
+                                               dir: Direction(k, seq: seq)))
+                    }
                 }
             }
         }
@@ -511,7 +519,10 @@ final class Session {
         var peerEnable: (seed: Data, iv: Data, base: UInt32, quirks: AirShield.Quirk)?
 
         func absorb(_ m: DataX.Message) throws {
-            guard m.channel == DataX.chSetup, let t = m.type else { return }
+            // Visor puts RequestEncryption on LINK_SETUP (0x8001) but EnableEncryption on
+            // ENABLE (0x0001). Filtering on 0x8001 alone silently dropped the peer's seed and
+            // IV, which is exactly what produced "enable=absent" and an underivable rx key.
+            guard m.channel == DataX.chSetup || m.channel == DataX.chSetupMirror, let t = m.type else { return }
             let f = try PB.parse(m.payload)
             if t == 1, peerRequest == nil,
                let p = f[1]?.first as? Data, let c = f[2]?.first as? Data {
@@ -577,10 +588,22 @@ final class Session {
                                                     baseSeq: baseSeq, quirks: quirks))
         emit("EnableEncryption sent (base=\(baseSeq))")
 
+        // The glasses answer our EnableEncryption with their own, carrying the seed and IV our
+        // receive direction needs. Wait for it instead of deriving keys from an empty seed.
+        if peerEnable == nil {
+            let until = Date().addingTimeInterval(3)
+            while Date() < until, peerEnable == nil {
+                guard let sdu = try? stream.nextFrame(timeout: 1.0),
+                      let m = try? DataX.parse(sdu) else { continue }
+                try? absorb(m)
+            }
+            emit("post-enable read: peer enable=\(peerEnable == nil ? "absent" : "present")")
+        }
+
         let keys = try AirShield.sessionKeys(shared: shared,
                                         ownChallenge: challenge, ownSeed: seed,
-                                        peerChallenge: req.challenge, peerSeed: en?.seed ?? Data(),
-                                        ownIV: iv, peerIV: en?.iv ?? Data(), peerBaseSeq: en?.base ?? 0,
+                                        peerChallenge: req.challenge, peerSeed: peerEnable?.seed ?? Data(),
+                                        ownIV: iv, peerIV: peerEnable?.iv ?? Data(), peerBaseSeq: peerEnable?.base ?? 0,
                                         quirks: quirks, multikey: multikey)
         send = keys.send
         recv = keys.recv
@@ -593,8 +616,8 @@ final class Session {
         // failing with bad MAC forever, prepare the plausible combinations; the first
         // frame the glasses send decides — its HMAC verifies under exactly one of them.
         rxOptions = Self.receiveCandidates(shared: shared, ownChallenge: challenge, ownSeed: seed,
-                                           peerChallenge: req.challenge, peerSeed: en?.seed ?? Data(),
-                                           ownIV: iv, peerIV: en?.iv ?? Data(), peerBase: en?.base ?? 0,
+                                           peerChallenge: req.challenge, peerSeed: peerEnable?.seed ?? Data(),
+                                           ownIV: iv, peerIV: peerEnable?.iv ?? Data(), peerBase: peerEnable?.base ?? 0,
                                            ownBase: baseSeq, quirks: quirks, multikey: multikey)
         emit("rx candidates: \(rxOptions.count)")
         peerPubkey = req.pub
@@ -608,13 +631,16 @@ final class Session {
         // Tolerate silence here: a device that does not want a link setup answer still gets trust.
         // 2 s, not 6: on this firmware the glasses never answer it, and waiting longer only
         // makes every connect feel like the app froze.
+        if trust { try doTrust(timeout: timeout) }
+
+        // Visor sends EndLinkSetup at the very end of open() — after trust. Sending it before
+        // trust made the glasses answer trust frames we could not attribute, and cost 2 s
+        // of dead time on every attempt.
         do {
             try endLinkSetup(timeout: min(timeout, 2))
         } catch {
-            emit("EndLinkSetup 未应答（\(error)）——继续尝试 trust")
+            emit("EndLinkSetup 未应答（\(error)）——链路已可用，继续")
         }
-
-        if trust { try doTrust(timeout: timeout) }
     }
 
     private func doTrust(timeout: TimeInterval) throws {
