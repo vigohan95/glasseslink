@@ -11,6 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Regression audit (known bug classes)
+        run: python3 tools/audit.py ios
+
       - name: Install XcodeGen
         run: brew install xcodegen
 

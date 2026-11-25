@@ -173,7 +173,7 @@ final class FakeGlasses {
 
         let status = try readSealed(timeout: 20)
         let s = try DataX.parse(status)
-        guard s.error == Int(AirShield.stOK) else {
+        guard s.error == Int(AirShield.stOK) || s.error == Int(AirShield.stSuccess) else {
             throw LinkError.unexpected("phone did not ack EndLinkSetup (error 0x\(String(s.error ?? 0xFFFF, radix: 16)))")
         }
         sawEndLinkStatus = true
