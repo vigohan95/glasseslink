@@ -481,8 +481,11 @@ final class Session {
                     emit("rx IV solved (\(hit.iv.hexShort)) after a garbled first frame", nil, inbound: true)
                     msg = rebuilt
                 } else {
-                    emit("parse FAILED (\(error))", plain, inbound: true)
-                    throw error
+                    // A short or garbled frame is not fatal: the glasses split long replies across
+                    // frames, so a 16-byte piece can be the tail of something bigger. Log it and
+                    // keep reading instead of tearing the handshake down.
+                    emit("parse FAILED (\(error)) — skipping this frame", plain, inbound: true)
+                    continue
                 }
             }
             emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",

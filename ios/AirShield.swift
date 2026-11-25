@@ -300,8 +300,11 @@ enum AirShield {
         var body = PB.bytes(1, pubkey) + PB.bytes(2, seed) + PB.bytes(3, iv)
         body += PB.uint(4, UInt64(baseSeq)) + PB.uint(5, paramsDefault)
         if quirks != .none { body += PB.uint(6, quirks.rawValue) }
-        return DataX.message(DataX.chSetupMirror, tags: [DataX.tag(1, 2, last: false),
-                                                         DataX.tag(2, 2, last: true)], payload: body)
+        // SecureLink.sendLinkSetup: "The serviceId tag goes on the first message of the exchange
+        // only, per the capture." EnableEncryption therefore carries the message-type tag alone.
+        // Sending a service tag here made Gen 2 ignore the frame and never answer with its own
+        // EnableEncryption — which is exactly what the 15:35 log shows (enable=none, then silence).
+        return DataX.message(DataX.chSetupMirror, tags: [DataX.tag(2, 2, last: true)], payload: body)
     }
 
     /// EndLinkSetup — 46-byte plaintext: 80 2A 80 01 02 00 10 00 | 08 01 | 12 10 <stream> | 1A 10 <link>
