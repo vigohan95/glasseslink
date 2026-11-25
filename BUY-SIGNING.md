@@ -13,7 +13,7 @@
 | TestFlight | 需 $99 开发者 | 90 天/build | 到期要重新发 | 想给别人用时才考虑 |
 | Apple Developer 自签 | $99/年 | 1 年 | 不会 | 最稳，你自己有 Mac 时最省心 |
 
-关键词就说「**UDID 定制签名，装我自己的 ipa，不越狱，iOS 27.2**」。
+关键词就说「**UDID 定制签名，装我自己编译的 ipa，iOS 27.2**」。
 
 ---
 
@@ -21,7 +21,7 @@
 
 1. **能装自己的 ipa**（不是只能装他们提供的应用）。有些卖家只卖"已签好的 app"，那不行。
 2. **保留 bundle id `dev.local.glasseslink`**，不要改。改了 Keychain 里的 owner key 就读不到（虽然我们还有文件备份，但省事）。
-3. **不要求越狱**、不改 entitlements。我们只用：蓝牙（`NSBluetoothAlwaysUsageDescription`）、本地网络、相册读写、文件共享。这些都是普通权限，不需要特殊 entitlement。
+3. **不需要系统级修改**、不改 entitlements。我们只用：蓝牙（`NSBluetoothAlwaysUsageDescription`）、本地网络、相册读写、文件共享。这些都是普通权限，不需要特殊 entitlement。
 
 ---
 
@@ -64,6 +64,45 @@ UDID：<他们给的链接取，或用 iMazing / 爱思助手看>
 2. 重新 OTA 装。
 3. 打开 app →「3 · 成为主人」→「从文件 App 导入 owner-export.json」→「1 · 连接」。
 4. **不需要**重新登录 Meta、**不需要**再碰安卓。
+
+---
+
+## 5.5 如果卖家给的是「p12 + 描述文件」（自己签）
+
+闲鱼上很多「UDID 定制 / 源码 v2」的店铺实际交付两种东西之一，**两种都能用**，但要分清：
+
+| 交付形态 | 拿到什么 | 怎么装 | 备注 |
+| --- | --- | --- | --- |
+| A. OTA 链接 | `itms-services://` 链接或二维码 | Safari 打开 → 安装 | 最省事，不用电脑 |
+| B. 证书包 | `.p12` + 密码 + `.mobileprovision` | Windows 上用 Sideloadly 签 + USB 装 | 需要装 iTunes/Apple Devices，之后可重复自签 |
+
+如果是 B，装 Sideloadly 后这样填：`IPA` 选我们的 ipa、`Apple ID` 那栏留空、勾 `Advanced Options` → 指定 `.p12` 与 `.mobileprovision`、填 p12 密码 → Start。
+
+两种情况都要盯同一件事：**`.mobileprovision` 里的 `application-identifier` 必须允许 `dev.local.glasseslink`**（UDID 定制签名一般是通配符 `*`，那就没问题；如果卖家给的是固定 bundle id，让他改成这个，或者用 `com.xxx.*` 通配）。
+
+**付款前问清这 5 句**（复制发过去）：
+
+1. 是 UDID 定制（Ad Hoc）还是企业签？我要 UDID 的。
+2. 能不能装**我自己的 ipa**？（不是只能装你们提供的应用）
+3. bundle id 能不能用 `dev.local.glasseslink`？或者给通配符 `*` 的描述文件？
+4. 掉签包不包补？补签要不要再付钱？
+5. 有效期多久？是 1 年还是跟证书剩余时间走？
+
+只要 1、2、3 都答"可以"，这个就能用。
+
+---
+
+## 5.6 三类闲鱼商品的取舍（判断标准，不看标题看交付）
+
+| 商品说法 | 实际卖的是 | 装法 | 风险 | 结论 |
+| --- | --- | --- | --- | --- |
+| 「UDID 定制签名」 | 卖家用自己的证书**替你签好**，给你 OTA 链接 | Safari 打开即装 | 证书被吊销会掉，但只影响这一批 UDID | **优先** |
+| 「自用 p12 证书」 | 一张 `.p12` + 密码（可能还给描述文件） | 你在 Windows 上用 Sideloadly 或手机上的全能签/轻松签自己签 | p12 若卖给多人 = 共享证书，一人违规全封；p12 泄露等于别人能替你签名 | 次选（要长期反复装才值） |
+| 「全能签 / 轻松签 / 万能签」 | 一个**第三方签名 App** + 教程 | 先装这个 App（多半靠企业签），再由它签我们的 ipa | 两层依赖：签名 App 自己掉签就全废；iOS 27 上这类工具支持情况不稳 | 最次 |
+
+一句话判断：**能直接给你「装好的 OTA 链接」的最省事；只给你工具让你自己折腾的，链路最长。**
+
+无论买哪种，都要问：能否装**我自己的 ipa**、bundle id 能否用 `dev.local.glasseslink`（或通配符 `*`）、掉签是否包补。
 
 ---
 

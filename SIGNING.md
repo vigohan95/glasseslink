@@ -1,6 +1,6 @@
 # 签名与安装：四条路，按预算选
 
-iOS 27.2 没有免费的永久签名（TrollStore 封顶 iOS 17.0；Liter8 是 tethered 越狱；MacDirtyCow/kfd 到 16.6 为止）。
+iOS 27.2 没有免费的永久签名：免费 Apple ID 7 天、SideStore 端上续签、或付费开发者账号，只有这三类。
 所以「装上去」这件事只有四种现实做法。所有做法用的都是同一个 `GlassesLink.ipa`，不用重新构建。
 
 ---

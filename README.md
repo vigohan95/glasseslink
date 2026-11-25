@@ -1,158 +1,85 @@
-# Meta Ray-Ban Gen 2 · 去 Meta 化 + 自选模型（iPhone 版）
+# GlassesLink — 面向 AI 智能眼镜的 iOS 客户端
 
-目标拆开看是四件事，能不能做完全不一样：
+GlassesLink 的目标是成为一个**跨品牌的 AI 智能眼镜客户端**：一副眼镜，一个 app，拍摄时长、编码与处理算法、AI 模型都由你自己选，而不是由厂商替你决定。
 
-| 你的需求 | 能否达成 | 现实代价 |
-|---|---|---|
-| 眼镜日常不再连 Meta 服务器 | **能** | 一次性配对必须过一次 Meta（拿 ownership receipt / owner key），之后手机↔眼镜走本地协议，照片、语音、模型请求都不出局域网 |
-| 正常拍照、录像、看相册 | **能** | 用 Visor 做眼镜端客户端；Wi-Fi Direct 只在 Android 上可用 |
-| 自选 AI 模型（DeepSeek / 本地 Ollama / 自建） | **能** | Visor 自带 Assistant 替换 Meta AI，“Hey Meta” 的语音走你给的 OpenAI 兼容 endpoint |
-| 全程只用 iPhone，不碰 Android | **部分能** | iPhone 不能直接跑 Visor；要么加一台 Android 当桥（推荐），要么把 AirShield 协议移植到 iOS（有骨架，但要 Mac + Xcode） |
-| 连一次性配对都不碰 Meta | **只有固件级** | 需要 ≤126 固件 + 自制 app 替换 DAT + MobileConfig 单字节绕过；127 已加签名校验，升级就封 |
+当前版本优先支持 **Ray-Ban Meta Gen 2**，已实现：
 
-关键事实先说清楚：**Ray-Ban Meta 眼镜自己不上网**（除了 Display 版），所有流量都是“手机 → 眼镜”的本地链路。所以“断云”这件事的真正战场在手机 App，而不在眼镜。Visor 就是把这个 App 换掉了。
+- 拍照、录像（可选 30 秒 / 1 分钟 / 3 分钟 / 5 分钟自动停止）
+- 相册浏览、按需把原始照片与视频取回并存进系统相册（保留视频封面帧）
+- 设备状态：电量、温度、存储、音量、折叠状态
+- 371 项设备设置（分 18 组）可读可写，含通知音量、指示灯亮度、语言、拍摄参数
+- Live 取景（蓝牙链路，360×640 / 720p 两档）与取景中抓拍
+- 助手：把眼镜上的「Hey Meta」接到任意 OpenAI 兼容服务（本地 Ollama、OpenAI、DeepSeek、OpenRouter 或自建），回答由眼镜自己念出来
+- 隐私开关：拦截厂商固件升级请求、关闭云端 OTA
+
+**架构上的三个承诺**
+
+1. 眼镜 ↔ iPhone 直连，蓝牙 LE L2CAP，会话层加密（AirShield / DataX）在 app 内实现，不套 WebView、不转发到第三方服务器。
+2. 日常使用不依赖厂商云端；只有第一次把手机登记为设备主人时需要厂商账号走一次 OAuth。
+3. 协议实现有**两份独立转写**（`pi/` 的 Python 与 `ios/` 的 Swift），互为对照，任何一处偏差都能在 CI 里被发现。
+
+> 关于"支持所有眼镜"：设备差异集中在三张表——产品号/设备类型、链路参数（PSM、通道号）、能力位（有无相机、有无显示）。
+> 代码里已把这三件事抽成 `DeviceProfile` + 能力位驱动 UI，新增一个品牌只需要加一行 profile，不必改界面。
 
 ---
 
-## 路线 A（推荐，今天就能跑）：Android 当桥，iPhone 当遥控器
+## 目录
 
 ```
-iPhone Safari/PWA  ──HTTP──▶  桥（笔记本/NAS/树莓派）  ──WebSocket──▶  Visor(Android)  ──BLE L2CAP──▶  眼镜
+ios/            iOS app 源码（Swift 5.9，iOS 17+）
+  Tests/        XCTest：协议、P-256、线格式对照、回环
+  Resources/    设置目录与文案（来自 Visor，AGPL，见 LICENSES.md）
+  Assets.xcassets/  app 图标
+pi/             Python 实现的同一套协议（可在树莓派 / Linux 上跑，含 12+5 组自测）
+bridge/         早期过渡方案：把 Android 参考实现的本地网络接口转成 HTTP/PWA
+tools/          一次性脚本：金标向量、配对凭据转换、参考实现对照、图标生成
+docs/           所有文档（架构、协议、签名、迁移、进度）
+releases/       已构建的 ipa
+logs/           证据：截图、CI 记录
+.github/workflows/ios.yml   macOS runner：编译 + 单测 + 打包未签名 ipa
 ```
 
-桥的意义：把 Visor 的网络门（JSON-RPC over WebSocket）翻译成 HTTP，iPhone 用 Safari 打开就行，不用装任何 App。
+## 五分钟上手
 
-### A1. 眼镜侧
+```powershell
+# 1) 装签名（见 docs/BUY-SIGNING.md 或 docs/SIGNING.md），装上 releases/ 里最新的 ipa
 
-1. 折叠双镜腿，长按拍摄键约 5 秒，内侧 LED 蓝闪 → 进入配对。
-2. 找一台 Android 12+ 手机，装 Visor：<https://github.com/macedonga/visor/releases>。
-3. Visor 首次 setup 会登录 Meta 账号，拿 login + ownership receipt（成为 owner app）。**这一步是唯一一次必须连 Meta**，之后 Visor 不再回传。
-4. 如果想自己编译 Visor：从官方 Meta AI app 里提取三个以 `HW|`、`AR|`、`FRL|` 开头的 client token，写进 `local.properties`：
-   ```
-   VISOR_META_HW_TOKEN=HW|...
-   VISOR_META_AR_TOKEN=AR|...
-   VISOR_META_FRL_TOKEN=FRL|...
-   ```
-   缺了它们，login 和 ownership 步骤会失败。
-5. Visor 里打开 **Network door**，记下它显示的 IP、端口（7333）和 token。
+# 2) 让 iPhone 成为设备主人（二选一）
+#    A. app 里「设备 → 成为主人」→ 用厂商账号登录一次 → 提示时按一下眼镜拍摄键
+#    B. 从已有的 Visor 导出配对凭据 → 转换 → 在 app 里粘贴导入（见 docs/OWNER-MIGRATION.md）
 
-### A2. 桥（本仓库）
+# 3) 连接
+#    「相册」页顶部点眼镜名 → 日志出现 trust ok (0x1000)
+```
+
+之后每次使用：**只有 iPhone ↔ 眼镜的蓝牙链路**。
+
+## 自己构建
 
 ```bash
-cd bridge
-python server.py --url ws://192.168.1.50:7333/rpc --token <VISOR_TOKEN>
-# 或者先把 config.example.json 复制成 ../config.json 再直接 python server.py
+# 本地（需要 macOS + Xcode 15+）
+cd ios && xcodegen generate && xcodebuild -scheme GlassesLink -destination 'generic/platform=iOS' build
+
+# 不签名出 ipa（用 GitHub Actions，本仓库已配好）
+gh workflow run ios.yml     # 产物在 Actions 的 GlassesLink-ipa artifact
 ```
 
-自测（不需要眼镜、不需要手机）：
+## 文档索引
 
-```bash
-python server.py --mock --port 8788
-curl http://127.0.0.1:8788/api/status
-```
+| 想做什么 | 看哪份 |
+| --- | --- |
+| 产品定位与边界 | `docs/POSITIONING.md` |
+| 搞清楚架构与模块职责 | `ARCHITECTURE.md` |
+| 版本演进 | `CHANGELOG.md` |
+| 踩过的坑与守卫 | `BUGLOG.md`、`docs/BUG-LEDGER.md` |
+| 开发规则（本项目的流程） | `docs/PROCESS.md` |
+| 与参考实现的逐步对照 | `docs/CONFORMANCE.md` |
+| 日常使用与故障排查 | `docs/RUNBOOK.md`、`docs/TRY-IT-NOW.md` |
+| 签名与分发 | `docs/SIGNING.md`、`docs/BUY-SIGNING.md`、`docs/DISTRIBUTION.md` |
+| 换手机 / 迁移钥匙 | `docs/OWNER-MIGRATION.md` |
+| 协议细节 | `docs/PROTOCOL-NOTES.md` |
 
-启动后终端会打印 `iPhone: http://<你的局域网IP>:8787/`，用 iPhone Safari 打开即可。加到主屏幕就是 PWA。
+## 许可
 
-### A3. 接自选模型
-
-编辑 `config.json` → `model`：
-
-```jsonc
-// 本地 Ollama（视觉模型，完全离线）
-{ "provider": "openai", "base_url": "http://127.0.0.1:11434/v1", "model": "qwen2.5vl:7b" }
-
-// DeepSeek / OpenRouter / 任何 OpenAI 兼容网关
-{ "provider": "openai", "base_url": "https://api.deepseek.com/v1", "api_key": "sk-...", "model": "deepseek-chat" }
-
-// 只想先看链路通不通
-{ "provider": "demo" }
-```
-
-`provider: demo` 不会调用任何外部服务，只回显，用来验证拍照链路。
-
-### A4. HTTP 接口
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/status` | 门是否连上、眼镜电量/佩戴/链路、当前模型 |
-| GET | `/api/captures` | 眼镜相册列表 |
-| POST | `/api/capture` | 拍一张，`{"mode":"auto"\|"live"\|"photo"}`，返回 base64 |
-| POST | `/api/ask` | `{"question":"...","capture":true}` 拍照 + 问模型 |
-| POST | `/api/video` | `{"action":"start"\|"stop"}` |
-
-拍照实现上走两条路：优先 `camera.live.photo`（需要 Visor 里开着 Live view，最快，随时抓帧），否则 `camera.photo` 拍一张再 `captures.import` 取回字节。所以**建议在 Visor 里常开 Live view**，桥就能像取景器一样随时取图。
-
-加了一层可选保护：`config.json` 里填 `server.access_key`，之后所有请求要带 `?k=<key>`。
-
----
-
-## 路线 B：iPhone 原生直连（要 Mac + Xcode，工作量大）
-
-协议栈是分层的，iOS 能覆盖一部分：
-
-| 层 | 内容 | iOS |
-|---|---|---|
-| Radio | LE L2CAP CoC / Classic RFCOMM / TCP over Wi-Fi | ✅ L2CAP（`CBPeripheral.openL2CAPChannel`）/ ❌ RFCOMM 第三方不可用 / ⚠️ Wi-Fi Direct 不可用，要眼镜自建 AP + 手动入网 |
-| Framing | 4 字节 DataX 头 + 4 字节 tag | ✅ 见 `ios/AirShield.swift` |
-| AirShield | ECDH P-256 → AES-256-CBC + HMAC-SHA-256 每帧 | ✅ CryptoKit + CommonCrypto |
-| Trust | svc36，用 owner key 签 channel binding | ⚠️ 需要一个已配对的 ownership receipt |
-| Services | protobuf / Thrift compact / FlatBuffers / zstd | ✅ 都有 Swift 实现 |
-
-`ios/AirShield.swift` 里已经按官方字节级文档写好了：DataX 头/tag 编码、protobuf 写出器、`RequestEncryption`(0x8001/type1)、`EnableEncryption`(0x0001/type2)、KDF（`salt_aes=SHA256(nonce‖seed)`、`PRK=HMAC(salt,S)`、`key=HMAC(PRK,"AirShield"‖0x01)`，含 QCS7 quirks 那条 136 字节 HKDF info 分支）、channel binding、`EndLinkSetup` 的 46 字节明文与 v4 UUID 校验、AES-CBC + 每帧 HMAC。TODO 都标了出来（MAC 拼接顺序、非 QCS7 的 MAC word、L2CAP PSM 数值），必须先抓一份 Android 端的 `wire.log` 对照再动手。
-
-现成的 iOS 参照项目：<https://github.com/rayl15/OpenVision>（Swift，用 Meta 官方 DAT SDK，7 个后端含本地 MLX 视觉模型）。它省事，但**仍然要 Meta 开发者账号注册 app**，不满足“不连 Meta”。
-
----
-
-## 路线 C：固件级，真正的“零 Meta”
-
-Bynar.io 的 Paula（pamoutaf）在 nullcon Berlin 2026 的演讲 “Beeps and Patches: arbitrary code execution on Meta Ray-Ban” 给了一条完整链路：
-
-1. **拿固件**：不用开壳。用 Meta AI app 触发 OTA，抓更新包就是完整固件镜像（反编译 Meta AI app，`OtaArtifactFetcher` 发请求、响应转成 `OTAArtifactInfo`）。
-2. **装自己的代码（固件 <126）**：这一版不校验 DAT 安装组件签名。把官方 DAT 换成自己未签名的 app（借 Meta 的 Camera Access 示例 app），就能在眼镜里跑自己的代码。
-3. **固件 127 的绕过**：127 加了签名校验，但手机从 Meta 服务器取 MobileConfig 后**原样下发给眼镜、不校验完整性**，翻转其中一个字节即可绕过（对应 `0x1043 INVALID_APP_IDENTITY`）。
-4. **拿 shell**：Frida hook + Meta 示例 app 维持连接，在 **Wi-Fi Direct 链路**上拿到交互式 shell。目前权限是 unprivileged。
-
-这条路意味着：眼镜里跑自定义组件 → 完全绕开手机侧 App → 真正不碰 Meta。代价是固件版本窗口极窄、一步走错变砖、而且每次官方 OTA 都可能把它关掉。
-
----
-
-## 为什么“完全不连 Meta”卡在 ownership 上
-
-眼镜每次建链都要做一次 svc36 trust：手机必须证明自己持有 owner key，而 owner key 是在**首次配对时由 Meta 签发的 ownership receipt** 换来的。这是设备信任根，绕不过去（除非走路线 C 改固件）。所以：
-
-- 现实定义 = **一次性配对 + 之后零回传**。
-- 配对那一次用的账号，建议单独一个，不要用主账号（它会留下设备归属记录）。
-- 配对完成后，Visor 的日常链路里没有任何 Meta 服务器参与：照片走 Wi-Fi Direct 导入，语音走你配的 endpoint，全部落在局域网内。
-
-## 固件与版本注意事项（技术层面）
-
-- **不要随手升级固件**。126 是“可以装未签名 DAT”的最后窗口，127 起要打 MobileConfig 补丁，更高版本可能直接封死。
-- 抓一次 OTA 更新包并留档，等于给自己留了回滚弹药。
-- Visor 是 AGPL-3.0：自己用、改、自建都没问题；分发二进制要开源。
-- 桥这一层不接触设备密钥，它只是 WebSocket 的转发器；token 泄露等于别人能操作你的眼镜，`access_key` 别省。
-
----
-
-## 文件清单
-
-```
-meta-gen2/
-├── config.example.json       # 复制成 config.json，填门地址/token/模型
-├── README.md
-├── BUILD-IOS.md              # 「让安卓彻底消失」runbook（无 Mac 也能出 ipa）
-├── PROTOCOL-NOTES.md         # 字节级协议笔记（握手、KDF、DataX 帧）
-├── bridge/
-│   ├── server.py             # HTTP API + PWA 托管（stdlib only）
-│   ├── visor_client.py       # 手写 WebSocket + JSON-RPC 客户端
-│   ├── mock_visor.py         # 假网络门，用于无设备自测
-│   └── web/index.html        # iPhone PWA
-├── tools/adb_export_owner.py # 从一次性安卓里把 owner key 抠出来
-├── visor-patch/OwnerExport.kt# 自己编 Visor 时加的软件 key + 导出补丁
-├── ios/
-│   ├── AirShield.swift       # 协议栈（DataX 帧、握手、KDF、AES-CBC+HMAC）
-│   ├── OwnerKey.swift        # owner key 导入 + NONEwithECDSA 签名
-│   ├── App.swift             # 客户端骨架（BLE 扫描 / 连接 / L2CAP）
-│   └── project.yml           # XcodeGen 工程描述
-└── .github/workflows/ios.yml # 云端 macOS 编译出未签名 ipa
-```
+app 代码为 MIT。`ios/Resources/settings.tsv`、`settings_ui.json`、`varm_template.bin` 三份数据文件来自 Visor（AGPL-3.0），
+分发或上架前需要替换为自己生成的等价数据，或取得原作者授权，详见 `docs/LICENSES.md`。
