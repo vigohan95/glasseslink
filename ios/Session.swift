@@ -719,7 +719,8 @@ final class Session {
         while Date() < deadline {
             let m = try recvMessage(timeout: max(0.5, deadline.timeIntervalSinceNow), includePending: false)
             guard m.channel == DataX.chSetupMirror, m.service == nil, m.type == nil, let code = m.error else {
-                pendingSetupMessages.append(m)
+                // Keep early service messages, but keep their status replies out of trust.
+                if m.error == nil { pendingSetupMessages.append(m) }
                 continue
             }
             guard code == Int(AirShield.stSuccess) || code == Int(AirShield.stOK) else {
