@@ -1274,7 +1274,7 @@ final class Glasses: NSObject, ObservableObject {
                 let batch = try await onGlassesQueue {
                     guard !cancellation.isCancelled else { throw CancellationError() }
                     try active.requestAsset(handle: capture.handle, assetID: request.asset.uuid)
-                    return active.receiveMediaFilesToDisk(expectedAssetIDs: [assetID],
+                    return try active.receiveMediaFilesToDisk(expectedAssetIDs: [assetID],
                         timeout: 45, maximumDuration: max(300, Double(request.asset.size) / 8_192),
                         onBytes: progressUpdate, isCancelled: { cancellation.isCancelled })
                 }
@@ -1374,7 +1374,7 @@ final class Glasses: NSObject, ObservableObject {
             let progressUpdate = mediaProgress(requests, job: job, route: "Wi-Fi")
             let started = Date()
             files = try await onGlassesQueue {
-                connection.receiveMediaFilesToDisk(expectedAssetIDs: expected, timeout: 12,
+                try connection.receiveMediaFilesToDisk(expectedAssetIDs: expected, timeout: 12,
                     maximumDuration: maximumDuration, onBytes: progressUpdate, isCancelled: { cancellation.isCancelled })
             }
             if let files {
