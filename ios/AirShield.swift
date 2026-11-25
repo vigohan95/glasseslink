@@ -457,9 +457,41 @@ final class Direction {
         return AirShieldPad.unpad(plain)
     }
 
+    /// Decrypt with the first IV that yields a structurally valid frame.
+    ///
+    /// The MAC covers the *ciphertext*, so a passing MAC proves the key, the sequence number and
+    /// the block count — but says nothing about the IV. When the peer never sends its own
+    /// EnableEncryption (Gen 2 does not), its IV is unknown, and the symptom is maddening: the
+    /// frame authenticates, then decrypts into garbage (`ch=0x5cac type=-` in the field log).
+    /// So keep the key the MAC proved and let the plaintext structure choose the IV.
+    func openTryingIVs(_ sdu: Data, ivs: [Data]) -> (plain: Data, iv: Data)? {
+        guard sdu.count >= 25, sdu[0] & 0xC0 == Direction.frameData else { return nil }
+        let tag = Data(sdu[1 ..< 9])
+        let count = sdu[9]
+        let ct = Data(sdu[10...])
+        guard ct.count == 16 * (Int(count) + 1) else { return nil }
+        guard tag == Self.mac(hmac, macWord, seq, count, ct) else { return nil }
+        for candidate in ivs where candidate.count == 16 {
+            guard let plain = try? Self.cbc(ct, key: aes, iv: candidate, encrypt: false) else { continue }
+            if Self.looksLikeAFrame(plain) {
+                iv = Data(ct.suffix(16))   // chaining continues from the ciphertext regardless
+                seq &+= 1
+                return (plain, candidate)
+            }
+        }
+        return nil
+    }
+
+    /// A DataX header states its own length: use that to tell real plaintext from CBC noise.
+    static func looksLikeAFrame(_ plain: Data) -> Bool {
+        let b = [UInt8](plain)
+        guard b.count >= 4 else { return false }
+        let declared = 4 + (Int(b[0] & 0x3F) << 8 | Int(b[1]))
+        return declared == b.count
+    }
+
     // mac = HMAC-SHA256(mac_word || LE32(seq) || count || ciphertext)[0..<8]
-    static func mac(_ key: Data, _ macWord: Data, _ seq: UInt32, _ count: UInt8, _ ct: Data) -> Data {
-        let msg = macWord + le32(seq) + Data([count]) + ct
+    static func mac(_ key: Data, _ macWord: Data, _ seq: UInt32, _ count: UInt8, _ ct: Data) -> Data {        let msg = macWord + le32(seq) + Data([count]) + ct
         let mac = HMAC<SHA256>.authenticationCode(for: msg, using: SymmetricKey(data: key))
         return Data(mac).prefix(8)
     }

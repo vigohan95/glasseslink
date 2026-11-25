@@ -56,6 +56,10 @@ def fires(rid, path, text, lineno, line):
             if "func " in prev:
                 enclosing = prev
                 break
+        # a local Array conversion on the same or a nearby line makes the index safe
+        nearby = "\n".join(lines_of(path)[max(0, lineno - 4):lineno])
+        if "[UInt8](" in nearby:
+            return False, ""
         if "[UInt8]" in enclosing or "Data)" not in enclosing:
             return False, ""
         return True, "indexing a Data slice from 0 is out of bounds when startIndex != 0"

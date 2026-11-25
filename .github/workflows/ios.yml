@@ -33,7 +33,6 @@ jobs:
         run: cd ios && xcodegen generate
 
       - name: Unit tests (golden vectors)
-        if: github.event_name == 'schedule' || inputs.full_tests == true
         run: |
           cd ios
           DEVICE=$(xcrun simctl list devices available | grep -Eo 'iPhone [0-9]+( Pro)?' | head -1)

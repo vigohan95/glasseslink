@@ -319,6 +319,14 @@ final class Session {
     /// first inbound frame (see `recvMessage`).
     private var rxOptions: [RxCandidate] = []
     private var rxSolved = false
+    private var ivSolved = false
+    private var rxIVs: [Data] = []
+
+    static func uniqueIVs(_ list: [Data]) -> [Data] {
+        var out: [Data] = []
+        for iv in list where iv.count == 16 && !out.contains(iv) { out.append(iv) }
+        return out
+    }
     private var nextChannel = chLocalFirst
     private var channels: [UInt16: String] = [:]
     private var idChannel: UInt16?
@@ -459,12 +467,23 @@ final class Session {
             } else {
                 plain = sdu
             }
-            let msg: DataX.Message
+            var msg: DataX.Message
             do {
                 msg = try DataX.parse(plain)
             } catch {
-                emit("parse FAILED (\(error))", plain, inbound: true)
-                throw error
+                // A structurally valid MAC with garbage plaintext means the key is right and the
+                // IV is not. Try the other candidates before declaring failure — this is the
+                // difference between "silent 12 s timeout" and a working link.
+                if !ivSolved, let r = recv,
+                   let hit = r.openTryingIVs(sdu, ivs: rxIVs),
+                   let rebuilt = try? DataX.parse(AirShieldPad.unpad(hit.plain)) {
+                    ivSolved = true
+                    emit("rx IV solved (\(hit.iv.hexShort)) after a garbled first frame", nil, inbound: true)
+                    msg = rebuilt
+                } else {
+                    emit("parse FAILED (\(error))", plain, inbound: true)
+                    throw error
+                }
             }
             emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
                  plain, inbound: true)
@@ -620,6 +639,8 @@ final class Session {
                                            ownIV: iv, peerIV: peerEnable?.iv ?? Data(), peerBase: peerEnable?.base ?? 0,
                                            ownBase: baseSeq, quirks: quirks, multikey: multikey)
         emit("rx candidates: \(rxOptions.count)")
+        // The MAC proves the key but not the IV; keep the IVs worth trying for the first frame.
+        rxIVs = Self.uniqueIVs([peerEnable?.iv ?? Data(), iv, Data(repeating: 0, count: 16)])
         peerPubkey = req.pub
         binding = AirShield.channelBinding(glassesChallenge: req.challenge, glassesPubkey: req.pub,
                                            seed: seed, phonePubkey: pub)
