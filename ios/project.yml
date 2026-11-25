@@ -15,6 +15,7 @@ targets:
       - AlbumMediaView.swift
       - AudioOutput.swift
       - MicrophoneCheckView.swift
+      - SpokenQuestionView.swift
       - LocalMediaLibrary.swift
       - ModelClient.swift
       - ModelSheet.swift
@@ -63,12 +64,13 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "0.97"
-        CFBundleVersion: "97"
+        CFBundleShortVersionString: "0.98"
+        CFBundleVersion: "98"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
-        NSMicrophoneUsageDescription: 在你主动测试时检查眼镜麦克风，测试录音仅保存在本机。
+        NSMicrophoneUsageDescription: 在你主动发起语音提问或麦克风测试时使用你选择的麦克风。
+        NSSpeechRecognitionUsageDescription: 将你主动录制的问题在 iPhone 上转写，确认后可发送文字给选定的模型。
         NSLocalNetworkUsageDescription: 通过眼镜 Wi-Fi 导入照片和视频，以及连接你配置的局域网模型或桥接服务。
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true

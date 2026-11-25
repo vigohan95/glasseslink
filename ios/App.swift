@@ -311,8 +311,22 @@ final class Glasses: NSObject, ObservableObject {
         let key = p.identifier.uuidString
         let name = ScanEntry.usableName(p.name)
         var saved = verifiedPeripheralNames
-        saved[key] = name ?? saved[key] ?? ""
+        if let peerKey = session?.verifiedPeerKey {
+            let fingerprint = Data(SHA256.hash(data: peerKey)).hex
+            var peers = UserDefaults.standard.dictionary(forKey: "verifiedPeripheralPeers") as? [String: String] ?? [:]
+            let aliases = peers.filter { $0.key != key && $0.value == fingerprint }.keys.sorted()
+            let priorName = aliases.compactMap { ScanEntry.usableName(saved[$0]) }.first
+            saved[key] = name ?? ScanEntry.usableName(saved[key]) ?? priorName ?? ""
+            for alias in aliases { saved.removeValue(forKey: alias) }
+            let obsoleteIDs = Set(aliases.compactMap(UUID.init(uuidString:)))
+            devices.removeAll { obsoleteIDs.contains($0.id) }
+            peers[key] = fingerprint
+            UserDefaults.standard.set(peers, forKey: "verifiedPeripheralPeers")
+        } else {
+            saved[key] = name ?? saved[key] ?? ""
+        }
         verifiedPeripheralNames = saved
+        UserDefaults.standard.set(key, forKey: "lastPeripheral")
         discoveredPeripherals[p.identifier] = p
 
         let index = devices.firstIndex { $0.id == p.identifier }
@@ -417,7 +431,7 @@ final class Glasses: NSObject, ObservableObject {
             let trustedName = verified[id.uuidString]
             let entry = ScanEntry(id: id, peripheralName: name, verifiedName: trustedName,
                                   advertisementName: old?.advertisementName, rssi: old?.rssi ?? 0,
-                                  isGlasses: source == .systemConnected || Self.matchesGlassesName(name ?? ""),
+                                  isGlasses: source == .systemConnected || ScanEntry.matchesRayBanMetaName(name),
                                   isVerified: trustedName != nil, source: source)
             if let index {
                 if entry != devices[index] { devices[index] = entry }
@@ -477,7 +491,6 @@ final class Glasses: NSObject, ObservableObject {
         discoveryMessage = nil
         peripheral = p
         p.delegate = self
-        UserDefaults.standard.set(id.uuidString, forKey: "lastPeripheral")
         let name = ScanEntry.usableName(p.name) ?? ScanEntry.usableName(verifiedPeripheralNames[id.uuidString])
         note("连接 \(name ?? devices.first(where: { $0.id == id })?.displayName ?? "未命名设备") …")
         let attempt = UUID()
@@ -490,12 +503,16 @@ final class Glasses: NSObject, ObservableObject {
             let reason = p.state == .connected ? "打开眼镜蓝牙通道超时" : "蓝牙连接眼镜超时"
             self.failConnection(reason, peripheral: p)
         }
+        let bridgeAudio = !forRegistration && verifiedPeripheralNames[id.uuidString] != nil
+            && UserDefaults.standard.bool(forKey: "requestedGlassesAudioBridging")
+        let options: [String: Any]? = bridgeAudio ? [CBConnectPeripheralOptionEnableTransportBridgingKey: true] : nil
         if p.state == .connected {
+            if let options { central.connect(p, options: options) }
             openLink(p)
         } else if p.state == .disconnecting {
             reconnectAfterDisconnect = (id, forRegistration)
         } else {
-            central.connect(p, options: nil)
+            central.connect(p, options: options)
         }
     }
 
@@ -694,7 +711,7 @@ final class Glasses: NSObject, ObservableObject {
         settings = [:]
         status = GlassesState()
         recording = false
-        recordStartedAt = nil
+        recordingCatalogBaseline = nil
         recordDeadline = nil
         autoStopTask?.cancel()
         autoStopTask = nil
@@ -722,6 +739,10 @@ final class Glasses: NSObject, ObservableObject {
         if p.state != .disconnected { central.cancelPeripheralConnection(p) }
         if let underlying { note("蓝牙通道错误：\(underlying)") }
         finishRecoveryOrShowFailure(p.identifier, reason: reason)
+        if recoveryTask == nil, mediaImportID == nil, !autoReconnectSuppressed,
+           savedGlassesID == p.identifier, reason == "蓝牙连接眼镜超时", central.state == .poweredOn {
+            startScan()
+        }
     }
 
     private func allowRecoveryForUnexpectedLoss(of id: UUID) {
@@ -1127,16 +1148,21 @@ final class Glasses: NSObject, ObservableObject {
             guard mediaImportID == job else { throw CancellationError() }
             mediaWiFiSwitching = true
             transferDetail = manual ? "Wi-Fi · 等待手动加入热点" : "Wi-Fi · 正在加入眼镜热点"
-            if manual {
-                guard await askToJoinMediaWiFi(endpoint, id: job) else { throw MediaWiFiError.hotspotUserDenied }
-            }
             guard mediaImportID == job else { throw CancellationError() }
             let connectTask = Task {
-                if manual {
-                    return try await MediaWiFiTransport.connectManuallyJoined(host: endpoint.address, port: endpoint.port)
+                if !manual {
+                    do {
+                        return try await MediaWiFiTransport.connect(ssid: endpoint.ssid, passphrase: endpoint.password,
+                                                                    host: endpoint.address, port: endpoint.port)
+                    } catch let error as MediaWiFiError where error.canOfferManualJoin {
+                        guard self.mediaImportID == job, !Task.isCancelled else { throw CancellationError() }
+                        self.note("眼镜热点已创建，iOS 自动加入失败：\(error.diagnosticDescription)")
+                        self.transferDetail = "Wi-Fi · 等待手动加入同一热点"
+                    }
                 }
-                return try await MediaWiFiTransport.connect(ssid: endpoint.ssid, passphrase: endpoint.password,
-                                                            host: endpoint.address, port: endpoint.port)
+                guard await self.askToJoinMediaWiFi(endpoint, id: job) else { throw MediaWiFiError.hotspotUserDenied }
+                try Task.checkCancellation()
+                return try await MediaWiFiTransport.connectManuallyJoined(host: endpoint.address, port: endpoint.port)
             }
             mediaWiFiConnectTask = connectTask
             let transport = try await connectTask.value
@@ -1264,14 +1290,13 @@ final class Glasses: NSObject, ObservableObject {
         if queueCameraDuringImport(.photo) { return }
         Task {
             _ = await withGlassesOperation { active in
-                let started = Date()
-                mediaMessage = "正在等待眼镜确认拍照…"
+                mediaMessage = "正在拍照…"
+                let baseline = try await catalogBeforeCapture(on: active)
                 let cameraState = try await onGlassesQueue { try active.shutterPhoto() }
                 try checkActive(active)
-                status.camera = cameraState.camera
-                mediaMessage = "眼镜已响应快门，正在检查新照片…"
-                note("眼镜确认拍照开始")
-                await verifyNewCapture(on: active, since: started, photo: true)
+                if let cameraState { status.camera = cameraState.camera }
+                note(cameraState == nil ? "拍照：未收到相机状态，改查新照片" : "拍照：眼镜确认开始")
+                await verifyNewCapture(on: active, baseline: baseline, photo: true, acknowledged: cameraState != nil)
             }
         }
     }
@@ -1282,6 +1307,8 @@ final class Glasses: NSObject, ObservableObject {
             _ = await withGlassesOperation { active in
                 let stopping = recording
                 mediaMessage = stopping ? "正在等待眼镜确认停止录像…" : "正在等待眼镜确认开始录像…"
+                var baseline = recordingCatalogBaseline
+                if !stopping { baseline = try await catalogBeforeCapture(on: active) }
                 let cameraState = try await onGlassesQueue {
                     try (stopping ? active.stopVideo() : active.startVideo())
                 }
@@ -1294,11 +1321,10 @@ final class Glasses: NSObject, ObservableObject {
                     recordDeadline = nil
                     mediaMessage = "眼镜已确认停止录像，正在查询新视频…"
                     note("眼镜确认停止录像")
-                    let started = recordStartedAt
-                    recordStartedAt = nil
-                    await verifyNewCapture(on: active, since: started, photo: false)
+                    recordingCatalogBaseline = nil
+                    await verifyNewCapture(on: active, baseline: baseline, photo: false, acknowledged: true)
                 } else {
-                    recordStartedAt = Date()
+                    recordingCatalogBaseline = baseline
                     scheduleAutoStop()
                     mediaMessage = nil
                     note("眼镜确认开始录像")
@@ -1350,38 +1376,52 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
     @Published var recordDeadline: Date?
-    private var recordStartedAt: Date?
+    private var recordingCatalogBaseline: [Capture]?
 
     private var autoStopTask: Task<Void, Never>?
 
-    private func verifyNewCapture(on active: Session, since started: Date?, photo: Bool) async {
-        let kind = photo ? "照片" : "视频"
-        let result = photo ? "眼镜已响应快门" : "眼镜已停止录像"
-        let known = Set(captures.map(\.id))
-        try? await Task.sleep(nanoseconds: photo ? 300_000_000 : 600_000_000)
-        guard session === active else { return }
+    private func catalogBeforeCapture(on active: Session) async throws -> [Capture]? {
         do {
-            let list = try await onGlassesQueue { try active.captureList(timeout: 5) }
+            let catalog = try await onGlassesQueue { try active.captureList(timeout: 2) }
             try checkActive(active)
-            updateCaptures(list)
-            let expectedKind = photo ? 3073 : 3074
-            let expectedAssetType = photo ? 2 : 1
-            let newCapture = list.contains { item in
-                guard item.kind == expectedKind,
-                      item.assets.contains(where: { $0.type == expectedAssetType && $0.size > 0 }),
-                      !known.contains(item.id), let started,
-                      let timestamp = item.timestampNS else { return false }
-                let recorded = Date(timeIntervalSince1970: Double(timestamp) / 1_000_000_000)
-                return recorded >= started.addingTimeInterval(-10) && recorded <= Date().addingTimeInterval(10)
-            }
-            mediaMessage = newCapture
-                ? "眼镜相册已出现新\(kind)，可以导入。"
-                : "\(result)，暂未查到新\(kind)。"
-        } catch {
-            guard session === active else { return }
-            mediaMessage = "\(result)。相册暂时读不到，请稍后刷新。"
-            note("拍摄后读取相册失败：\(error)")
+            return catalog
+        } catch LinkError.unexpected(_) {
+            try checkActive(active)
+            note("拍摄：拍摄前相册未完成刷新")
+            return nil
         }
+    }
+
+    private func verifyNewCapture(on active: Session, baseline: [Capture]?, photo: Bool, acknowledged: Bool) async {
+        let kind = photo ? "照片" : "视频"
+        mediaMessage = "正在检查眼镜相册里的新\(kind)…"
+        for delay in [350, 850, 1_500] {
+            do {
+                try await Task.sleep(for: .milliseconds(delay))
+                try checkActive(active)
+                let catalog = try await onGlassesQueue { try active.captureList(timeout: 2) }
+                try checkActive(active)
+                updateCaptures(catalog)
+                guard let baseline else {
+                    mediaMessage = "已刷新眼镜相册。本次\(kind)暂无法确认。"
+                    return
+                }
+                if Shutter.hasNewOriginal(in: catalog, comparedTo: baseline, photo: photo) {
+                    mediaMessage = "眼镜相册已出现新\(kind)，可以打开相册导入。"
+                    note("拍摄验证：已发现包含原件的新\(kind)")
+                    return
+                }
+            } catch LinkError.unexpected(_) {
+                continue
+            } catch {
+                reportOperationError(error, session: active)
+                return
+            }
+        }
+        guard session === active else { return }
+        let state = acknowledged ? (photo ? "眼镜已响应快门。" : "眼镜已停止录像。") : "眼镜没有确认拍照。"
+        mediaMessage = "\(state)相册暂未找到新\(kind)。"
+        note("拍摄验证：暂未找到新\(kind)原件")
     }
 
     /// Stops the take when the chosen limit is reached, and shows the countdown in the UI.
@@ -1464,7 +1504,7 @@ final class Glasses: NSObject, ObservableObject {
                 if let camera = current.camera {
                     recording = camera == Status.cameraName(Status.videoStarted)
                     if !recording {
-                        recordStartedAt = nil
+                        recordingCatalogBaseline = nil
                         recordDeadline = nil
                         autoStopTask?.cancel()
                         autoStopTask = nil
@@ -1516,6 +1556,7 @@ final class Glasses: NSObject, ObservableObject {
             return
         }
         let a = Assistant(session: sess)
+        note("眼镜语音：用户请求启用，开始注册眼镜语音")
         assistantMessage = "正在等眼镜确认语音注册…"
         assistantAnswer = ""
         assistantRegistering = true
@@ -1613,6 +1654,7 @@ final class Glasses: NSObject, ObservableObject {
         assistantAnswer = ""
         let client = configuredModel
         assistantMessage = "已收到问题，正在调用 \(client.model)…"
+        note("眼镜语音：已收到转写，开始调用用户配置的模型")
         voiceAnswer = Task { [weak self, weak assistant] in
             guard let self, let assistant else { return }
             let text: String
@@ -1716,6 +1758,18 @@ final class Glasses: NSObject, ObservableObject {
         case .bluetoothLE: audioMediaProfile = "蓝牙 LE 音频"
         default: audioMediaProfile = nil
         }
+    }
+
+    var canRequestGlassesAudioConnection: Bool {
+        canUseGlasses && !phaseBusy && !busy && !settingsLoading && !recording && !albumTransferBatch
+            && live == nil && assistantRef == nil
+    }
+
+    func requestGlassesAudioConnection() {
+        guard canRequestGlassesAudioConnection else { return }
+        UserDefaults.standard.set(true, forKey: "requestedGlassesAudioBridging")
+        note("音频：已请求 iOS 接通眼镜的经典蓝牙音频")
+        reconnect(forRegistration: false)
     }
 
     func beginVideoPlayback() throws {
@@ -2167,12 +2221,6 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
 
-    private nonisolated static func matchesGlassesName(_ name: String) -> Bool {
-        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return normalized.hasPrefix("rb meta") || normalized.hasPrefix("ray-ban meta")
-            || normalized.hasPrefix("ray ban meta")
-    }
-
     nonisolated func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
                                     advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let peripheralName = ScanEntry.usableName(p.name)
@@ -2187,8 +2235,8 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             $0.uuidString == "FD5F" || $0.uuidString == Self.metaService
         }
         let isConnectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue != false
-        let candidate = hasMetaService || hasMetaManufacturer || Self.matchesGlassesName(peripheralName ?? "")
-            || Self.matchesGlassesName(localName ?? "")
+        let candidate = hasMetaService || hasMetaManufacturer || ScanEntry.matchesRayBanMetaName(peripheralName)
+            || ScanEntry.matchesRayBanMetaName(localName)
         let id = p.identifier
         let rssi = RSSI.intValue
         Task { @MainActor in

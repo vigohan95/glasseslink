@@ -46,17 +46,24 @@ struct AlbumMediaView: View {
             .safeAreaInset(edge: .bottom) {
                 if player != nil {
                     HStack {
-                        Label("播放位置", systemImage: g.audioRouteUsesBluetooth ? "headphones" : "speaker.wave.2")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(g.audioRouteName)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.trailing)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Label("视频音频输出", systemImage: g.audioRouteUsesBluetooth ? "headphones" : "speaker.wave.2")
+                                .font(.subheadline.weight(.semibold))
+                            Text(g.audioRouteName)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            if !g.audioRouteUsesBluetooth {
+                                Text("播放时可在 iPhone 控制中心的播放卡片中选择眼镜。")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer(minLength: 8)
                         AudioOutputPicker()
                             .frame(width: 44, height: 44)
                     }
                     .padding(.horizontal, 16)
+                    .padding(.vertical, 7)
                     .background(.ultraThinMaterial)
                 }
             }

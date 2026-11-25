@@ -50,7 +50,8 @@ final class LiveStream {
     enum Phase: String { case idle, starting, running, failed }
 
     let session: Session
-    let layer = AVSampleBufferDisplayLayer()
+    let layer: AVSampleBufferDisplayLayer
+    private let renderer: AVSampleBufferVideoRenderer
 
     private(set) var phase: Phase = .idle
     private(set) var lastError: String?
@@ -70,6 +71,12 @@ final class LiveStream {
     private var frameBuf = Data()
     private var photoBuf = Data()
     private var format: CMVideoFormatDescription?
+    private var codecConfig = Data()
+    private var needsKeyframe = true
+    private var lastRendererError: Int?
+    private var nextVisibilityCheck = Date.distantPast
+    private var reportedVisibleFrame = false  // Read and written on the main queue.
+    private static let maximumEncodedFrameBytes = 8 * 1024 * 1024
     private var windowStart = Date()
     private var windowBytes = 0
     private var windowFrames = 0
@@ -77,6 +84,9 @@ final class LiveStream {
 
     init(session: Session) {
         self.session = session
+        let layer = AVSampleBufferDisplayLayer()
+        self.layer = layer
+        renderer = layer.sampleBufferRenderer
         layer.videoGravity = .resizeAspect
     }
 
@@ -266,13 +276,13 @@ final class LiveStream {
         switch type {
         case StreamType.codecConfig:
             takeCodecConfig(message.payload)
-        case StreamType.videoBuffer:
+        case StreamType.videoBuffer, StreamType.videoEnd:
+            guard message.payload.count <= Self.maximumEncodedFrameBytes - frameBuf.count else {
+                throw LinkError.unexpected("取景视频帧超出可处理大小")
+            }
             frameBuf.append(message.payload)
             meter(message.payload.count)
-        case StreamType.videoEnd:
-            frameBuf.append(message.payload)
-            meter(message.payload.count)
-            finishFrame()
+            if type == StreamType.videoEnd { finishFrame() }
         case StreamType.photoBuffer:
             photoBuf.append(message.payload)
         case StreamType.photoEnd:
@@ -291,12 +301,13 @@ final class LiveStream {
 
     /// CODEC_CONFIGURATION_UPDATE_REQUEST: field 3 is the parameter sets, field 2 says which codec.
     private func takeCodecConfig(_ payload: Data) {
-        guard let f = try? PB.parse(payload), let config = f[3]?.first as? Data else { return }
+        guard let f = try? PB.parse(payload), let config = f[3]?.first as? Data, config != codecConfig else { return }
         let units = Self.annexBUnits(config)
-        guard !units.isEmpty else { return }
         if let fmt = Self.hevcFormat(units) {
+            codecConfig = config
             format = fmt
-            layer.flush()
+            renderer.flush()
+            needsKeyframe = true
             log("codec config: HEVC, \(units.count) parameter sets")
         }
     }
@@ -312,17 +323,41 @@ final class LiveStream {
         }
         let annex = whole.subdata(in: 8..<whole.count)
         let units = Self.annexBUnits(annex)
-        guard let time = CMTimeValue(exactly: UInt64(littleEndian: pts)), !units.isEmpty, let fmt = format,
+        let types = units.compactMap(Self.hevcNALType)
+        guard let time = CMTimeValue(exactly: UInt64(littleEndian: pts)), let fmt = format,
+              types.contains(where: { $0 <= 31 }) else { return }
+        let now = Date()
+        lastFrameAt = now
+        let isSync = types.contains(where: { (16...21).contains($0) })
+        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
+            let code = (renderer.error as NSError?)?.code ?? 0
+            if lastRendererError != code { log("video renderer needs reset (\(code))") }
+            lastRendererError = code
+            renderer.flush()
+            needsKeyframe = true
+        }
+        if !needsKeyframe, !renderer.isReadyForMoreMediaData {
+            // Dropping compressed video can remove references for later frames. Resume at a keyframe.
+            renderer.flush()
+            needsKeyframe = true
+        }
+        guard !needsKeyframe || isSync,
               let sample = Self.sampleBuffer(units: units, format: fmt,
-                                             pts: CMTime(value: time, timescale: 1_000_000)) else { return }
-        if layer.status == .failed { layer.flush() }
-        layer.enqueue(sample)
-        lastFrameAt = Date()
+                                             pts: CMTime(value: time, timescale: 1_000_000), isSync: isSync) else { return }
+        renderer.enqueue(sample)
+        needsKeyframe = false
         frames += 1
         windowFrames += 1
         if phase != .running { setPhase(.running) }
-        if let dims = CMSampleBufferGetFormatDescription(sample).map(CMVideoFormatDescriptionGetDimensions) {
-            decodedSize = CGSize(width: Int(dims.width), height: Int(dims.height))
+        let dims = CMVideoFormatDescriptionGetDimensions(fmt)
+        decodedSize = CGSize(width: Int(dims.width), height: Int(dims.height))
+        if now >= nextVisibilityCheck {
+            nextVisibilityCheck = now.addingTimeInterval(1)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.reportedVisibleFrame, self.isRunning, self.layer.isReadyForDisplay else { return }
+                self.reportedVisibleFrame = true
+                self.log("first preview frame ready for display")
+            }
         }
     }
 
@@ -400,12 +435,10 @@ final class LiveStream {
 
     /// Builds the format description from VPS/SPS/PPS; HEVC wants 4-byte NAL lengths.
     static func hevcFormat(_ units: [Data]) -> CMVideoFormatDescription? {
-        let params = units.filter { u in
-            guard let h = u.first else { return false }
-            let t = (h >> 1) & 0x3F
-            return t == 32 || t == 33 || t == 34     // VPS, SPS, PPS
+        let params = units.filter { unit in
+            Self.hevcNALType(unit).map { (32...34).contains($0) } ?? false
         }
-        guard !params.isEmpty else { return nil }
+        guard Set(params.compactMap(Self.hevcNALType)).count == 3 else { return nil }
         var pointers: [UnsafePointer<UInt8>] = []
         var sizes: [Int] = []
         var kept: [UnsafeMutablePointer<UInt8>] = []
@@ -436,34 +469,53 @@ final class LiveStream {
         return fmt
     }
 
-    /// Annex-B NAL units into one AVCC sample buffer the display layer takes.
-    static func sampleBuffer(units: [Data], format: CMVideoFormatDescription, pts: CMTime) -> CMSampleBuffer? {
-        var avcc = Data()
-        for u in units {
-            var len = UInt32(u.count).bigEndian
-            withUnsafeBytes(of: &len) { avcc.append(contentsOf: $0) }
-            avcc.append(u)
+    static func hevcNALType(_ unit: Data) -> UInt8? {
+        guard unit.count >= 2, let header = unit.first else { return nil }
+        return (header >> 1) & 0x3F
+    }
+
+    /// Puts length-prefixed NALs in memory owned by Core Media for the renderer's asynchronous use.
+    static func sampleBuffer(units: [Data], format: CMVideoFormatDescription, pts: CMTime,
+                             isSync: Bool) -> CMSampleBuffer? {
+        var sampleBytes = Data()
+        for unit in units {
+            guard unit.count >= 2, let count = UInt32(exactly: unit.count) else { return nil }
+            var length = count.bigEndian
+            withUnsafeBytes(of: &length) { sampleBytes.append(contentsOf: $0) }
+            sampleBytes.append(unit)
         }
+        guard !sampleBytes.isEmpty else { return nil }
         var block: CMBlockBuffer?
-        let mem = UnsafeMutableRawPointer.allocate(byteCount: max(1, avcc.count), alignment: 1)
-        avcc.copyBytes(to: mem.assumingMemoryBound(to: UInt8.self), count: avcc.count)
         let created = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault, memoryBlock: mem, blockLength: avcc.count,
-            blockAllocator: kCFAllocatorNull, customBlockSource: nil, offsetToData: 0,
-            dataLength: avcc.count, flags: 0, blockBufferOut: &block)
-        guard created == kCMBlockBufferNoErr, let block else {
-            mem.deallocate()
-            return nil
+            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: sampleBytes.count,
+            blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
+            dataLength: sampleBytes.count, flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block)
+        guard created == kCMBlockBufferNoErr, let block else { return nil }
+        let copied = sampleBytes.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            CMBlockBufferReplaceDataBytes(with: bytes.baseAddress!, blockBuffer: block,
+                                          offsetIntoDestination: 0, dataLength: bytes.count)
         }
-        var sampleSize = avcc.count
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30), presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+        guard copied == kCMBlockBufferNoErr else { return nil }
+        var sampleSize = sampleBytes.count
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
         var sample: CMSampleBuffer?
         let status = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format,
             sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
             sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize, sampleBufferOut: &sample)
-        // The block buffer owns the memory now; the block allocator is null so free it with the buffer.
-        guard status == noErr, let sample else { return nil }
+        guard status == noErr, let sample,
+              let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
+              CFArrayGetCount(attachments) == 1,
+              let first = CFArrayGetValueAtIndex(attachments, 0) else { return nil }
+        let dictionary = Unmanaged<CFMutableDictionary>.fromOpaque(first).takeUnretainedValue()
+        // The glasses' PTS does not run on the phone's display clock.
+        let display = Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque()
+        let value = Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+        CFDictionarySetValue(dictionary, display, value)
+        if !isSync {
+            let notSync = Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque()
+            CFDictionarySetValue(dictionary, notSync, value)
+        }
         return sample
     }
 }

@@ -6,20 +6,35 @@ import UIKit
 struct LiveLayerView: UIViewRepresentable {
     let layer: AVSampleBufferDisplayLayer
 
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
+    final class Surface: UIView {
+        private var displayLayer: AVSampleBufferDisplayLayer?
+
+        func show(_ layer: AVSampleBufferDisplayLayer) {
+            guard displayLayer !== layer else { return }
+            displayLayer?.removeFromSuperlayer()
+            displayLayer = layer
+            self.layer.addSublayer(layer)
+            setNeedsLayout()
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            displayLayer?.frame = bounds
+            CATransaction.commit()
+        }
+    }
+
+    func makeUIView(context: Context) -> Surface {
+        let view = Surface()
         view.backgroundColor = .black
-        layer.frame = view.bounds
-        layer.videoGravity = .resizeAspect
-        view.layer.addSublayer(layer)
+        view.show(layer)
         return view
     }
 
-    func updateUIView(_ view: UIView, context: Context) {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.frame = view.bounds
-        CATransaction.commit()
+    func updateUIView(_ view: Surface, context: Context) {
+        view.show(layer)
     }
 }
 
@@ -35,6 +50,11 @@ struct LiveView: View {
                         .frame(maxWidth: .infinity)
                         .aspectRatio(9.0 / 16.0, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .overlay {
+                            if !live.layer.isReadyForDisplay, live.lastError == nil {
+                                Text("正在等待取景画面…").font(.footnote).foregroundStyle(.white)
+                            }
+                        }
                         .overlay(alignment: .topLeading) {
                             Text(g.liveLine)
                                 .font(.system(size: 11, design: .monospaced))

@@ -1,8 +1,35 @@
 import Foundation
+import NetworkExtension
 import XCTest
 @testable import GlassesLink
 
 final class MediaWiFiTests: XCTestCase {
+    func testAutomaticJoinErrorOffersManualJoinWithoutLeakingSystemDetails() {
+        let code = NEHotspotConfigurationError.systemConfiguration.rawValue
+        let error = NSError(domain: NEHotspotConfigurationErrorDomain, code: code,
+                            userInfo: [NSLocalizedDescriptionKey: "private system details"])
+        guard case .failure(let failure) = MediaWiFiError.hotspotOutcome(error) else {
+            return XCTFail("automatic join should report the configuration failure")
+        }
+        XCTAssertTrue(failure.canOfferManualJoin)
+        XCTAssertTrue(failure.diagnosticDescription.contains(String(code)))
+        XCTAssertFalse(failure.diagnosticDescription.contains("private system details"))
+    }
+
+    func testJoinDeclinedDoesNotOfferAnotherJoin() throws {
+        let declined = NSError(domain: NEHotspotConfigurationErrorDomain,
+                               code: NEHotspotConfigurationError.userDenied.rawValue)
+        guard case .failure(let failure) = MediaWiFiError.hotspotOutcome(declined) else {
+            return XCTFail("automatic join should report the user declined")
+        }
+        XCTAssertFalse(failure.canOfferManualJoin)
+
+        let existing = NSError(domain: NEHotspotConfigurationErrorDomain,
+                               code: NEHotspotConfigurationError.alreadyAssociated.rawValue)
+        XCTAssertFalse(try MediaWiFiError.hotspotOutcome(existing).get())
+        XCTAssertTrue(try MediaWiFiError.hotspotOutcome(nil).get())
+    }
+
     func testCreateRequestUsesATCSoftAPFields() throws {
         let id = try XCTUnwrap(UUID(uuidString: "00112233-4455-4677-8899-AABBCCDDEEFF"))
         let encoded = try MediaWiFiProtocol.makeRequest(countryCode: "us", id: id,

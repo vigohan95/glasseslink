@@ -1,3 +1,5 @@
+import AVFoundation
+import Combine
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -989,6 +991,7 @@ struct AssistantTab: View {
     let openDevice: () -> Void
     @State private var question = ""
     @State private var showModel = false
+    @State private var showSpokenQuestion = false
     @State private var includePhoto = false
     @FocusState private var typing: Bool
 
@@ -1018,6 +1021,11 @@ struct AssistantTab: View {
                 ToolbarItem(placement: .topBarLeading) { StatusCapsule(g: g) { openDevice() } }
             }
             .sheet(isPresented: $showModel) { ModelSheet(g: g) }
+            .sheet(isPresented: $showSpokenQuestion) {
+                SpokenQuestionView(glassesName: g.connectedGlassesName, modelName: g.modelName) { prompt in
+                    g.ask(prompt)
+                }
+            }
         }
     }
 
@@ -1061,7 +1069,19 @@ struct AssistantTab: View {
             }
             if let message = g.assistantMessage {
                 Text(message).font(.subheadline).foregroundStyle(.secondary)
+            } else if g.canUseGlasses && !g.assistantOn && !g.assistantRegistering {
+                Text("先启用眼镜语音，再说「Hey Meta」。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
+            Button {
+                typing = false
+                showSpokenQuestion = true
+            } label: {
+                Label("点按说话", systemImage: "waveform.circle")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(g.askingModel || g.modelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             if g.assistantTranscriptMissing {
                 Button("打开键盘听写") { typing = true }
                     .buttonStyle(.bordered)
@@ -1215,6 +1235,8 @@ struct OwnerBadge: View {
 struct DeviceTabBody: View {
     @ObservedObject var g: Glasses
     @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var audioTest = AudioRouteTest()
     @State private var showSettings = false
     @State private var showQuick = false
     @State private var showDiagnostics = false
@@ -1226,7 +1248,7 @@ struct DeviceTabBody: View {
     }
 
     private var connectionTitle: String {
-        if g.canUseGlasses { return "眼镜已连接" }
+        if g.canUseGlasses { return "眼镜控制已连接" }
         if g.connected { return "等待主人验证" }
         if case .failed = g.phase { return "连接失败" }
         return g.phaseText
@@ -1261,6 +1283,15 @@ struct DeviceTabBody: View {
         .sheet(isPresented: $showDiagnostics) { NavigationStack { ContentView(g: g) } }
         .sheet(isPresented: $showAbout) { AboutView() }
         .sheet(isPresented: $showMicrophoneCheck) { MicrophoneCheckView(glassesName: g.connectedGlassesName) }
+        .onDisappear { stopAudioTest() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background { stopAudioTest() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { note in
+            if note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt == AVAudioSession.InterruptionType.began.rawValue {
+                stopAudioTest()
+            }
+        }
     }
 
     private var connectionPanel: some View {
@@ -1310,7 +1341,8 @@ struct DeviceTabBody: View {
     private var nearbyPanel: some View {
         let listed = candidates
         let verified = listed.filter(\.isVerified)
-        let nearby = listed.filter { !$0.isVerified }
+        let nearby = listed.filter { !$0.isVerified && !$0.needsIdentification }
+        let unidentified = listed.filter(\.needsIdentification)
 
         return VStack(alignment: .leading, spacing: 12) {
             if !verified.isEmpty {
@@ -1319,7 +1351,7 @@ struct DeviceTabBody: View {
                     .accessibilityAddTraits(.isHeader)
                 ForEach(verified) { candidateRow($0) }
             }
-            if !nearby.isEmpty || verified.isEmpty || g.scanning || g.discoveryMessage != nil {
+            if !nearby.isEmpty || !unidentified.isEmpty || verified.isEmpty || g.scanning || g.discoveryMessage != nil {
                 if !verified.isEmpty { Divider() }
 
                 Text("待确认的设备")
@@ -1327,17 +1359,29 @@ struct DeviceTabBody: View {
                     .accessibilityAddTraits(.isHeader)
                 if let message = g.discoveryMessage {
                     Text(message).font(.footnote).foregroundStyle(.secondary)
-                } else if nearby.isEmpty {
+                } else if nearby.isEmpty && unidentified.isEmpty {
                     if g.scanning {
                         ProgressView("扫描附近的眼镜…").font(.footnote)
                     }
                     Text(g.hasSavedGlasses && !g.scanning
                          ? "眼镜开机并在手机附近时，可以直接重连。"
-                         : "首次连接时，折叠两侧镜腿，按住拍摄键直到镜框内侧的指示灯闪蓝。")
+                         : "首次连接时，将开机的眼镜放回充电盒，按住盒背按钮约 5 秒，等指示灯闪蓝后扫描。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
                 ForEach(nearby) { candidateRow($0) }
+                if !unidentified.isEmpty {
+                    DisclosureGroup("更多蓝牙候选（\(unidentified.count)）") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("这些广播的眼镜名称还待确认。名称缺失时，用 iPhone 蓝牙标识的后四位区分条目。")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            ForEach(unidentified) { candidateRow($0) }
+                        }
+                        .padding(.top, 8)
+                    }
+                    .font(.subheadline)
+                }
             }
             if g.hasSavedGlasses && !g.scanning && !g.phaseBusy {
                 Button("扫描眼镜") { g.startScan() }.buttonStyle(.bordered)
@@ -1398,10 +1442,11 @@ struct DeviceTabBody: View {
                     .frame(width: 28)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("音频与麦克风").font(.headline)
-                    Text("本 App 读到的输出：\(g.audioRouteName)")
+                    Text("蓝牙音频与麦克风").font(.headline)
+                    Text("播放输出 · \(g.audioRouteName)")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                        .accessibilityLabel("当前播放输出，\(g.audioRouteName)")
                     if let profile = g.audioMediaProfile {
                         Text(profile)
                             .font(.caption)
@@ -1412,24 +1457,42 @@ struct DeviceTabBody: View {
                 AudioOutputPicker()
                     .frame(width: 44, height: 44)
             }
-            Text("拍摄和导入使用 GlassesLink 的眼镜连接。抖音、音乐和通话使用 iPhone 的系统蓝牙音频。")
+            Text("拍摄和导入走眼镜控制连接。播放声音由 iPhone 选择音频设备。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 5) {
-                Text("用眼镜听抖音").font(.subheadline.weight(.semibold))
-                Text("1. 打开 iPhone「设置 → 蓝牙」，确认眼镜显示「已连接」。")
-                Text("2. 播放抖音时打开「控制中心」，点播放卡片的音频输出图标，选择眼镜。")
-            }
-            .font(.footnote)
-            Button { g.readAudioOutput() } label: {
-                Label("重新读取本 App 的音频输出", systemImage: "arrow.clockwise")
-                    .font(.footnote)
+            Button { g.requestGlassesAudioConnection() } label: {
+                Label("尝试接通眼镜音频", systemImage: "headphones")
             }
             .buttonStyle(.bordered)
+            .disabled(!g.canRequestGlassesAudioConnection)
+            .accessibilityHint("会重新连接眼镜，并请求 iPhone 接通蓝牙音频")
+            Button {
+                if audioTest.isPlaying { stopAudioTest() }
+                else { audioTest.start { g.readAudioOutput() } }
+            } label: {
+                Label(audioTest.isPlaying ? "停止测试音" : "播放测试音",
+                      systemImage: audioTest.isPlaying ? "stop.circle" : "play.circle")
+            }
+            .buttonStyle(.bordered)
+            if let error = audioTest.error { Text(error).font(.footnote).foregroundStyle(.secondary) }
+            Text(audioTest.isPlaying
+                 ? "测试音持续 15 秒。可打开 iPhone 控制中心，在播放卡片中选择眼镜。"
+                 : "先在「设置 → 蓝牙」确认眼镜已连接。播放视频或抖音时，在控制中心的播放卡片中选择眼镜。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             Divider()
-            actionRow("测试眼镜麦克风", icon: "mic") { showMicrophoneCheck = true }
+            actionRow("测试眼镜麦克风", icon: "mic") {
+                stopAudioTest()
+                showMicrophoneCheck = true
+            }
         }
         .glassesPanel(padding: 13)
+    }
+
+    private func stopAudioTest() {
+        guard audioTest.isPlaying else { return }
+        audioTest.stop()
+        g.readAudioOutput()
     }
 
     private func statusMetric(_ title: String, value: String?, icon: String, detail: String? = nil) -> some View {
@@ -1513,6 +1576,9 @@ struct DeviceTabBody: View {
                     Text(detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if let alias = device.alternateAdvertisementName {
+                        Text("广播名称 · \(alias)").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 Spacer(minLength: 6)
                 if g.phaseBusy && g.connectingID == device.id {

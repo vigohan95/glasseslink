@@ -58,11 +58,28 @@ enum Shutter {
     static func stopVideoPayload() -> Data {
         intent(actionCloseCapture)
     }
+
+    // The glasses' wall clock can lag the phone. Compare a fresh catalog from before
+    // the action with the returned originals, including their media type and size.
+    static func hasNewOriginal(in captures: [Capture], comparedTo baseline: [Capture], photo: Bool) -> Bool {
+        let captureKind = photo ? 3073 : 3074
+        let assetType = photo ? 2 : 1
+        let known = Set(baseline.filter { $0.kind == captureKind }.flatMap(\.assets)
+            .filter { $0.type == assetType && $0.size > 0 }.map { $0.uuid.lowercased() })
+        return captures.contains { capture in
+            capture.kind == captureKind && capture.assets.contains { asset in
+                asset.type == assetType && asset.size > 0 && UUID(uuidString: asset.uuid) != nil
+                    && !known.contains(asset.uuid.lowercased())
+            }
+        }
+    }
 }
 
 extension Session {
-    func shutterPhoto() throws -> GlassesState {
-        try confirmedShutter(Shutter.photoPayload()) { $0 == Status.photoStarted }
+    func shutterPhoto() throws -> GlassesState? {
+        try shutterAcknowledgement(Shutter.photoPayload(), timeout: 2.5) {
+            $0 == Status.photoStarted
+        }
     }
 
     func startVideo() throws -> GlassesState {

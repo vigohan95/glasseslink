@@ -1471,11 +1471,19 @@ final class Session {
     }
 
     func confirmedShutter(_ payload: Data, matching confirmed: (Int) -> Bool) throws -> GlassesState {
+        guard let state = try shutterAcknowledgement(payload, timeout: 5, matching: confirmed) else {
+            throw LinkError.unexpected("眼镜没有确认拍摄状态")
+        }
+        return state
+    }
+
+    func shutterAcknowledgement(_ payload: Data, timeout: TimeInterval,
+                                 matching confirmed: (Int) -> Bool) throws -> GlassesState? {
         if !statusSubscribed { _ = try subscribeStatus(timeout: 2, requireReport: false) }
         let ch = statusChannel()
         try sendOnService("status", service: Shutter.service, type: Shutter.mtSnIntent, payload: payload)
 
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(timeout)
         var state = GlassesState()
         var lastType: Int?
         while deadline.timeIntervalSinceNow > 0 {
@@ -1492,7 +1500,7 @@ final class Session {
             if camera == 4 || camera == 6 { throw LinkError.unexpected("眼镜报告拍摄失败") }
             if confirmed(camera) { return state }
         }
-        throw LinkError.unexpected("眼镜没有确认拍摄状态")
+        return nil
     }
 
     // MARK: svc31 settings (write-only)

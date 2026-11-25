@@ -35,7 +35,18 @@ struct ScanEntry: Identifiable, Equatable {
         return trimmed
     }
 
+    static func matchesRayBanMetaName(_ name: String?) -> Bool {
+        guard let name = usableName(name) else { return false }
+        let normalized = name.lowercased().filter { $0.isLetter || $0.isNumber }
+        return normalized.hasPrefix("rbmeta") || normalized.hasPrefix("raybanmeta")
+    }
+
     var isVisibleCandidate: Bool { isVerified || isGlasses || source != .advertisement }
+
+    var needsIdentification: Bool {
+        !isVerified && source == .advertisement
+            && !Self.matchesRayBanMetaName(peripheralName) && !Self.matchesRayBanMetaName(advertisementName)
+    }
 
     var name: String? { peripheralName ?? verifiedName ?? advertisementName }
 
@@ -52,12 +63,18 @@ struct ScanEntry: Identifiable, Equatable {
         return nil
     }
 
+    var alternateAdvertisementName: String? {
+        guard let advertisementName, let name, name.caseInsensitiveCompare(advertisementName) != .orderedSame else {
+            return nil
+        }
+        return advertisementName
+    }
+
     var sourceLabel: String {
-        if isVerified { return "曾验证的眼镜" }
         switch source {
-        case .systemConnected: return "iPhone 蓝牙已连接"
-        case .previouslySelected: return "上次选择"
-        case .advertisement: return "扫描到的蓝牙候选"
+        case .systemConnected: return "iPhone 列为已连设备"
+        case .previouslySelected: return isVerified ? "来自已验证记录" : "上次选择"
+        case .advertisement: return isVerified ? "已验证 · 扫描发现" : "扫描到的蓝牙候选"
         }
     }
 

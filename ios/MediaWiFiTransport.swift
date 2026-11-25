@@ -11,7 +11,7 @@ protocol SessionTransport: AnyObject {
 enum MediaWiFiError: LocalizedError, CustomStringConvertible {
     case invalidHotspot
     case invalidEndpoint
-    case automaticJoinUnavailable
+    case automaticJoinUnavailable(systemCode: Int?)
     case hotspotUserDenied
     case hotspotBusy
     case hotspotRequiresForeground
@@ -21,6 +21,18 @@ enum MediaWiFiError: LocalizedError, CustomStringConvertible {
     case connectionFailed
 
     var errorDescription: String? { description }
+
+    var canOfferManualJoin: Bool {
+        if case .automaticJoinUnavailable = self { return true }
+        return false
+    }
+
+    var diagnosticDescription: String {
+        if case let .automaticJoinUnavailable(code?) = self {
+            return "\(description)（系统热点错误代码 \(code)）"
+        }
+        return description
+    }
 
     var description: String {
         switch self {
@@ -34,6 +46,23 @@ enum MediaWiFiError: LocalizedError, CustomStringConvertible {
         case .localNetworkDenied: return "请在 iPhone 设置中允许 GlassesLink 访问本地网络。"
         case .connectionTimeout: return "连接眼镜 Wi-Fi 数据通道超时。"
         case .connectionFailed: return "无法连接眼镜 Wi-Fi 数据通道。"
+        }
+    }
+
+    /// The boolean indicates whether the app owns a configuration to remove on disconnect.
+    static func hotspotOutcome(_ error: Error?) -> Result<Bool, MediaWiFiError> {
+        guard let error else { return .success(true) }
+        let nsError = error as NSError
+        guard nsError.domain == NEHotspotConfigurationErrorDomain else {
+            return .failure(.automaticJoinUnavailable(systemCode: nil))
+        }
+        switch NEHotspotConfigurationError(rawValue: nsError.code) {
+        case .alreadyAssociated: return .success(false)
+        case .userDenied: return .failure(.hotspotUserDenied)
+        case .applicationIsNotInForeground: return .failure(.hotspotRequiresForeground)
+        case .pending: return .failure(.hotspotBusy)
+        case .invalid, .invalidSSID, .invalidWPAPassphrase: return .failure(.invalidHotspot)
+        default: return .failure(.automaticJoinUnavailable(systemCode: nsError.code))
         }
     }
 }
@@ -65,27 +94,8 @@ final class MediaWiFiTransport: SessionTransport, @unchecked Sendable {
         configuration.joinOnce = true
         let joined = MediaWiFiAwaiter<Bool>()
         manager.apply(configuration) { error in
-            if let error {
-                let nsError = error as NSError
-                guard nsError.domain == NEHotspotConfigurationErrorDomain else {
-                    joined.resolve(.failure(MediaWiFiError.automaticJoinUnavailable))
-                    return
-                }
-                switch NEHotspotConfigurationError(rawValue: nsError.code) {
-                case .alreadyAssociated:
-                    joined.resolve(.success(false))
-                case .userDenied:
-                    joined.resolve(.failure(MediaWiFiError.hotspotUserDenied))
-                case .applicationIsNotInForeground:
-                    joined.resolve(.failure(MediaWiFiError.hotspotRequiresForeground))
-                case .pending:
-                    joined.resolve(.failure(MediaWiFiError.hotspotBusy))
-                case .invalid, .invalidSSID, .invalidWPAPassphrase:
-                    joined.resolve(.failure(MediaWiFiError.invalidHotspot))
-                default:
-                    joined.resolve(.failure(MediaWiFiError.automaticJoinUnavailable))
-                }
-            } else if !joined.resolve(.success(true)) {
+            let outcome = MediaWiFiError.hotspotOutcome(error)
+            if !joined.resolve(outcome.mapError { $0 as Error }), case .success(true) = outcome {
                 // The OS can grant consent after the waiting task has timed out or been cancelled.
                 manager.removeConfiguration(forSSID: ssid)
             }

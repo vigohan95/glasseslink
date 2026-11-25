@@ -300,6 +300,19 @@ final class ProtocolTests: XCTestCase {
 
     // MARK: - camera shutter
 
+    func testNewCaptureConfirmationUsesOriginalAssetRatherThanGlassesClock() {
+        let old = CaptureAsset(uuid: "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa", type: 1, delivered: false, size: 2_048)
+        let new = CaptureAsset(uuid: "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb", type: 1, delivered: false, size: 3_072)
+        let pending = CaptureAsset(uuid: new.uuid, type: 1, delivered: false, size: 0)
+        let baseline = [Capture(handle: "old", kind: 3074, timestampNS: 20, assets: [old])]
+        let unfinished = Capture(handle: "new", kind: 3074, timestampNS: nil, assets: [pending])
+        let finished = Capture(handle: "new", kind: 3074, timestampNS: 10, assets: [new])
+        XCTAssertFalse(Shutter.hasNewOriginal(in: baseline, comparedTo: baseline, photo: false))
+        XCTAssertFalse(Shutter.hasNewOriginal(in: [unfinished], comparedTo: baseline, photo: false))
+        XCTAssertTrue(Shutter.hasNewOriginal(in: [finished], comparedTo: baseline, photo: false))
+        XCTAssertFalse(Shutter.hasNewOriginal(in: [finished], comparedTo: baseline, photo: true))
+    }
+
     func testCameraStateCodesMatchShutterConfirmations() {
         XCTAssertEqual(Status.cameraCode(PB.uint(3, 1)), Status.photoStarted)
         XCTAssertEqual(Status.cameraCode(PB.uint(3, 2)), Status.videoStarted)
