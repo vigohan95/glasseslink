@@ -15,6 +15,9 @@ struct RootView: View {
     private enum Tab: Hashable { case album, camera, assistant, device }
 
     private var importBadge: String? { g.mediaImportInProgress ? "导入中" : nil }
+    private var shouldPollGlassesStatus: Bool {
+        selectedTab == .device && scenePhase == .active && g.canUseGlasses && !g.mediaImportInProgress
+    }
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -33,16 +36,19 @@ struct RootView: View {
                 .tag(Tab.assistant)
         }
         .tint(GlassesTheme.accent)
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase, initial: true) { _, phase in
             if phase == .active {
                 g.readAudioOutput()
                 g.autoReconnect()
+            } else if phase == .background {
+                g.suspendReconnectForBackground()
+                LogStore.shared.flushToDisk()
             }
         }
-        .task(id: selectedTab == .device && scenePhase == .active) {
-            guard selectedTab == .device, scenePhase == .active else { return }
+        .task(id: shouldPollGlassesStatus) {
+            guard shouldPollGlassesStatus else { return }
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(15)) } catch { return }
+                do { try await Task.sleep(for: .seconds(60)) } catch { return }
                 g.refreshVisibleDeviceStatus()
             }
         }
@@ -155,7 +161,7 @@ struct StatusCapsule: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
-                if g.phaseBusy {
+                if g.phaseBusy || g.mediaImportInProgress {
                     ProgressView().controlSize(.mini)
                 } else {
                     Circle()
@@ -163,7 +169,7 @@ struct StatusCapsule: View {
                               : { if case .failed = g.phase { return Color.red }; return Color.orange }())
                         .frame(width: 7, height: 7)
                 }
-                Text(g.connected && !g.canUseGlasses ? "待验证" : g.phaseText)
+                Text(g.mediaImportInProgress ? "导入中" : (g.connected && !g.canUseGlasses ? "待验证" : g.phaseText))
                     .font(.caption.weight(.semibold))
                     .lineLimit(1)
                 if g.canUseGlasses, let b = g.status.batteryPercent {
@@ -205,8 +211,6 @@ struct AlbumTab: View {
     @Environment(\.dynamicTypeSize) private var typeSize
     @State private var library: Library = .glasses
     @State private var filter: Filter = .all
-    @State private var inFlight: String?
-    @State private var failed: Set<String> = []
     @State private var preview: AlbumMediaSelection?
     @State private var isSelecting = false
     @State private var selectedIDs: Set<String> = []
@@ -225,10 +229,11 @@ struct AlbumTab: View {
         [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 245 : 140), spacing: 10, alignment: .top)]
     }
 
-    private var displayedLibrary: Library { g.canUseGlasses ? library : .local }
-    private var canDelete: Bool { g.canDeleteGlassesCaptures && inFlight == nil && !isDeleting }
+    private var canBrowseGlasses: Bool { g.canUseGlasses || g.mediaImportInProgress }
+    private var displayedLibrary: Library { canBrowseGlasses ? library : .local }
+    private var canDelete: Bool { g.canDeleteGlassesCaptures && !isDeleting }
     private var canStartTransfer: Bool {
-        g.canUseGlasses && inFlight == nil && !g.mediaImportInProgress && !g.busy && !isSelecting && !isDeleting
+        g.canStartMediaImport && !isSelecting && !isDeleting
     }
 
     private var selectableRows: [Capture] {
@@ -360,7 +365,7 @@ struct AlbumTab: View {
 
     private var filters: some View {
         HStack(spacing: 12) {
-            if g.canUseGlasses {
+            if canBrowseGlasses {
                 Picker("相册来源", selection: $library) {
                     ForEach(Library.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
@@ -439,18 +444,25 @@ struct AlbumTab: View {
 
     @ViewBuilder
     private var transferStatus: some View {
-        if inFlight != nil || g.mediaImportInProgress {
+        if g.mediaImportInProgress {
             VStack(alignment: .leading, spacing: 7) {
                 let title = g.mediaMessage ?? "正在从眼镜导入…"
-                if let inFlight, let fraction = g.progress[inFlight], fraction.isFinite, fraction > 0 {
+                if let id = g.mediaImportCurrentID, let fraction = g.progress[id], fraction.isFinite, fraction > 0 {
                     ProgressView(title, value: min(fraction, 1)).font(.footnote)
                 } else {
                     ProgressView(title).font(.footnote)
                 }
-                if let detail = g.transferDetail {
-                    Text(detail)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("已完成 \(g.mediaImportCompleteCount)/\(g.mediaImportTotal) 项")
+                        if let detail = g.transferDetail { Text(detail) }
+                    }
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    Spacer()
+                    Button(g.mediaImportCancelling ? "正在停止…" : "停止导入") { g.cancelMediaImport() }
+                        .font(.footnote)
+                        .disabled(g.mediaImportCancelling)
                 }
             }
             .glassesPanel(padding: 12)
@@ -522,7 +534,6 @@ struct AlbumTab: View {
         isDeleting = true
         Task { @MainActor in
             let removed = await g.deleteGlassesCaptures(captures)
-            failed.subtract(removed)
             selectedIDs.subtract(removed)
             isDeleting = false
             if selectedIDs.isEmpty { clearSelection() }
@@ -547,36 +558,19 @@ struct AlbumTab: View {
         return CaptureTile(capture: capture,
                            media: item,
                            imported: saved,
-                           working: inFlight == capture.id,
-                           failed: failed.contains(capture.id),
+                           working: g.mediaImportCurrentID == capture.id,
+                           failed: g.mediaImportFailedIDs.contains(capture.id),
                            fraction: g.progress[capture.id] ?? 0,
                            canFetch: canStartTransfer && presentOnGlasses,
-                           presentOnGlasses: g.canUseGlasses && presentOnGlasses,
+                           presentOnGlasses: canBrowseGlasses && presentOnGlasses,
                            selection: selection,
                            onOpen: { preview = item },
                            onTransfer: { transfer([capture], originalOnly: saved) })
     }
 
     private func transfer(_ queue: [Capture], originalOnly: Bool = false) {
-        guard canStartTransfer, let first = queue.first else { return }
-        inFlight = first.id
-        g.beginAlbumTransferBatch()
-        Task { @MainActor in
-            defer {
-                inFlight = nil
-                g.endAlbumTransferBatch()
-            }
-            for capture in queue {
-                guard g.canUseGlasses, !Task.isCancelled else { break }
-                if !originalOnly && g.importedCaptures[capture.id] != nil { continue }
-                inFlight = capture.id
-                failed.remove(capture.id)
-                let ok: Bool
-                if originalOnly { ok = await g.cacheOriginal(capture) }
-                else { ok = await g.importCapture(capture) }
-                if !ok { failed.insert(capture.id) }
-            }
-        }
+        guard canStartTransfer else { return }
+        g.startMediaImport(queue, saveToPhotos: !originalOnly)
     }
 }
 

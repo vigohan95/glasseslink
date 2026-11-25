@@ -18,6 +18,8 @@ enum MediaWiFiProtocol {
     static let create: UInt16 = 0x1000
     static let info: UInt16 = 0x1001
     static let destroy: UInt16 = 0x1002
+    // The capture service's HIGH route sends queued assets over the Wi-Fi data session.
+    static let captureLinkType = 7
 
     // Visor v3.1.0, core/media/Wifi.kt: ATC's SoftAP control messages and TCP listener.
     private static let listenerPort: UInt16 = 20203

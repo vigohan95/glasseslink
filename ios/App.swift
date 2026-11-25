@@ -10,6 +10,7 @@ import AVFoundation
 import Combine
 import CoreBluetooth
 import CryptoKit
+import ImageIO
 import Photos
 import UIKit
 import UniformTypeIdentifiers
@@ -53,6 +54,23 @@ struct ManualMediaWiFiJoin: Identifiable {
     let id: UUID
     let ssid: String
     let password: String
+}
+
+private final class MediaImportCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
 }
 
 // MARK: - link controller
@@ -118,6 +136,9 @@ final class Glasses: NSObject, ObservableObject {
         devices.filter(\.isVisibleCandidate)
     }
     private var scanTimer: Timer?
+    private var scanStartedAt: ContinuousClock.Instant?
+    private var recoveryScanID: UUID?
+    private var recoveryScanUsed = false
     private var ignoredAdvertisers: Set<UUID> = []
     private var sawGlassesAdvertisement = false
     private var scanRound = 0
@@ -125,6 +146,7 @@ final class Glasses: NSObject, ObservableObject {
     @Published var connected = false
     private var connecting = false
     private var connectionAttempt: UUID?
+    private var connectionTimeoutTask: Task<Void, Never>?
     private var connectionStartedAt: Date?
     private var retriedL2CAP = false
     private var openingL2CAP = false
@@ -140,8 +162,14 @@ final class Glasses: NSObject, ObservableObject {
     @Published var importRoute: MediaImportRoute = .automatic
     @Published private(set) var manualMediaWiFi: ManualMediaWiFiJoin?
     @Published private(set) var mediaImportInProgress = false
+    @Published private(set) var mediaImportCancelling = false
+    @Published private(set) var mediaImportCurrentID: String?
+    @Published private(set) var mediaImportCompleteCount = 0
+    @Published private(set) var mediaImportTotal = 0
+    @Published private(set) var mediaImportFailedIDs: Set<String> = []
     @Published private(set) var queuedGlassesActionText: String?
     private var mediaImportID: UUID?
+    private var mediaImportCancellation: MediaImportCancellation?
     private var mediaWiFiTransport: MediaWiFiTransport?
     private var mediaWiFiConnectTask: Task<MediaWiFiTransport, Error>?
     private var mediaWiFiSwitching = false
@@ -154,12 +182,16 @@ final class Glasses: NSObject, ObservableObject {
     private var pendingMediaHotspot: MediaHotspotCleanup?
     private var manualMediaDecision: CheckedContinuation<Bool, Never>?
     private var manualMediaTimeout: Task<Void, Never>?
-    private var albumTransferBatch = false
-    private var batchWiFiUnavailable = false
+    private struct OriginalRequest {
+        let capture: Capture
+        let asset: CaptureAsset
+        let assetID: UUID
+    }
     private enum QueuedCameraAction { case photo, startVideo, stopVideo }
     private var queuedCamera: (action: QueuedCameraAction, peripheralID: UUID)?
     @Published var glassesLine = "未连接"
     @Published var lastPhoto: Data?
+    private var lastImportedPhotoURL: URL?
     @Published var answer = ""
     @Published var share: ShareBox?
 
@@ -200,13 +232,20 @@ final class Glasses: NSObject, ObservableObject {
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
     private var reconnectAfterDisconnect: (id: UUID, forRegistration: Bool)?
+    private var disconnectingPeripheral: CBPeripheral?
+    private var disconnectTimeoutTask: Task<Void, Never>?
     private static let reconnectDelays: [UInt64] = [350_000_000, 2_000_000_000, 5_000_000_000]
     private var recoveryTask: Task<Void, Never>?
     private var recoveringID: UUID?
     private var recoveryAttempts = 0
+    private var recoveringMediaJob: UUID?
+    private var needsFullHandshake = false
     private var useQuickHandshake = false
     private var verifiedAt: ContinuousClock.Instant?
-    private var autoReconnectSuppressed = false
+    private var autoReconnectSuppressed: Bool {
+        get { UserDefaults.standard.bool(forKey: "glassesAutoReconnectSuppressed") }
+        set { UserDefaults.standard.set(newValue, forKey: "glassesAutoReconnectSuppressed") }
+    }
     private var connectingForRegistration = false
     private var channel: CBL2CAPChannel?
     private var stream: SDUStream?
@@ -349,7 +388,8 @@ final class Glasses: NSObject, ObservableObject {
             discoveryMessage = bluetoothUnavailableMessage
             return
         }
-        stopScan()
+        guard mediaImportID == nil, !phaseBusy else { return }
+        stopScanning()
         devices.removeAll()
         discoveredPeripherals.removeAll()
         loadSystemPaired()
@@ -362,8 +402,22 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     func stopScan() {
+        let wasRecovering = recoveryScanID != nil
+        stopScanning()
+        if wasRecovering {
+            resetRecovery()
+            connectingID = nil
+            let message = "已停止寻找上次连接的眼镜。"
+            phase = .failed(message)
+            glassesLine = message
+        }
+    }
+
+    private func stopScanning() {
         scanTimer?.invalidate()
         scanTimer = nil
+        scanStartedAt = nil
+        recoveryScanID = nil
         if central.state == .poweredOn { central.stopScan() }
         if scanning, !ignoredAdvertisers.isEmpty {
             note("附近还有 \(ignoredAdvertisers.count) 个未列出的蓝牙信号")
@@ -382,6 +436,7 @@ final class Glasses: NSObject, ObservableObject {
 
     private func beginScanRound() {
         scanRound += 1
+        scanStartedAt = ContinuousClock.now
         note("第 \(scanRound)/\(scanRounds) 轮扫描（每轮 15 秒）…眼镜折叠后长按拍摄键 5 秒到指示灯闪蓝")
         // Duplicates must stay ON: the glasses announce themselves in a short burst and
         // then go quiet, so a scan started a second too early would otherwise never see them.
@@ -401,13 +456,44 @@ final class Glasses: NSObject, ObservableObject {
                     self.beginScanRound()
                     return
                 }
-                self.stopScan()
+                self.stopScanning()
                 if self.primaryDevices.isEmpty {
                     self.discoveryMessage = "没找到可连接的眼镜。看到眼镜指示灯闪蓝后，再扫描一次。"
                     self.note("扫描结束，未发现兼容的眼镜")
                 }
             }
         }
+    }
+
+    /// One brief foreground search for the saved identifier. Other candidates remain available for manual selection.
+    @discardableResult
+    private func scanForRecovery(_ id: UUID) -> Bool {
+        guard recoveryScanID == nil, !recoveryScanUsed, !connecting, disconnectingPeripheral == nil,
+              mediaImportID == nil, canRetryConnection(id) else { return false }
+        stopScanning()
+        recoveryScanUsed = true
+        recoveryScanID = id
+        scanStartedAt = ContinuousClock.now
+        ignoredAdvertisers.removeAll()
+        scanning = true
+        connectingID = id
+        phase = .reconnecting(max(1, recoveryAttempts))
+        glassesLine = "正在附近寻找上次连接的眼镜"
+        note("短时搜索上次连接的眼镜")
+        central.scanForPeripherals(withServices: nil, options: nil)
+        scanTimer = Timer.scheduledTimer(withTimeInterval: 7, repeats: false) { [weak self] timer in
+            Task { @MainActor in
+                guard let self, self.scanTimer === timer, self.recoveryScanID == id else { return }
+                self.stopScanning()
+                if self.canRetryConnection(id) {
+                    self.beginConnection(id)
+                } else {
+                    self.connectingID = nil
+                    self.phase = .idle
+                }
+            }
+        }
+        return true
     }
 
     /// The system's connected service matches and the last explicitly selected peripheral.
@@ -450,43 +536,37 @@ final class Glasses: NSObject, ObservableObject {
         beginConnection(id, forRegistration: forRegistration)
     }
 
-    private func beginConnection(_ id: UUID, forRegistration: Bool = false) {
+    private func beginConnection(_ id: UUID, forRegistration: Bool = false, restoringMedia: Bool = false) {
         guard central.state == .poweredOn else {
             discoveryMessage = bluetoothUnavailableMessage
             return
         }
-        if channel != nil {
-            note("链路已经打开了，不用再点；要重来先「断开」")
+        guard channel == nil, !connecting, !mediaWiFiSwitching else { return }
+        if restoringMedia { recoveringMediaJob = mediaImportID }
+        if let closing = disconnectingPeripheral {
+            deferConnection(id, forRegistration: forRegistration, untilDisconnected: closing)
             return
         }
-        // Tapping the row repeatedly used to start a fresh connect storm: several
-        // openL2CAPChannel() calls in a row all fail with "PSM already connected" and the
-        // daemon then holds the channel until the app dies. One attempt at a time only.
-        if connecting {
-            note("上一次连接还没结束，等 2 秒；一直卡就点「断开」再试")
+        let knownPeripheral = discoveredPeripherals[id] ?? (peripheral?.identifier == id ? peripheral : nil)
+        guard let p = knownPeripheral ?? central.retrievePeripherals(withIdentifiers: [id]).first else {
+            if !forRegistration, canRetryConnection(id) {
+                recoveringID = id
+                if scanForRecovery(id) { return }
+            }
+            finishRecoveryOrShowFailure(id, reason: "未找到上次连接的眼镜。")
             return
         }
+        if p.state == .disconnecting {
+            deferConnection(id, forRegistration: forRegistration, untilDisconnected: p)
+            return
+        }
+        stopScanning()
         connecting = true
         connectingID = id
-        if recoveringID != id {
-            phase = .connecting
-            glassesLine = "正在打开蓝牙连接"
-        }
-        let knownPeripheral = peripheral?.identifier == id ? peripheral : discoveredPeripherals[id]
-        guard let p = knownPeripheral ?? central.retrievePeripherals(withIdentifiers: [id]).first else {
-            clearLink()
-            let reason = "找不到上次的眼镜，正在搜索附近设备。"
-            finishRecoveryOrShowFailure(id, reason: reason)
-            // Visor issue #114: after the glasses reboot, the cached identifier can go stale and
-            // every connect attempt says "Out of reach" while Bluetooth audio stays fine. Rescan
-            // instead of making the user guess.
-            note("找不到这台设备（可能刚重启过），自动重新扫描…")
-            if recoveryTask == nil { startScan() }
-            return
-        }
-        stopScan()
+        if recoveringID != id || recoveryAttempts == 0 { phase = .connecting }
+        glassesLine = "正在打开蓝牙连接"
         connectingForRegistration = forRegistration
-        useQuickHandshake = !forRegistration && owner != nil && recoveryAttempts <= 1
+        useQuickHandshake = !forRegistration && !needsFullHandshake && owner != nil && recoveryAttempts <= 1
             && savedGlassesID == id && UserDefaults.standard.bool(forKey: "isOwner")
         discoveryMessage = nil
         peripheral = p
@@ -497,9 +577,10 @@ final class Glasses: NSObject, ObservableObject {
         connectionAttempt = attempt
         connectionStartedAt = Date()
         let automatic = recoveringID == id
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: automatic ? 9_000_000_000 : 15_000_000_000)
-            guard let self, self.connectionAttempt == attempt else { return }
+        connectionTimeoutTask?.cancel()
+        connectionTimeoutTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: automatic ? 9_000_000_000 : 15_000_000_000) } catch { return }
+            guard let self, self.connectionAttempt == attempt, self.peripheral === p else { return }
             let reason = p.state == .connected ? "打开眼镜蓝牙通道超时" : "蓝牙连接眼镜超时"
             self.failConnection(reason, peripheral: p)
         }
@@ -509,9 +590,7 @@ final class Glasses: NSObject, ObservableObject {
         if p.state == .connected {
             if let options { central.connect(p, options: options) }
             openLink(p)
-        } else if p.state == .disconnecting {
-            reconnectAfterDisconnect = (id, forRegistration)
-        } else {
+        } else if p.state == .disconnected {
             central.connect(p, options: options)
         }
     }
@@ -519,19 +598,30 @@ final class Glasses: NSObject, ObservableObject {
     /// The glasses stay paired at the iOS level, so a cold launch can go straight back to
     /// the same peripheral without scanning — that is what makes "打开就能用" work.
     func autoReconnect() {
-        guard mediaImportID == nil, !connected, !phaseBusy, central.state == .poweredOn,
-              !autoReconnectSuppressed else { return }
-        if case .rejected = ownerState { return }
+        guard mediaImportID == nil, !connected, !phaseBusy, !scanning,
+              let id = savedGlassesID, canRetryConnection(id) else { return }
         if UserDefaults.standard.bool(forKey: "linkInFlight") {
-            // Last launch died inside the handshake. Reconnecting automatically would replay
-            // the same crash, so this launch waits for an explicit tap.
             UserDefaults.standard.set(false, forKey: "linkInFlight")
+            autoReconnectSuppressed = true
             note("上次是在握手途中退出的，这次不自动重连——请手动点一次眼镜，日志里会有崩溃现场")
             return
         }
-        guard let id = savedGlassesID else { return }
+        resetRecovery()
+        recoveringID = id
         note("自动连接上次的眼镜 …")
-        connect(id)
+        beginConnection(id)
+    }
+
+    func suspendReconnectForBackground() {
+        guard mediaImportID == nil else { return }
+        stopScanning()
+        guard !connected, recoveringID != nil else { return }
+        resetRecovery()
+        reconnectAfterDisconnect = nil
+        clearLink()
+        if let peripheral { requestDisconnect(peripheral) }
+        phase = .idle
+        glassesLine = "回到前台后会继续寻找眼镜"
     }
 
     private var savedGlassesID: UUID? {
@@ -625,10 +715,8 @@ final class Glasses: NSObject, ObservableObject {
             trustLine = Glasses.explain(error)
             note("❌ 握手中断：\(error)")
             if quickStart, case LinkError.unexpected(let reason) = error,
-               reason == Session.missingPeerEncryptionRequest,
-               let id = peripheral?.identifier {
-                recoveringID = id
-                recoveryAttempts = max(1, recoveryAttempts)
+               reason == Session.missingPeerEncryptionRequest {
+                needsFullHandshake = true
                 note("眼镜未回应快速握手，改用完整等待窗口")
             }
             if case LinkError.trustRejected(let code) = error {
@@ -687,6 +775,8 @@ final class Glasses: NSObject, ObservableObject {
 
     private func clearLink() {
         if session != nil { UserDefaults.standard.set(false, forKey: "linkInFlight") }
+        connectionTimeoutTask?.cancel()
+        connectionTimeoutTask = nil
         session = nil
         stream?.close()
         stream = nil
@@ -728,6 +818,7 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     private func failConnection(_ reason: String, peripheral p: CBPeripheral, underlying: Error? = nil) {
+        guard peripheral === p else { return }
         if mediaWiFiSwitching, mediaImportID != nil {
             releaseBluetoothForMediaWiFi()
             note("切换到眼镜 Wi-Fi 期间蓝牙控制通道关闭")
@@ -736,24 +827,33 @@ final class Glasses: NSObject, ObservableObject {
         allowRecoveryForUnexpectedLoss(of: p.identifier)
         reconnectAfterDisconnect = nil
         clearLink()
-        if p.state != .disconnected { central.cancelPeripheralConnection(p) }
+        requestDisconnect(p)
         if let underlying { note("蓝牙通道错误：\(underlying)") }
         finishRecoveryOrShowFailure(p.identifier, reason: reason)
-        if recoveryTask == nil, mediaImportID == nil, !autoReconnectSuppressed,
-           savedGlassesID == p.identifier, reason == "蓝牙连接眼镜超时", central.state == .poweredOn {
-            startScan()
-        }
     }
 
     private func allowRecoveryForUnexpectedLoss(of id: UUID) {
-        guard let verifiedAt, canUseGlasses, savedGlassesID == id else { return }
-        if verifiedAt.duration(to: ContinuousClock.now) >= .seconds(30) { recoveryAttempts = 0 }
+        guard !connectingForRegistration, canRetryConnection(id) else { return }
+        if let verifiedAt, verifiedAt.duration(to: ContinuousClock.now) >= .seconds(30) {
+            recoveryAttempts = 0
+            recoveryScanUsed = false
+            needsFullHandshake = false
+        }
         recoveringID = id
+    }
+
+    private func canRetryConnection(_ id: UUID) -> Bool {
+        guard savedGlassesID == id, owner != nil, !autoReconnectSuppressed,
+              !mediaWiFiSwitching, mediaImportID == nil || recoveringMediaJob == mediaImportID,
+              central.state == .poweredOn, UIApplication.shared.applicationState != .background else { return false }
+        if case .rejected = ownerState { return false }
+        return true
     }
 
     private func finishRecoveryOrShowFailure(_ id: UUID, reason: String) {
         note(reason)
         guard let attempt = scheduleRecovery(id) else {
+            connectingID = nil
             phase = .failed(reason)
             glassesLine = reason
             mediaMessage = reason + " 可在设备页重新连接。"
@@ -767,7 +867,7 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     private func scheduleRecovery(_ id: UUID) -> Int? {
-        guard recoveringID == id, !autoReconnectSuppressed, central.state == .poweredOn,
+        guard recoveringID == id, recoveryTask == nil, canRetryConnection(id),
               recoveryAttempts < Self.reconnectDelays.count else { return nil }
         let delay = Self.reconnectDelays[recoveryAttempts]
         recoveryAttempts += 1
@@ -775,6 +875,12 @@ final class Glasses: NSObject, ObservableObject {
             do { try await Task.sleep(nanoseconds: delay) } catch { return }
             guard let self, !Task.isCancelled, self.recoveringID == id else { return }
             self.recoveryTask = nil
+            guard self.canRetryConnection(id) else {
+                self.connectingID = nil
+                self.phase = .idle
+                return
+            }
+            if self.recoveryAttempts == Self.reconnectDelays.count, self.scanForRecovery(id) { return }
             self.beginConnection(id)
         }
         return recoveryAttempts
@@ -785,25 +891,82 @@ final class Glasses: NSObject, ObservableObject {
         recoveryTask = nil
         recoveringID = nil
         recoveryAttempts = 0
+        recoveryScanUsed = false
+        recoveringMediaJob = nil
+        needsFullHandshake = false
+    }
+
+    private func deferConnection(_ id: UUID, forRegistration: Bool, untilDisconnected p: CBPeripheral) {
+        stopScanning()
+        reconnectAfterDisconnect = (id, forRegistration)
+        connectingID = id
+        if recoveringID != id || recoveryAttempts == 0 { phase = .connecting }
+        glassesLine = "正在等待上一条蓝牙连接关闭"
+        requestDisconnect(p)
+    }
+
+    private func requestDisconnect(_ p: CBPeripheral) {
+        guard central.state == .poweredOn else { return }
+        if p.state == .disconnected {
+            if disconnectingPeripheral == nil, reconnectAfterDisconnect != nil { disconnectingPeripheral = p }
+            if disconnectingPeripheral === p { _ = completeDisconnect(p) }
+            return
+        }
+        if disconnectingPeripheral == nil {
+            disconnectingPeripheral = p
+            if p.state != .disconnecting { central.cancelPeripheralConnection(p) }
+        }
+        guard disconnectingPeripheral === p, disconnectTimeoutTask == nil else { return }
+        disconnectTimeoutTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(4)) } catch { return }
+            guard let self, self.disconnectingPeripheral === p else { return }
+            self.disconnectTimeoutTask = nil
+            if p.state == .disconnected {
+                _ = self.completeDisconnect(p)
+            } else if let pending = self.reconnectAfterDisconnect {
+                self.reconnectAfterDisconnect = nil
+                self.resetRecovery()
+                self.clearLink()
+                self.finishRecoveryOrShowFailure(pending.id, reason: "上一条蓝牙连接尚未关闭。")
+            }
+        }
+    }
+
+    @discardableResult
+    private func completeDisconnect(_ p: CBPeripheral) -> Bool {
+        guard disconnectingPeripheral === p else { return false }
+        disconnectTimeoutTask?.cancel()
+        disconnectTimeoutTask = nil
+        disconnectingPeripheral = nil
+        let deferred = reconnectAfterDisconnect
+        reconnectAfterDisconnect = nil
+        if let deferred, !autoReconnectSuppressed {
+            if recoveringID != deferred.id || canRetryConnection(deferred.id) {
+                beginConnection(deferred.id, forRegistration: deferred.forRegistration)
+            } else {
+                connectingID = nil
+                phase = .idle
+            }
+        }
+        return true
     }
 
     func disconnect() {
-        mediaImportID = nil
+        cancelMediaImport()
+        resetMediaImportUI()
         mediaWiFiSwitching = false
-        mediaImportInProgress = false
         mediaWiFiConnectTask?.cancel()
         mediaWiFiConnectTask = nil
         mediaWiFiTransport?.close()
         mediaWiFiTransport = nil
         resolveManualMediaWiFi(false)
-        progress.removeAll()
-        transferDetail = nil
         cancelQueuedGlassesAction()
         autoReconnectSuppressed = true
         resetRecovery()
+        stopScanning()
         reconnectAfterDisconnect = nil
         clearLink()
-        if let p = peripheral { central.cancelPeripheralConnection(p) }
+        if let peripheral { requestDisconnect(peripheral) }
         phase = .idle
         glassesLine = "未连接"
         mediaMessage = nil
@@ -813,20 +976,16 @@ final class Glasses: NSObject, ObservableObject {
     func reconnectForOwnerVerification() { reconnect(forRegistration: false) }
 
     private func reconnect(forRegistration: Bool) {
-        guard !phaseBusy else { return }
+        guard !phaseBusy, mediaImportID == nil else { return }
         guard let p = peripheral else { startScan(); return }
         resetRecovery()
+        autoReconnectSuppressed = false
         clearLink()
-        if p.state == .disconnected {
-            connect(p.identifier, forRegistration: forRegistration)
-            return
+        if p.state == .disconnected, disconnectingPeripheral == nil {
+            beginConnection(p.identifier, forRegistration: forRegistration)
+        } else {
+            deferConnection(p.identifier, forRegistration: forRegistration, untilDisconnected: p)
         }
-        reconnectAfterDisconnect = (p.identifier, forRegistration)
-        connecting = true
-        connectingID = p.identifier
-        phase = .connecting
-        glassesLine = "正在重新连接眼镜"
-        central.cancelPeripheralConnection(p)
     }
 
     // MARK: capture
@@ -894,32 +1053,61 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     func fetch(_ captureItem: Capture, saveToLibrary: Bool) {
-        Task {
-            _ = await withGlassesOperation { active in
-                try await downloadCapture(captureItem, from: active, save: saveToLibrary || !captureItem.isPhoto)
-            }
-        }
+        startMediaImport([captureItem], saveToPhotos: saveToLibrary || !captureItem.isPhoto)
     }
 
-    func importCapture(_ capture: Capture) async -> Bool {
-        await withGlassesOperation { active in
-            try await downloadCapture(capture, from: active, save: true)
-        } ?? false
+    var canStartMediaImport: Bool {
+        canUseGlasses && !busy && !settingsLoading && !recording && !mediaImportInProgress
+            && live == nil && assistantRef == nil
     }
 
     func localMediaURL(for capture: Capture) -> URL? {
         localMediaIndex[capture.id].flatMap(LocalMediaLibrary.url(for:))
     }
 
-    func beginAlbumTransferBatch() {
-        albumTransferBatch = true
-        batchWiFiUnavailable = false
+    func startMediaImport(_ selection: [Capture], saveToPhotos: Bool = true) {
+        guard canStartMediaImport, let active = session else { return }
+        var seen = Set<String>()
+        let captures = selection.filter { seen.insert($0.id).inserted && (!saveToPhotos || importedCaptures[$0.id] == nil) }
+        guard !captures.isEmpty else { return }
+        let job = UUID()
+        let cancellation = MediaImportCancellation()
+        let route = importRoute
+        mediaImportID = job
+        mediaImportCancellation = cancellation
+        mediaImportInProgress = true
+        mediaImportCancelling = false
+        mediaImportCurrentID = nil
+        mediaImportCompleteCount = 0
+        mediaImportTotal = captures.count
+        mediaImportFailedIDs.subtract(captures.map(\.id))
+        busy = true
+        mediaMessage = "正在准备眼镜原件…"
+        Task {
+            await runMediaImport(captures, saveToPhotos: saveToPhotos, route: route, control: active,
+                                 job: job, cancellation: cancellation)
+        }
     }
 
-    func endAlbumTransferBatch() {
-        albumTransferBatch = false
-        runQueuedCameraIfReady()
-        startPendingStatusRefresh()
+    func cancelMediaImport() {
+        guard let cancellation = mediaImportCancellation, !cancellation.isCancelled else { return }
+        cancellation.cancel()
+        mediaImportCancelling = true
+        mediaWiFiConnectTask?.cancel()
+        resolveManualMediaWiFi(false)
+        mediaMessage = "正在停止导入…"
+    }
+
+    private func resetMediaImportUI() {
+        progress.removeAll()
+        mediaImportID = nil
+        mediaImportCancellation = nil
+        mediaImportInProgress = false
+        mediaImportCancelling = false
+        mediaImportCurrentID = nil
+        mediaImportCompleteCount = 0
+        mediaImportTotal = 0
+        transferDetail = nil
     }
 
     func resolveManualMediaWiFi(_ useWiFi: Bool) {
@@ -942,12 +1130,6 @@ final class Glasses: NSObject, ObservableObject {
                 self.resolveManualMediaWiFi(false)
             }
         }
-    }
-
-    func cacheOriginal(_ capture: Capture) async -> Bool {
-        await withGlassesOperation { active in
-            try await downloadCapture(capture, from: active, save: false)
-        } ?? false
     }
 
     var canDeleteGlassesCaptures: Bool {
@@ -1014,123 +1196,127 @@ final class Glasses: NSObject, ObservableObject {
         return deleted ?? []
     }
 
-    private func downloadCapture(_ capture: Capture, from active: Session, save: Bool) async throws -> Bool {
-        let id = capture.id
-        if save, importedCaptures[id] != nil { return true }
-        if let existing = localMediaURL(for: capture) {
-            if save { try await saveImportedCapture(capture, file: existing, transfer: nil, session: active) }
-            return true
-        }
-        guard !recording else { throw LinkError.unexpected("请先结束眼镜录像，再导入原件。") }
-        let candidates = capture.isPhoto ? capture.stills : capture.assets.filter { $0.type == 1 }
-        let asset = candidates.max { $0.size < $1.size }
-        guard let asset else {
-            throw LinkError.unexpected("这条记录没有可导入的原文件")
-        }
-        let job = UUID()
-        mediaImportID = job
-        mediaImportInProgress = true
-        progress[id] = 0
-        mediaMessage = "正在从眼镜导入…"
-        defer {
-            if mediaImportID == job {
-                progress.removeValue(forKey: id)
-                mediaImportID = nil
-                mediaImportInProgress = false
-                transferDetail = nil
-                if session !== active {
-                    busy = false
-                    if !connected, !autoReconnectSuppressed { autoReconnect() }
-                    startPendingStatusRefresh()
-                    runQueuedCameraIfReady()
+    private func runMediaImport(_ captures: [Capture], saveToPhotos: Bool, route: MediaImportRoute,
+                                control: Session, job: UUID, cancellation: MediaImportCancellation) async {
+        var requests: [OriginalRequest] = []
+        var failure: Error?
+        for capture in captures {
+            guard mediaImportID == job, !cancellation.isCancelled else { break }
+            if let existing = localMediaURL(for: capture) {
+                do {
+                    if saveToPhotos { try await saveImportedCapture(capture, file: existing) }
+                    guard mediaImportID == job else { return }
+                    mediaImportCompleteCount += 1
+                } catch {
+                    guard mediaImportID == job else { return }
+                    mediaImportFailedIDs.insert(capture.id)
+                    failure = failure ?? error
                 }
+                continue
             }
-        }
-        let started = Date()
-        let (transfer, route): (Session.Transfer, String)
-        do {
-            (transfer, route) = try await receiveCapture(capture, asset: asset, control: active, job: job)
-        } catch {
-            if mediaImportID == job, session == nil { mediaMessage = Glasses.explain(error) }
-            throw error
-        }
-        guard mediaImportID == job else { throw CancellationError() }
-        let elapsed = Date().timeIntervalSince(started)
-        note("\(route) 导入 \(transfer.size)B · \(String(format: "%.1f", elapsed)) 秒")
-        transferDetail = nil
-        let file: URL?
-        do {
-            let item = try await onGlassesQueue {
-                try LocalMediaLibrary.store(transfer.data, capture: capture, originalName: transfer.name)
+            let candidates = capture.isPhoto ? capture.stills : capture.assets.filter { $0.type == 1 }
+            guard let asset = candidates.filter({ $0.size > 0 }).max(by: { $0.size < $1.size }),
+                  let assetID = UUID(uuidString: asset.uuid) else {
+                mediaImportFailedIDs.insert(capture.id)
+                failure = failure ?? LinkError.unexpected("一项素材没有可导入的原件。")
+                continue
             }
-            localMediaIndex[id] = item
-            LocalMediaLibrary.saveIndex(localMediaIndex)
-            file = LocalMediaLibrary.url(for: item)
-        } catch {
-            guard save else { throw error }
-            note("App 原件缓存失败：\(error.localizedDescription)")
-            file = nil
+            requests.append(OriginalRequest(capture: capture, asset: asset, assetID: assetID))
         }
-        guard mediaImportID == job else { throw CancellationError() }
-        if capture.isPhoto {
-            lastPhoto = transfer.data
-            rememberThumb(id, transfer.data)
-        } else if let file {
-            lastVideoURL = file
-            rememberVideoThumb(id, file)
-        }
-        guard save else {
-            if mediaImportID == job { mediaMessage = "原件已保存到 App，可直接打开。" }
-            return true
-        }
-        let savingOn = session
-        do {
-            try await saveImportedCapture(capture, file: file, transfer: transfer.data, session: savingOn ?? active)
-        } catch {
-            if mediaImportID == job, session === savingOn { mediaMessage = Glasses.explain(error) }
-            throw error
-        }
-        if mediaImportID == job, !connected { mediaMessage = "文件已存入 iPhone 相册。蓝牙控制正在恢复。" }
-        return true
-    }
 
-    private func receiveCapture(_ capture: Capture, asset: CaptureAsset, control: Session, job: UUID)
-        async throws -> (Session.Transfer, String) {
         var bluetooth: Session? = control
-        let route = importRoute
-        if route != .bluetooth, !batchWiFiUnavailable {
-            let attempt = await receiveThroughMediaWiFi(capture, asset: asset, control: control, job: job,
-                                                        manual: route == .manualWiFi)
-            bluetooth = attempt.bluetooth
-            guard mediaImportID == job else { throw CancellationError() }
-            switch attempt.result {
-            case .success(let file): return (file, "Wi-Fi")
-            case .failure(let reason):
-                if albumTransferBatch { batchWiFiUnavailable = true }
-                let message = Glasses.explain(reason)
-                note("眼镜 Wi-Fi 导入未完成，回退蓝牙：\(message)")
-                mediaMessage = "Wi-Fi 未完成，改用蓝牙。"
-                if bluetooth == nil { throw LinkError.io("Wi-Fi 未完成，蓝牙也尚未恢复。请重连眼镜后重试。") }
+        if route != .bluetooth, !requests.isEmpty, !cancellation.isCancelled, mediaImportID == job {
+            let result = await receiveThroughMediaWiFi(requests, control: control, job: job,
+                                                       manual: route == .manualWiFi, cancellation: cancellation)
+            guard mediaImportID == job else { return }
+            bluetooth = result.bluetooth
+            if let reason = result.error ?? result.files?.error ?? result.files?.failures.values.first,
+               !cancellation.isCancelled {
+                note("眼镜 Wi-Fi 批量导入未完成：\(Glasses.explain(reason))")
+            }
+            if let files = result.files?.files {
+                var retry: [OriginalRequest] = []
+                for request in requests {
+                    guard mediaImportID == job else { return }
+                    guard let staged = files[request.assetID] else { retry.append(request); continue }
+                    let error = await finishMediaFile(staged, capture: request.capture, job: job,
+                                                      saveToPhotos: saveToPhotos, cancellation: cancellation)
+                    failure = failure ?? error
+                }
+                requests = retry
+            }
+            if !requests.isEmpty, !cancellation.isCancelled {
+                mediaMessage = "未传完的素材改用蓝牙。"
             }
         }
-        guard let bluetooth, session === bluetooth, stream != nil else {
-            throw LinkError.io("眼镜蓝牙控制链路尚未恢复。")
+
+        for (index, request) in requests.enumerated() {
+            guard mediaImportID == job, !cancellation.isCancelled else { break }
+            var active = bluetooth
+            if active == nil || session !== active || stream == nil {
+                active = await restoreMediaBluetooth(control: control, job: job)
+            }
+            guard let active, mediaImportID == job, !cancellation.isCancelled else {
+                if mediaImportID == job, !cancellation.isCancelled {
+                    mediaImportFailedIDs.formUnion(requests[index...].map(\.capture.id))
+                    failure = failure ?? LinkError.io("蓝牙控制连接尚未恢复。")
+                }
+                break
+            }
+            bluetooth = active
+            let capture = request.capture
+            let assetID = request.assetID
+            let progressUpdate = mediaProgress([request], job: job, route: "蓝牙")
+            transferDetail = "蓝牙 · 等待文件"
+            mediaImportCurrentID = capture.id
+            progress[capture.id] = 0
+            do {
+                let batch = try await onGlassesQueue {
+                    guard !cancellation.isCancelled else { throw CancellationError() }
+                    try active.requestAsset(handle: capture.handle, assetID: request.asset.uuid)
+                    return active.receiveMediaFilesToDisk(expectedAssetIDs: [assetID],
+                        timeout: 45, maximumDuration: max(300, Double(request.asset.size) / 8_192),
+                        onBytes: progressUpdate, isCancelled: { cancellation.isCancelled })
+                }
+                guard mediaImportID == job else { return }
+                guard let staged = batch.files[assetID] else {
+                    throw batch.error ?? batch.failures[assetID] ?? LinkError.unexpected("眼镜没有发送文件。")
+                }
+                let error = await finishMediaFile(staged, capture: capture, job: job,
+                                                  saveToPhotos: saveToPhotos, cancellation: cancellation)
+                failure = failure ?? error
+            } catch {
+                guard mediaImportID == job, !cancellation.isCancelled else { break }
+                mediaImportFailedIDs.insert(capture.id)
+                failure = failure ?? error
+                if case LinkError.badMAC = error { reportOperationError(error, session: active) }
+            }
         }
-        progress[capture.id] = 0
-        transferDetail = "蓝牙 · 等待文件"
-        do {
-            return (try await readCaptureFile(from: bluetooth, capture: capture, asset: asset, job: job, wifi: false), "蓝牙")
-        } catch {
-            if mediaImportID == job, bluetooth !== control { reportOperationError(error, session: bluetooth) }
-            throw error
+
+        guard mediaImportID == job else { return }
+        let count = mediaImportCompleteCount
+        if cancellation.isCancelled {
+            mediaMessage = "导入已停止，已完成 \(count) 项。"
+        } else if let failure {
+            mediaMessage = "已完成 \(count)/\(captures.count) 项。\(Glasses.explain(failure))"
+        } else {
+            mediaMessage = "已导入 \(count) 项。"
         }
+        note("媒体批次结束：完成 \(count)/\(captures.count) 项，取消=\(cancellation.isCancelled)")
+        resetMediaImportUI()
+        busy = false
+        if !connected, !autoReconnectSuppressed { autoReconnect() }
+        if !runQueuedCameraIfReady() { startPendingStatusRefresh() }
     }
 
-    private func receiveThroughMediaWiFi(_ capture: Capture, asset: CaptureAsset, control: Session, job: UUID,
-                                          manual: Bool) async -> (result: Result<Session.Transfer, Error>, bluetooth: Session?) {
+    private func receiveThroughMediaWiFi(_ requests: [OriginalRequest], control: Session, job: UUID, manual: Bool,
+                                          cancellation: MediaImportCancellation) async
+        -> (files: Session.StagedMediaBatch?, bluetooth: Session?, error: Error?) {
         var wifi: Session?
-        let result: Result<Session.Transfer, Error>
+        var files: Session.StagedMediaBatch?
+        var failure: Error?
         do {
+            guard !cancellation.isCancelled else { throw CancellationError() }
             guard let expectedKey = control.verifiedPeerKey, let peripheralID = peripheral?.identifier,
                   let country = Locale.current.region?.identifier else {
                 throw LinkError.unexpected("眼镜身份或 iPhone 地区尚未读取。")
@@ -1141,21 +1327,25 @@ final class Glasses: NSObject, ObservableObject {
                 try control.createMediaSoftAP(countryCode: country, timeout: 12)
             }
             try checkActive(control)
-            guard mediaImportID == job else { throw CancellationError() }
-            try await onGlassesQueue {
-                try control.queueAssetForMediaWiFi(handle: capture.handle, assetID: asset.uuid, delivered: asset.delivered)
+            guard mediaImportID == job, !cancellation.isCancelled else { throw CancellationError() }
+            let wifiRequests = requests.map {
+                Session.MediaWiFiRequest(handle: $0.capture.handle, assetID: $0.assetID, delivered: $0.asset.delivered)
             }
-            guard mediaImportID == job else { throw CancellationError() }
+            try await onGlassesQueue {
+                try control.queueAssetsForMediaWiFi(wifiRequests)
+            }
+            guard mediaImportID == job, !cancellation.isCancelled else { throw CancellationError() }
             mediaWiFiSwitching = true
             transferDetail = manual ? "Wi-Fi · 等待手动加入热点" : "Wi-Fi · 正在加入眼镜热点"
-            guard mediaImportID == job else { throw CancellationError() }
             let connectTask = Task {
                 if !manual {
                     do {
                         return try await MediaWiFiTransport.connect(ssid: endpoint.ssid, passphrase: endpoint.password,
                                                                     host: endpoint.address, port: endpoint.port)
                     } catch let error as MediaWiFiError where error.canOfferManualJoin {
-                        guard self.mediaImportID == job, !Task.isCancelled else { throw CancellationError() }
+                        guard self.mediaImportID == job, !Task.isCancelled, !cancellation.isCancelled else {
+                            throw CancellationError()
+                        }
                         self.note("眼镜热点已创建，iOS 自动加入失败：\(error.diagnosticDescription)")
                         self.transferDetail = "Wi-Fi · 等待手动加入同一热点"
                     }
@@ -1166,7 +1356,7 @@ final class Glasses: NSObject, ObservableObject {
             }
             mediaWiFiConnectTask = connectTask
             let transport = try await connectTask.value
-            guard mediaImportID == job else { transport.close(); throw CancellationError() }
+            guard mediaImportID == job, !cancellation.isCancelled else { transport.close(); throw CancellationError() }
             mediaWiFiTransport = transport
             releaseBluetoothForMediaWiFi()
             let connection = Session(stream: transport, owner: control.owner)
@@ -1176,12 +1366,23 @@ final class Glasses: NSObject, ObservableObject {
             try await onGlassesQueue {
                 try connection.handshake(timeout: 10, trust: true, quickStart: true, expectedPeerKey: expectedKey)
             }
-            guard mediaImportID == job else { throw CancellationError() }
-            transferDetail = "Wi-Fi · 等待文件"
-            result = .success(try await readCaptureFile(from: connection, capture: capture, asset: asset,
-                                                        job: job, wifi: true))
+            guard mediaImportID == job, !cancellation.isCancelled else { throw CancellationError() }
+            note("Wi-Fi 媒体连接已验证：本次会话接收 \(requests.count) 项")
+            transferDetail = "Wi-Fi · 等待本批文件"
+            let expected = Set(requests.map(\.assetID))
+            let maximumDuration = max(300, requests.reduce(0.0) { $0 + Double($1.asset.size) / 8_192 })
+            let progressUpdate = mediaProgress(requests, job: job, route: "Wi-Fi")
+            let started = Date()
+            files = try await onGlassesQueue {
+                connection.receiveMediaFilesToDisk(expectedAssetIDs: expected, timeout: 12,
+                    maximumDuration: maximumDuration, onBytes: progressUpdate, isCancelled: { cancellation.isCancelled })
+            }
+            if let files {
+                let received = files.files.values.reduce(0.0) { $0 + Double($1.size) }
+                note("Wi-Fi 媒体批次：校验通过 \(files.files.count) 项，\(String(format: "%.1f", received / 1_000_000)) MB，\(String(format: "%.1f", Date().timeIntervalSince(started))) 秒")
+            }
         } catch {
-            result = .failure(error)
+            failure = error
         }
         if pendingMediaHotspot?.job == job {
             pendingMediaHotspot?.deadline = ContinuousClock.now.advanced(by: .seconds(120))
@@ -1198,7 +1399,7 @@ final class Glasses: NSObject, ObservableObject {
         if let bluetooth, mediaImportID == job {
             await closeMediaHotspot(using: bluetooth, job: job)
         }
-        return (result, bluetooth)
+        return (files, bluetooth, failure)
     }
 
     private func closeMediaHotspot(using link: Session, job: UUID) async {
@@ -1228,7 +1429,7 @@ final class Glasses: NSObject, ObservableObject {
             verifiedAt = nil
             glassesLine = "正在恢复蓝牙控制连接"
             transferDetail = "正在恢复蓝牙控制连接"
-            beginConnection(id)
+            beginConnection(id, restoringMedia: true)
         }
         let deadline = ContinuousClock.now.advanced(by: .seconds(25))
         while ContinuousClock.now < deadline, mediaImportID == job, !Task.isCancelled {
@@ -1239,50 +1440,82 @@ final class Glasses: NSObject, ObservableObject {
         return nil
     }
 
-    private func readCaptureFile(from link: Session, capture: Capture, asset: CaptureAsset, job: UUID,
-                                 wifi: Bool) async throws -> Session.Transfer {
-        let route = wifi ? "Wi-Fi" : "蓝牙"
-        let id = capture.id
-        let file = try await onGlassesQueue { [weak self] in
-            if !wifi { try link.requestAsset(handle: capture.handle, assetID: asset.uuid) }
-            var lastUpdate = ContinuousClock.now
-            var sampleStart = Date()
-            let maximumDuration = max(300, Double(asset.size) / 8_192)
-            return try link.receiveFile(timeout: wifi ? 12 : 45, maximumDuration: maximumDuration,
-                                        expectedAssetID: wifi ? asset.uuid : nil) { got, total in
-                let now = ContinuousClock.now
-                if got == 0 { sampleStart = Date() }
-                guard got == total || lastUpdate.duration(to: now) >= .milliseconds(250) else { return }
-                lastUpdate = now
-                let seconds = Date().timeIntervalSince(sampleStart)
-                let bytesPerSecond = seconds >= 1 && got > 0 ? Double(got) / seconds : 0
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.mediaImportID == job, self.progress[id] != nil, total > 0 else { return }
-                    self.progress[id] = Double(got) / Double(total)
-                    if bytesPerSecond > 0 {
-                        let rate = String(format: "%.0f KB/s", bytesPerSecond / 1_000)
-                        let remaining = Int(min(86_400, ceil(Double(max(0, total - got)) / bytesPerSecond)))
-                        let eta = remaining < 60 ? "\(remaining) 秒" : "\((remaining + 59) / 60) 分钟"
-                        self.transferDetail = "\(route) · \(rate) · 约 \(eta)"
-                    } else {
-                        self.transferDetail = "\(route) · 正在接收"
-                    }
+    private func mediaProgress(_ requests: [OriginalRequest], job: UUID, route: String) -> (UUID, Int, Int) -> Void {
+        let captures = Dictionary(requests.map { ($0.assetID, $0.capture.id) }, uniquingKeysWith: { first, _ in first })
+        var firstByte: [UUID: Date] = [:]
+        var lastUpdate = ContinuousClock.now
+        return { [weak self] assetID, got, total in
+            guard let id = captures[assetID], total > 0 else { return }
+            let now = ContinuousClock.now
+            if got == 0 || firstByte[assetID] == nil { firstByte[assetID] = Date() }
+            guard got == total || lastUpdate.duration(to: now) >= .milliseconds(300) else { return }
+            lastUpdate = now
+            let seconds = firstByte[assetID].map { Date().timeIntervalSince($0) } ?? 0
+            let bytesPerSecond = seconds >= 1 && got > 0 ? Double(got) / seconds : 0
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.mediaImportID == job, !self.mediaImportCancelling else { return }
+                self.mediaImportCurrentID = id
+                self.progress[id] = min(Double(got) / Double(total), 1)
+                if bytesPerSecond > 0 {
+                    let rate = String(format: "%.0f KB/s", bytesPerSecond / 1_000)
+                    let remaining = Int(min(86_400, ceil(Double(max(0, total - got)) / bytesPerSecond)))
+                    let eta = remaining < 60 ? "\(remaining) 秒" : "\((remaining + 59) / 60) 分钟"
+                    self.transferDetail = "\(route) · \(rate) · 当前文件约 \(eta)"
+                } else {
+                    self.transferDetail = "\(route) · 正在接收"
                 }
             }
         }
-        guard let file else { throw LinkError.unexpected("眼镜没有发送文件。") }
-        return file
     }
 
-    private func saveImportedCapture(_ capture: Capture, file: URL?, transfer: Data?, session active: Session) async throws {
-        if session === active { mediaMessage = "正在存入 iPhone 相册…" }
-        try await persistCapture(transfer, isPhoto: capture.isPhoto, original: file)
+    private func finishMediaFile(_ staged: Session.StagedMediaFile, capture: Capture, job: UUID,
+                                 saveToPhotos: Bool, cancellation: MediaImportCancellation) async -> Error? {
+        defer { staged.discard() }
+        guard mediaImportID == job else { return nil }
+        mediaImportCurrentID = capture.id
+        if !cancellation.isCancelled { transferDetail = "正在保存已校验的原件" }
+        do {
+            let original: URL
+            do {
+                let item = try await Task.detached(priority: .utility) {
+                    try LocalMediaLibrary.storeFile(staged.url, capture: capture, originalName: staged.name)
+                }.value
+                guard mediaImportID == job else { return nil }
+                guard let url = LocalMediaLibrary.url(for: item) else { throw LinkError.io("无法打开 App 原件。") }
+                original = url
+                localMediaIndex[capture.id] = item
+                LocalMediaLibrary.saveIndex(localMediaIndex)
+                if capture.isPhoto {
+                    lastImportedPhotoURL = url
+                    lastPhoto = nil
+                    rememberPhotoFileThumb(capture.id, url)
+                } else {
+                    lastVideoURL = url
+                    rememberVideoThumb(capture.id, url)
+                }
+            } catch {
+                guard saveToPhotos, !cancellation.isCancelled else { throw error }
+                note("本机原件缓存失败，尝试存入系统相册")
+                original = staged.url
+            }
+            if saveToPhotos, !cancellation.isCancelled { try await saveImportedCapture(capture, file: original) }
+            guard mediaImportID == job else { return nil }
+            mediaImportCompleteCount += 1
+            progress[capture.id] = 1
+            return nil
+        } catch {
+            guard mediaImportID == job, !cancellation.isCancelled else { return nil }
+            mediaImportFailedIDs.insert(capture.id)
+            note("导入保存失败：\(Glasses.explain(error))")
+            return error
+        }
+    }
+
+    private func saveImportedCapture(_ capture: Capture, file: URL) async throws {
+        try await persistCapture(nil, isPhoto: capture.isPhoto, original: file)
         importedCaptures[capture.id] = capture
         if let data = try? JSONEncoder().encode(importedCaptures) {
             UserDefaults.standard.set(data, forKey: "importedCaptureRecords")
-        }
-        if session === active {
-            mediaMessage = file == nil ? "已存入 iPhone 相册，App 本机原件未保存。" : "已存入 iPhone 相册，也可在 App 内打开。"
         }
     }
 
@@ -1334,7 +1567,7 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     private func queueCameraDuringImport(_ action: QueuedCameraAction) -> Bool {
-        guard mediaImportInProgress || albumTransferBatch else { return false }
+        guard mediaImportInProgress else { return false }
         guard queuedCamera == nil, let id = peripheral?.identifier else { return true }
         queuedCamera = (action, id)
         switch action {
@@ -1350,20 +1583,28 @@ final class Glasses: NSObject, ObservableObject {
         queuedGlassesActionText = nil
     }
 
-    private func runQueuedCameraIfReady() {
-        guard !albumTransferBatch, !mediaImportInProgress, !busy, !settingsLoading, let queued = queuedCamera else { return }
-        if phaseBusy, peripheral?.identifier == queued.peripheralID { return }
+    @discardableResult
+    private func runQueuedCameraIfReady() -> Bool {
+        guard !mediaImportInProgress, !busy, !settingsLoading, let queued = queuedCamera else { return false }
+        if phaseBusy, peripheral?.identifier == queued.peripheralID { return false }
         cancelQueuedGlassesAction()
         guard UIApplication.shared.applicationState == .active, canUseGlasses,
               peripheral?.identifier == queued.peripheralID, assistantRef == nil, live == nil else {
             mediaMessage = "排队的拍摄已取消，请重新操作。"
-            return
+            return false
         }
         switch queued.action {
-        case .photo: if !recording { snap() }
-        case .startVideo: if !recording { toggleRecording() }
-        case .stopVideo: if recording { toggleRecording() }
+        case .photo:
+            guard !recording else { return false }
+            snap()
+        case .startVideo:
+            guard !recording else { return false }
+            toggleRecording()
+        case .stopVideo:
+            guard recording else { return false }
+            toggleRecording()
         }
+        return true
     }
 
     /// 0 means "until I stop it". The glasses themselves cap a clip, so this only decides when
@@ -1451,15 +1692,16 @@ final class Glasses: NSObject, ObservableObject {
 
     func capture() {
         Task {
-            _ = await withGlassesOperation { active in
+            let newest: Capture? = await withGlassesOperation { active in
                 let list = try await onGlassesQueue { try active.captureList() }
                 try checkActive(active)
                 updateCaptures(list)
                 guard let newest = captures.first(where: { $0.isPhoto && !$0.stills.isEmpty }) else {
                     throw LinkError.unexpected("眼镜相册里没有照片")
                 }
-                return try await downloadCapture(newest, from: active, save: true)
+                return newest
             }
+            if let newest { startMediaImport([newest]) }
         }
     }
 
@@ -1477,7 +1719,7 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     private func startPendingStatusRefresh() {
-        guard statusRefreshPending, canUseGlasses, let active = session, !busy, !settingsLoading, !albumTransferBatch,
+        guard statusRefreshPending, canUseGlasses, let active = session, !busy, !settingsLoading, !mediaImportInProgress,
               live == nil, assistantRef == nil else { return }
         statusRefreshPending = false
         statusRefreshing = true
@@ -1766,7 +2008,7 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     var canRequestGlassesAudioConnection: Bool {
-        canUseGlasses && !phaseBusy && !busy && !settingsLoading && !recording && !albumTransferBatch
+        canUseGlasses && !phaseBusy && !busy && !settingsLoading && !recording && !mediaImportInProgress
             && live == nil && assistantRef == nil
     }
 
@@ -1802,13 +2044,23 @@ final class Glasses: NSObject, ObservableObject {
 
     /// Caches a small preview of an imported asset, so the album shows real pictures
     /// instead of placeholders — and keeps working with the glasses out of range.
-    func rememberThumb(_ id: String, _ data: Data) {
-        guard let image = UIImage(data: data) else { return }
-        let small = image.preparingThumbnail(of: CGSize(width: 168, height: 168)) ?? image
-        thumbs[id] = small
-        if let dir = Self.thumbDir,
-           let jpeg = small.jpegData(compressionQuality: 0.7) {
-            try? jpeg.write(to: dir.appendingPathComponent(Self.safeName(id) + ".jpg"))
+    private func rememberPhotoFileThumb(_ id: String, _ url: URL) {
+        let destination = Self.thumbDir?.appendingPathComponent(Self.safeName(id) + ".jpg")
+        Task {
+            let thumbnail = await Task.detached(priority: .utility) { () -> Data? in
+                let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+                let thumbnailOptions = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 336
+                ] as CFDictionary
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions),
+                      let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions),
+                      let jpeg = UIImage(cgImage: image).jpegData(compressionQuality: 0.7) else { return nil }
+                if let destination { try? jpeg.write(to: destination, options: .atomic) }
+                return jpeg
+            }.value
+            if let thumbnail, let image = UIImage(data: thumbnail) { thumbs[id] = image }
         }
     }
 
@@ -1922,6 +2174,9 @@ final class Glasses: NSObject, ObservableObject {
     var hasPhotoForModel: Bool { lastPhoto != nil || latestLocalPhoto != nil }
 
     private var latestLocalPhoto: URL? {
+        if let lastImportedPhotoURL, FileManager.default.fileExists(atPath: lastImportedPhotoURL.path) {
+            return lastImportedPhotoURL
+        }
         guard let capture = localCaptures.filter(\.isPhoto).max(by: { ($0.timestampNS ?? 0) < ($1.timestampNS ?? 0) }) else {
             return nil
         }
@@ -2077,6 +2332,7 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     func shareLog() {
+        LogStore.shared.flushToDisk()
         share = ShareBox(url: logURL)
     }
 
@@ -2102,7 +2358,7 @@ final class Glasses: NSObject, ObservableObject {
         out.append("trust \(trustLine)")
         out.append("link \(glassesLine)")
         out.append("--- log ---")
-        out.append(contentsOf: log.reversed())
+        out.append(contentsOf: LogStore.shared.snapshot())
         return out.joined(separator: "\n")
     }
 
@@ -2194,15 +2450,20 @@ final class Glasses: NSObject, ObservableObject {
 extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func centralManagerDidUpdateState(_ c: CBCentralManager) {
         Task { @MainActor in
+            guard c === self.central else { return }
             switch c.state {
             case .poweredOn:
                 discoveryMessage = nil
                 note("蓝牙就绪")
-                autoReconnect()
-            case .unauthorized, .poweredOff, .unsupported:
-                stopScan()
+                if autoReconnectSuppressed, let peripheral { requestDisconnect(peripheral) }
+                else { autoReconnect() }
+            case .resetting, .unauthorized, .poweredOff, .unsupported:
+                stopScanning()
                 resetRecovery()
                 reconnectAfterDisconnect = nil
+                disconnectTimeoutTask?.cancel()
+                disconnectTimeoutTask = nil
+                disconnectingPeripheral = nil
                 clearLink()
                 discoveryMessage = bluetoothUnavailableMessage
                 phase = .failed(bluetoothUnavailableMessage)
@@ -2215,14 +2476,16 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     /// iOS relaunches us in the background with the old central; take the peripheral back.
     nonisolated func centralManager(_ c: CBCentralManager, willRestoreState dict: [String: Any]) {
-        guard let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral])?.first else {
-            return
-        }
+        let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
         Task { @MainActor in
-            guard !connecting, channel == nil else { return }
-            guard restored.identifier == savedGlassesID, !autoReconnectSuppressed else { return }
+            guard c === self.central, !phaseBusy, !connected, channel == nil,
+                  let id = savedGlassesID, let restored = peripherals.first(where: { $0.identifier == id }) else { return }
             peripheral = restored
-            if c.state == .poweredOn { autoReconnect() }
+            discoveredPeripherals[id] = restored
+            if c.state == .poweredOn {
+                if autoReconnectSuppressed { requestDisconnect(restored) }
+                else { autoReconnect() }
+            }
         }
     }
 
@@ -2244,12 +2507,14 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             || ScanEntry.matchesRayBanMetaName(localName)
         let id = p.identifier
         let rssi = RSSI.intValue
+        let observedAt = ContinuousClock.now
         Task { @MainActor in
-            guard self.scanning else { return }
+            guard c === self.central, self.scanning, let startedAt = self.scanStartedAt, observedAt >= startedAt else { return }
+            let target = self.recoveryScanID == id && self.canRetryConnection(id)
             let index = self.devices.firstIndex { $0.id == id }
             let previous = index.map { self.devices[$0] }
             let verifiedName = self.verifiedPeripheralNames[id.uuidString]
-            guard isConnectable, candidate || previous?.isVisibleCandidate == true || verifiedName != nil else {
+            guard isConnectable, target || candidate || previous?.isVisibleCandidate == true || verifiedName != nil else {
                 self.ignoredAdvertisers.insert(id)
                 return
             }
@@ -2268,25 +2533,30 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
                 self.devices.append(entry)
                 self.note("找到蓝牙候选：\(entry.displayName)")
             }
+            if target {
+                self.stopScanning()
+                self.beginConnection(id)
+            }
         }
     }
 
     nonisolated func peripheralDidUpdateName(_ p: CBPeripheral) {
         Task { @MainActor in
-            guard canUseGlasses, peripheral?.identifier == p.identifier else { return }
+            guard canUseGlasses, peripheral === p else { return }
             rememberVerifiedPeripheral(p)
         }
     }
 
     nonisolated func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
         Task { @MainActor in
+            guard c === self.central else { return }
             self.openLink(p)
         }
     }
 
     private func openLink(_ p: CBPeripheral) {
-        guard connectingID == p.identifier, connectionAttempt != nil,
-              reconnectAfterDisconnect == nil, channel == nil, !openingL2CAP,
+        guard peripheral === p, connecting, connectingID == p.identifier, connectionAttempt != nil,
+              disconnectingPeripheral == nil, reconnectAfterDisconnect == nil, channel == nil, !openingL2CAP,
               p.state == .connected else { return }
         openingL2CAP = true
         note("打开 L2CAP PSM 0x\(String(psm, radix: 16))")
@@ -2295,12 +2565,9 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     nonisolated func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         Task { @MainActor in
-            guard self.peripheral?.identifier == p.identifier, p.state == .disconnected else { return }
-            if let reconnect = self.reconnectAfterDisconnect, reconnect.id == p.identifier {
-                self.reconnectAfterDisconnect = nil
-                self.clearLink()
-                self.beginConnection(reconnect.id, forRegistration: reconnect.forRegistration)
-            } else if self.channel != nil || self.connecting {
+            guard c === self.central, p.state == .disconnected else { return }
+            if self.completeDisconnect(p) { return }
+            if self.peripheral === p, self.channel != nil || self.connecting {
                 self.failConnection("眼镜蓝牙已断开。", peripheral: p, underlying: error)
             }
         }
@@ -2308,7 +2575,9 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     nonisolated func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
         Task { @MainActor in
-            guard self.connectingID == p.identifier, p.state == .disconnected else { return }
+            guard c === self.central, p.state == .disconnected else { return }
+            if self.completeDisconnect(p) { return }
+            guard self.peripheral === p, self.connectingID == p.identifier, self.connectionAttempt != nil else { return }
             let reason = error?.localizedDescription ?? "蓝牙连接未建立"
             self.failConnection("连接失败：\(reason)", peripheral: p)
         }
@@ -2316,14 +2585,17 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     nonisolated func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
         Task { @MainActor in
+            guard self.peripheral === p else { return }
             for s in p.services ?? [] { self.note("service \(s.uuid)") }
         }
     }
 
     nonisolated func peripheral(_ p: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
         Task { @MainActor in
-            guard self.connectingID == p.identifier, let attempt = self.connectionAttempt,
-                  self.reconnectAfterDisconnect == nil, self.channel == nil, p.state == .connected else {
+            if let channel, self.channel === channel { return }
+            guard self.peripheral === p, self.connectingID == p.identifier, let attempt = self.connectionAttempt,
+                  self.openingL2CAP, self.disconnectingPeripheral == nil, self.reconnectAfterDisconnect == nil,
+                  self.channel == nil, p.state == .connected else {
                 channel?.inputStream?.close()
                 channel?.outputStream?.close()
                 return
@@ -2344,6 +2616,8 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             self.channel = ch
             self.connecting = false
             self.connectionAttempt = nil
+            self.connectionTimeoutTask?.cancel()
+            self.connectionTimeoutTask = nil
             self.note("L2CAP up psm=0x\(String(ch.psm, radix: 16))")
             self.phase = .handshaking
             let requireTrust = self.owner != nil && !self.connectingForRegistration

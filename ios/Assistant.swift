@@ -309,7 +309,7 @@ final class Assistant {
     private func loop() {
         do {
             while registered {
-                if let message = try nextIfAvailable(timeout: 1), registered {
+                if let message = try nextIfAvailable(timeout: receiveTimeout), registered {
                     try handle(message)
                 }
                 try maintainTurn()
@@ -319,6 +319,13 @@ final class Assistant {
             stop()
             DispatchQueue.main.async { [weak self] in self?.onFailure?(error) }
         }
+    }
+
+    private var receiveTimeout: TimeInterval {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        // Incoming frames wake the transport immediately. Only an active turn has time-based work.
+        return turn == nil ? 15 : 1
     }
 
     private func handle(_ message: DataX.Message) throws {

@@ -556,7 +556,7 @@ final class Session {
         return plain
     }
 
-    private func decodeFrame(_ sdu: Data, bulkChannel: UInt16? = nil, tracePayload: Bool = true) throws -> [DataX.Message] {
+    private func decodeFrame(_ sdu: Data, bulkChannels: Set<UInt16> = [], tracePayload: Bool = true) throws -> [DataX.Message] {
         let plain = resolveFirstIV(try openFrame(sdu), frame: sdu)
         let available = dataXCarry.count + plain.count
         let packets = DataX.splitMessages(plain, carry: &dataXCarry)
@@ -564,7 +564,7 @@ final class Session {
         let messages = packets.map { packet in
             let msg = packet.message
             consumed += msg.consumed
-            let bulk = msg.channel == bulkChannel && msg.error == nil
+            let bulk = bulkChannels.contains(msg.channel) && msg.error == nil
                 && (msg.type == nil || msg.type == Int(Self.airData))
             if !bulk {
                 let atc = serviceChannels[MediaWiFiProtocol.channelName]
@@ -581,7 +581,7 @@ final class Session {
     }
 
     private func recvMessage(timeout: TimeInterval, includePending: Bool = true,
-                             handlesAirshipOffers: Bool = false, bulkChannel: UInt16? = nil,
+                             handlesAirshipOffers: Bool = false, bulkChannels: Set<UInt16> = [],
                              tracePayload: Bool = true) throws -> DataX.Message {
         let deadline = Date().addingTimeInterval(timeout)
         receiveLock.lock()
@@ -594,7 +594,7 @@ final class Session {
                 msg = decoded
             } else {
                 let sdu = try stream.nextFrame(timeout: max(0, deadline.timeIntervalSinceNow))
-                decodedMessages = try decodeFrame(sdu, bulkChannel: bulkChannel, tracePayload: tracePayload)[...]
+                decodedMessages = try decodeFrame(sdu, bulkChannels: bulkChannels, tracePayload: tracePayload)[...]
                 continue
             }
 
@@ -1115,18 +1115,39 @@ final class Session {
         emit("media: requested selected asset over Bluetooth")
     }
 
-    /// Queue before switching transport. The same capture catalog is shared by both links.
+    struct MediaWiFiRequest {
+        let handle: String
+        let assetID: UUID
+        let delivered: Bool
+    }
+
+    /// Queue while still on Bluetooth. One route request covers one capture and its pending assets.
     func queueAssetForMediaWiFi(handle: String, assetID: String, delivered: Bool) throws {
-        guard ownerTrustCompleted, !handle.isEmpty, handle.utf8.count <= 1024,
-              !handle.contains(":"), !handle.utf8.contains(0), UUID(uuidString: assetID) != nil else {
+        guard let assetID = UUID(uuidString: assetID) else {
             throw LinkError.unexpected("无法验证 Wi-Fi 导入的素材。")
         }
-        if delivered {
-            try sendOnService("captures", service: Self.svcCaptures, type: Self.capRequestAsset,
-                              payload: Data("\(handle):\(assetID)".utf8))
+        try queueAssetsForMediaWiFi([MediaWiFiRequest(handle: handle, assetID: assetID, delivered: delivered)])
+    }
+
+    func queueAssetsForMediaWiFi(_ requests: [MediaWiFiRequest]) throws {
+        guard ownerTrustCompleted, Set(requests.map(\.assetID)).count == requests.count,
+              requests.allSatisfy({ request in
+                  !request.handle.isEmpty && request.handle.utf8.count <= 1024
+                      && !request.handle.contains(":") && !request.handle.utf8.contains(0)
+              }) else {
+            throw LinkError.unexpected("无法验证 Wi-Fi 导入的素材。")
         }
-        try sendOnService("captures", service: Self.svcCaptures, type: Self.capSetLink,
-                          payload: Data("\(handle):7".utf8))
+        let byCapture = Dictionary(grouping: requests, by: \.handle)
+        var queued: Set<String> = []
+        for request in requests where queued.insert(request.handle).inserted {
+            for asset in byCapture[request.handle] ?? [] where asset.delivered {
+                let id = asset.assetID.uuidString.lowercased()
+                try sendOnService("captures", service: Self.svcCaptures, type: Self.capRequestAsset,
+                                  payload: Data("\(asset.handle):\(id)".utf8))
+            }
+            try sendOnService("captures", service: Self.svcCaptures, type: Self.capSetLink,
+                              payload: Data("\(request.handle):\(MediaWiFiProtocol.captureLinkType)".utf8))
+        }
     }
 
     static func parseCapture(_ body: Data) -> Capture? {
@@ -1168,6 +1189,94 @@ final class Session {
 
     struct Transfer { let name: String; let size: Int; let data: Data }
 
+    final class StagedMediaFile {
+        let assetID: UUID
+        let name: String
+        let size: Int
+        let url: URL
+        private let directory: URL
+
+        fileprivate init(assetID: UUID, name: String, size: Int) throws {
+            self.assetID = assetID
+            self.name = name
+            self.size = size
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("glasses-media-\(UUID().uuidString)", isDirectory: true)
+            self.directory = directory
+            let suffix = URL(fileURLWithPath: name).pathExtension.lowercased()
+            let mediaSuffixes = ["heic", "heif", "jpg", "jpeg", "png", "mp4", "mov", "m4v"]
+            url = directory.appendingPathComponent("asset.\(mediaSuffixes.contains(suffix) ? suffix : "partial")")
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+                guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+                    throw LinkError.io("无法创建眼镜素材临时文件。")
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: directory)
+                throw LinkError.io("无法创建眼镜素材临时文件。")
+            }
+        }
+
+        func discard() { try? FileManager.default.removeItem(at: directory) }
+        deinit { discard() }
+    }
+
+    struct StagedMediaBatch {
+        fileprivate(set) var files: [UUID: StagedMediaFile] = [:]
+        fileprivate(set) var failures: [UUID: Error] = [:]
+        fileprivate(set) var error: Error?
+    }
+
+    private final class StagedReception {
+        let offer: AirshipOffer
+        let file: StagedMediaFile
+        private let handle: FileHandle
+        private(set) var received = 0
+        private(set) var checksum: UInt32 = 1
+        var messageType: Int
+
+        init(offer: AirshipOffer, assetID: UUID, messageType: Int) throws {
+            self.offer = offer
+            self.messageType = messageType
+            let staged = try StagedMediaFile(assetID: assetID, name: offer.name, size: offer.size)
+            file = staged
+            do { handle = try FileHandle(forWritingTo: staged.url) }
+            catch { throw LinkError.io("无法打开眼镜素材临时文件。") }
+        }
+
+        deinit { try? handle.close() }
+
+        func append(_ chunk: Data) throws {
+            guard chunk.count <= offer.size - received else {
+                throw LinkError.unexpected("眼镜发送的文件超出了声明大小。")
+            }
+            do { try handle.write(contentsOf: chunk) }
+            catch { throw LinkError.io("无法写入眼镜素材，请检查 iPhone 可用空间。") }
+            received += chunk.count
+            checksum = Session.updateAdler32(checksum, with: chunk)
+        }
+
+        func reset() throws {
+            do {
+                try handle.truncate(atOffset: 0)
+                try handle.seek(toOffset: 0)
+            } catch { throw LinkError.io("无法重置眼镜素材临时文件。") }
+            received = 0
+            checksum = 1
+        }
+
+        func finish(_ payload: Data) throws {
+            guard Session.hasVerifiedAirshipCompletion(payload, size: offer.size, received: received,
+                                                       checksum: checksum) else {
+                throw LinkError.unexpected("眼镜文件的大小或校验值不匹配。")
+            }
+            do {
+                try handle.synchronize()
+                try handle.close()
+            } catch { throw LinkError.io("无法完成眼镜素材写入，请检查 iPhone 可用空间。") }
+        }
+    }
+
     struct AirshipOffer {
         let channel: UInt16
         let id: Data
@@ -1178,8 +1287,9 @@ final class Session {
         var mirror: UInt16 { channel ^ 0x8000 }
     }
 
-    static func airshipOffer(_ message: DataX.Message) throws -> AirshipOffer? {
-        guard message.channel & 0x8000 != 0, message.error == nil, message.service == Self.svcAirship,
+    static func airshipOffer(_ message: DataX.Message, previouslyNamed: Bool = false) throws -> AirshipOffer? {
+        guard message.channel & 0x8000 != 0, message.error == nil,
+              message.service == Self.svcAirship || (message.service == nil && previouslyNamed),
               message.type == Int(Self.airOffer) || message.type == Int(Self.airOfferMultiscope)
         else { return nil }
         let fields = try PB.parse(message.payload)
@@ -1200,6 +1310,157 @@ final class Session {
         try sendAirshipReply(Self.airDrop, on: offer.mirror, payload: PB.bytes(1, offer.id))
         emit("media: declined an unrequested Airship offer")
         return true
+    }
+
+    private static func hasVerifiedAirshipCompletion(_ payload: Data, size: Int, received: Int,
+                                                      checksum: UInt32) -> Bool {
+        guard size == received, let fields = try? PB.parse(payload) else { return false }
+        return (fields[1]?.first as? Int ?? 0) == size && fields[2]?.first as? Int == Int(checksum)
+    }
+
+    /// This reader owns the authenticated link until every selected file is resolved or the batch stops.
+    func receiveMediaFilesToDisk(expectedAssetIDs: Set<UUID>, timeout: TimeInterval = 45,
+                                 maximumDuration: TimeInterval? = nil,
+                                 onBytes: ((UUID, Int, Int) -> Void)? = nil,
+                                 onFileCompleted: ((StagedMediaFile) -> Void)? = nil,
+                                 isCancelled: () -> Bool = { false }) throws -> StagedMediaBatch {
+        guard ownerTrustCompleted else { throw LinkError.unexpected("导入素材前需要验证眼镜主人身份。") }
+        requestedCaptureAsset = nil
+        var batch = StagedMediaBatch()
+        var pending = expectedAssetIDs
+        var active: [UInt16: StagedReception] = [:]
+        var airshipChannels: Set<UInt16> = []
+        let capturesMirror = serviceChannels["captures"].map { $0 ^ 0x8000 }
+        let started = ProcessInfo.processInfo.systemUptime
+        let maximumDeadline = maximumDuration.map { started + $0 } ?? .infinity
+        var idleDeadline = started + timeout
+        var abandonOffers = false
+
+        func drop(_ offer: AirshipOffer) throws {
+            try sendAirshipReply(Self.airDrop, on: offer.mirror, payload: PB.bytes(1, offer.id))
+        }
+
+        func fail(_ transfer: StagedReception, _ error: Error) {
+            active.removeValue(forKey: transfer.offer.channel)
+            pending.remove(transfer.file.assetID)
+            batch.failures[transfer.file.assetID] = error
+        }
+
+        do {
+            while !pending.isEmpty {
+                if isCancelled() {
+                    abandonOffers = true
+                    throw CancellationError()
+                }
+                let left = min(idleDeadline, maximumDeadline) - ProcessInfo.processInfo.systemUptime
+                guard left > 0 else {
+                    abandonOffers = true
+                    throw LinkError.unexpected("眼镜文件传输暂停过久，请重试。")
+                }
+                let message: DataX.Message
+                do {
+                    message = try recvMessage(timeout: min(left, 0.5), handlesAirshipOffers: true,
+                                              bulkChannels: Set(active.keys), tracePayload: false)
+                } catch LinkError.unexpected(let reason) where reason.hasPrefix("timeout waiting for a frame") {
+                    continue
+                }
+                if message.channel == capturesMirror, message.type == Int(Self.capAssetGone), message.error == nil,
+                   message.service == nil || message.service == Self.svcCaptures,
+                   expectedAssetIDs.count == 1, let id = pending.first {
+                    batch.failures[id] = LinkError.unexpected("眼镜上已找不到这项素材。")
+                    pending.remove(id)
+                    continue
+                }
+                guard message.channel & 0x8000 != 0, message.error == nil else { continue }
+                if let service = message.service {
+                    guard service == Self.svcAirship else {
+                        airshipChannels.remove(message.channel)
+                        active.removeValue(forKey: message.channel)
+                        continue
+                    }
+                    airshipChannels.insert(message.channel)
+                }
+                if let offer = try Self.airshipOffer(message, previouslyNamed: airshipChannels.contains(message.channel)) {
+                    // A new offer replaces any older transfer on its channel.
+                    active.removeValue(forKey: offer.channel)
+                    let assetID = offer.id.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+                        UUID(uuid: bytes.loadUnaligned(as: uuid_t.self))
+                    }
+                    guard offer.namespace == "namespace_media", pending.contains(assetID) else {
+                        try drop(offer)
+                        continue
+                    }
+                    // A re-offer on a different channel can be the sender's retry of the same asset.
+                    if let previous = active.first(where: { $0.value.file.assetID == assetID })?.key {
+                        active.removeValue(forKey: previous)
+                    }
+                    do {
+                        active[offer.channel] = try StagedReception(offer: offer, assetID: assetID,
+                                                                   messageType: message.type ?? Int(Self.airOffer))
+                    } catch {
+                        pending.remove(assetID)
+                        batch.failures[assetID] = error
+                        try drop(offer)
+                        continue
+                    }
+                    try sendAirshipReply(Self.airCursor, on: offer.mirror, payload: PB.uint(2, 1))
+                    idleDeadline = ProcessInfo.processInfo.systemUptime + timeout
+                    onBytes?(assetID, 0, offer.size)
+                    emit("media: accepted selected Airship offer (\(offer.size)B)")
+                    continue
+                }
+                guard let transfer = active[message.channel] else { continue }
+                if let type = message.type { transfer.messageType = type }
+                let offer = transfer.offer
+                let assetID = transfer.file.assetID
+                switch transfer.messageType {
+                case Int(Self.airData):
+                    guard !message.payload.isEmpty else { continue }
+                    do { try transfer.append(message.payload) }
+                    catch {
+                        fail(transfer, error)
+                        try drop(offer)
+                        continue
+                    }
+                    idleDeadline = ProcessInfo.processInfo.systemUptime + timeout
+                    onBytes?(assetID, transfer.received, offer.size)
+                case Int(Self.airCheck):
+                    let offset = transfer.received == 0 ? Data() : PB.uint(1, UInt64(transfer.received))
+                    try sendAirshipReply(Self.airCursor, on: offer.mirror,
+                                         payload: offset + PB.uint(2, UInt64(transfer.checksum)))
+                case Int(Self.airComplete):
+                    do {
+                        try transfer.finish(message.payload)
+                        active.removeValue(forKey: message.channel)
+                        pending.remove(assetID)
+                        batch.files[assetID] = transfer.file
+                        onFileCompleted?(transfer.file)
+                    } catch { fail(transfer, error) }
+                    try drop(offer)
+                case Int(Self.airReset):
+                    do {
+                        try transfer.reset()
+                        onBytes?(assetID, 0, offer.size)
+                    } catch {
+                        fail(transfer, error)
+                        try drop(offer)
+                    }
+                case Int(Self.airStopped):
+                    active.removeValue(forKey: message.channel)
+                    onBytes?(assetID, 0, offer.size)
+                case Int(Self.airDrop), Int(Self.airRemoved):
+                    fail(transfer, LinkError.unexpected("眼镜取消了这项素材的传输。"))
+                default:
+                    break
+                }
+            }
+        } catch {
+            batch.error = error
+        }
+        if abandonOffers {
+            for transfer in active.values { try? drop(transfer.offer) }
+        }
+        return batch
     }
 
     /// The glasses open the transfer channel. Cursor and Drop use its mirror.
@@ -1229,7 +1490,8 @@ final class Session {
             if left <= 0 { throw LinkError.unexpected("眼镜文件传输超时，请重试。") }
             let m: DataX.Message
             do {
-                m = try recvMessage(timeout: left, handlesAirshipOffers: true, bulkChannel: accepted?.channel)
+                let bulk = accepted.map { Set([$0.channel]) } ?? []
+                m = try recvMessage(timeout: left, handlesAirshipOffers: true, bulkChannels: bulk, tracePayload: false)
             } catch LinkError.unexpected(let reason) where reason.hasPrefix("timeout waiting for a frame") {
                 throw LinkError.unexpected("眼镜文件传输暂停过久，请重试。")
             }
@@ -1276,14 +1538,12 @@ final class Session {
                 let offset = buf.isEmpty ? Data() : PB.uint(1, UInt64(buf.count))
                 try sendAirshipReply(Self.airCursor, on: mirror, payload: offset + PB.uint(2, UInt64(checksum)))
             case Self.airComplete:
-                let fields = try? PB.parse(m.payload)
-                let size = fields?[1]?.first as? Int ?? 0
-                let adler = fields?[2]?.first as? Int
                 try sendAirshipReply(Self.airDrop, on: mirror, payload: PB.bytes(1, offer.id))
-                guard fields != nil, size == offer.size, size == buf.count, adler == Int(checksum) else {
+                guard Self.hasVerifiedAirshipCompletion(m.payload, size: offer.size, received: buf.count,
+                                                        checksum: checksum) else {
                     throw LinkError.unexpected("file size or checksum did not match")
                 }
-                return Transfer(name: offer.name, size: size, data: buf)
+                return Transfer(name: offer.name, size: offer.size, data: buf)
             case Self.airReset:
                 buf.removeAll(keepingCapacity: true)
                 checksum = 1

@@ -30,6 +30,29 @@ enum LocalMediaLibrary {
     }
 
     static func store(_ data: Data, capture: Capture, originalName: String) throws -> Item {
+        let destination = try destination(for: capture, originalName: originalName)
+        try data.write(to: destination.url, options: .atomic)
+        return destination.item
+    }
+
+    /// Publish a verified source file without allocating another in-memory copy. The caller
+    /// retains the staged source until any separate Photos export has finished.
+    static func storeFile(_ source: URL, capture: Capture, originalName: String) throws -> Item {
+        let destination = try destination(for: capture, originalName: originalName)
+        let files = FileManager.default
+        let pending = destination.url.deletingLastPathComponent()
+            .appendingPathComponent(".\(UUID().uuidString).partial")
+        defer { try? files.removeItem(at: pending) }
+        try files.copyItem(at: source, to: pending)
+        if files.fileExists(atPath: destination.url.path) {
+            _ = try files.replaceItemAt(destination.url, withItemAt: pending)
+        } else {
+            try files.moveItem(at: pending, to: destination.url)
+        }
+        return destination.item
+    }
+
+    private static func destination(for capture: Capture, originalName: String) throws -> (item: Item, url: URL) {
         guard var root = originals else { throw LinkError.io("无法打开 App 的媒体目录。") }
         if !FileManager.default.fileExists(atPath: root.path) {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -42,7 +65,6 @@ enum LocalMediaLibrary {
         let ext = allowed.contains(suffix) ? suffix : (capture.isPhoto ? "heic" : "mp4")
         let identity = SHA256.hash(data: Data(capture.id.utf8)).map { String(format: "%02x", $0) }.joined()
         let fileName = identity + "." + ext
-        try data.write(to: root.appendingPathComponent(fileName), options: .atomic)
-        return Item(capture: capture, fileName: fileName)
+        return (Item(capture: capture, fileName: fileName), root.appendingPathComponent(fileName))
     }
 }

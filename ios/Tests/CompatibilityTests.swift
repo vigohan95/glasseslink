@@ -356,6 +356,134 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(transfer?.data, data)
     }
 
+    func testMediaWiFiQueuesEachCaptureOnceAndRequestsDeliveredAssets() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let a = try XCTUnwrap(UUID(uuidString: "00112233-4455-4677-8999-aabbccddeeff"))
+        let b = try XCTUnwrap(UUID(uuidString: "10112233-4455-4677-8999-aabbccddeeff"))
+        let c = try XCTUnwrap(UUID(uuidString: "20112233-4455-4677-8999-aabbccddeeff"))
+        try session.queueAssetsForMediaWiFi([
+            .init(handle: "first", assetID: a, delivered: false),
+            .init(handle: "second", assetID: b, delivered: false),
+            .init(handle: "first", assetID: c, delivered: true),
+        ])
+
+        let files = try (0..<3).map { _ in try DataX.parse(peer.nextFrame(timeout: 1)) }
+        XCTAssertEqual(files.map(\.type), [Int(Session.capRequestAsset), Int(Session.capSetLink), Int(Session.capSetLink)])
+        XCTAssertEqual(files.map(\.payload), [Data("first:\(c.uuidString.lowercased())".utf8),
+                                              Data("first:7".utf8), Data("second:7".utf8)])
+    }
+
+    func testDiskMediaBatchReceivesInterleavedSelectedAssetsOnSeparateChannels() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let a = try XCTUnwrap(UUID(uuidString: "00112233-4455-4677-8999-aabbccddeeff"))
+        let b = try XCTUnwrap(UUID(uuidString: "10112233-4455-4677-8999-aabbccddeeff"))
+        let foreign = bytes("20112233445546778999aabbccddeeff")
+        let aID = withUnsafeBytes(of: a.uuid) { Data($0) }
+        let bID = withUnsafeBytes(of: b.uuid) { Data($0) }
+        let aBytes = Data("first capture".utf8)
+        let bBytes = Data("second capture".utf8)
+        let aChannel: UInt16 = 0x8010
+        let bChannel: UInt16 = 0x8011
+        try peer.write(mediaOffer(channel: bChannel, id: bID, size: UInt64(bBytes.count)))
+        try peer.write(mediaOffer(channel: 0x8012, id: foreign, size: 1))
+        try peer.write(mediaOffer(channel: aChannel, id: aID, size: UInt64(aBytes.count)))
+        let dataTag = [DataX.tag(2, Session.airData, last: true)]
+        try peer.write(DataX.message(bChannel, tags: dataTag, payload: Data(bBytes.prefix(3))))
+        try peer.write(DataX.message(aChannel, tags: dataTag, payload: aBytes))
+        try peer.write(DataX.message(bChannel, tags: [], payload: Data(bBytes.dropFirst(3))))
+        let completeTag = [DataX.tag(2, Session.airComplete, last: true)]
+        for (channel, data) in [(aChannel, aBytes), (bChannel, bBytes)] {
+            let completion = PB.uint(1, UInt64(data.count)) + PB.uint(2, UInt64(Session.adler32(data)))
+            try peer.write(DataX.message(channel, tags: completeTag, payload: completion))
+        }
+
+        var completed: [UUID] = []
+        let batch = try session.receiveMediaFilesToDisk(expectedAssetIDs: [a, b], timeout: 1,
+            onFileCompleted: { completed.append($0.assetID) })
+        XCTAssertNil(batch.error)
+        XCTAssertTrue(batch.failures.isEmpty)
+        XCTAssertEqual(completed, [a, b])
+        let aFile = try XCTUnwrap(batch.files[a])
+        let bFile = try XCTUnwrap(batch.files[b])
+        XCTAssertEqual(try Data(contentsOf: aFile.url), aBytes)
+        XCTAssertEqual(try Data(contentsOf: bFile.url), bBytes)
+        let replies = try (0..<5).map { _ in try DataX.parse(peer.nextFrame(timeout: 1)) }
+        XCTAssertEqual(replies.map(\.channel), [0x0011, 0x0012, 0x0010, 0x0010, 0x0011])
+        XCTAssertEqual(replies.map(\.type), [Int(Session.airCursor), Int(Session.airDrop), Int(Session.airCursor),
+                                            Int(Session.airDrop), Int(Session.airDrop)])
+        aFile.discard()
+        bFile.discard()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: aFile.url.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bFile.url.path))
+    }
+
+    func testDiskMediaCancellationReturnsVerifiedPartialBatchAndLeavesLinkOpen() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let a = try XCTUnwrap(UUID(uuidString: "00112233-4455-4677-8999-aabbccddeeff"))
+        let b = try XCTUnwrap(UUID(uuidString: "10112233-4455-4677-8999-aabbccddeeff"))
+        let aID = withUnsafeBytes(of: a.uuid) { Data($0) }
+        let bID = withUnsafeBytes(of: b.uuid) { Data($0) }
+        let content = Data("first capture".utf8)
+        try peer.write(mediaOffer(channel: 0x8010, id: aID, size: UInt64(content.count)))
+        try peer.write(DataX.message(0x8010, tags: [DataX.tag(2, Session.airData, last: true)], payload: content))
+        let completion = PB.uint(1, UInt64(content.count)) + PB.uint(2, UInt64(Session.adler32(content)))
+        try peer.write(DataX.message(0x8010, tags: [DataX.tag(2, Session.airComplete, last: true)], payload: completion))
+        try peer.write(mediaOffer(channel: 0x8011, id: bID, size: 1))
+
+        var secondOfferAcceptedAt: TimeInterval?
+        let batch = try session.receiveMediaFilesToDisk(expectedAssetIDs: [a, b], timeout: 10,
+            onBytes: { id, _, _ in
+                if id == b { secondOfferAcceptedAt = ProcessInfo.processInfo.systemUptime }
+            }, isCancelled: {
+                secondOfferAcceptedAt.map { ProcessInfo.processInfo.systemUptime - $0 >= 0.05 } ?? false
+            })
+        XCTAssertTrue(batch.error is CancellationError)
+        XCTAssertTrue(batch.failures.isEmpty)
+        let file = try XCTUnwrap(batch.files[a])
+        XCTAssertEqual(try Data(contentsOf: file.url), content)
+        XCTAssertNil(batch.files[b])
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - (try XCTUnwrap(secondOfferAcceptedAt)), 1.5)
+        let replies = try (0..<4).map { _ in try DataX.parse(peer.nextFrame(timeout: 1)) }
+        XCTAssertEqual(replies.last?.channel, 0x0011)
+        XCTAssertEqual(replies.last?.type, Int(Session.airDrop))
+        try session.sendStatus(3, AirShield.stSuccess)
+        XCTAssertEqual(try DataX.parse(peer.nextFrame(timeout: 1)).error, Int(AirShield.stSuccess))
+    }
+
+    func testDiskMediaRejectsUnverifiedSession() throws {
+        let (session, _) = try encryptedLoopback()
+        XCTAssertThrowsError(try session.receiveMediaFilesToDisk(expectedAssetIDs: [UUID()], timeout: 0.1))
+    }
+
+    func testDiskMediaKeepsVerifiedAssetWhenAnotherFailsChecksum() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let a = try XCTUnwrap(UUID(uuidString: "00112233-4455-4677-8999-aabbccddeeff"))
+        let b = try XCTUnwrap(UUID(uuidString: "10112233-4455-4677-8999-aabbccddeeff"))
+        let channel: UInt16 = 0x8010
+        let content = Data("sample".utf8)
+        let data = [DataX.tag(2, Session.airData, last: true)]
+        let complete = [DataX.tag(2, Session.airComplete, last: true)]
+        try peer.write(mediaOffer(channel: channel, id: withUnsafeBytes(of: a.uuid) { Data($0) },
+                                  size: UInt64(content.count)))
+        try peer.write(DataX.message(channel, tags: data, payload: content))
+        let size = PB.uint(1, UInt64(content.count))
+        let differentChecksum = Session.adler32(Data("differ".utf8))
+        try peer.write(DataX.message(channel, tags: complete, payload: size + PB.uint(2, UInt64(differentChecksum))))
+        let next = try DataX.parse(mediaOffer(channel: channel, id: withUnsafeBytes(of: b.uuid) { Data($0) },
+                                               size: UInt64(content.count)))
+        // Service 20 is already named on the channel. The next offer only changes the message type.
+        try peer.write(DataX.message(channel, tags: [DataX.tag(2, Session.airOffer, last: true)], payload: next.payload))
+        try peer.write(DataX.message(channel, tags: data, payload: content))
+        try peer.write(DataX.message(channel, tags: complete,
+                                     payload: size + PB.uint(2, UInt64(Session.adler32(content)))))
+
+        let batch = try session.receiveMediaFilesToDisk(expectedAssetIDs: [a, b], timeout: 1)
+        XCTAssertNil(batch.error)
+        XCTAssertNotNil(batch.failures[a])
+        XCTAssertNil(batch.files[a])
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(batch.files[b]).url), content)
+    }
+
     func testShutterConfirmationUsesCameraEventsOnSubscriptionMirror() throws {
         let (session, peer) = try encryptedLoopback()
         let mirror = Session.chLocalFirst ^ 0x8000
