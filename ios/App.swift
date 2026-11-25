@@ -56,6 +56,34 @@ final class Glasses: NSObject, ObservableObject {
     }
     @Published var ownerState: OwnerState = .unknown
 
+    /// One visible state for "what is happening right now". The user tapped, saw nothing, and
+    /// could not tell whether the tap registered — a spinner that disappears after 200 ms and a
+    /// silent log are both useless feedback. Everything the UI shows about progress reads this.
+    enum Phase: Equatable {
+        case idle
+        case connecting      // CoreBluetooth connect + L2CAP open
+        case handshaking     // ECDH, keys, trust
+        case connected
+        case failed(String)
+    }
+    @Published var phase: Phase = .idle
+
+    var phaseText: String {
+        switch phase {
+        case .idle: return "未连接"
+        case .connecting: return "连接中…"
+        case .handshaking: return "握手中…"
+        case .connected: return "已连接"
+        case .failed(let why): return "失败：\(why)"
+        }
+    }
+
+    var phaseBusy: Bool {
+        if case .connecting = phase { return true }
+        if case .handshaking = phase { return true }
+        return false
+    }
+
     @Published var devices: [ScanEntry] = []
     /// Which row is currently being connected, so the list can show a spinner instead of a button.
     @Published var connectingID: UUID?
@@ -284,7 +312,9 @@ final class Glasses: NSObject, ObservableObject {
         }
         connecting = true
         connectingID = id
+        phase = .connecting
         lastConnectAt = Date()
+        note("▶︎ 已收到点击，开始连接 …")
         guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
             connecting = false
             connectingID = nil
@@ -357,6 +387,7 @@ final class Glasses: NSObject, ObservableObject {
                 try sess.handshake(trust: trust)
             }.value
             connected = true
+            phase = .connected
             if trust {
                 UserDefaults.standard.set(true, forKey: "isOwner")
                 trustLine = "已验证（这台 iPhone 是主人）"
@@ -372,6 +403,7 @@ final class Glasses: NSObject, ObservableObject {
             UserDefaults.standard.set(Self.ts(), forKey: "ownerStateAt")
         } catch {
             trustLine = Glasses.explain(error)
+            phase = .failed(Glasses.explain(error))
             note("❌ 握手中断：\(error)")
             glassesLine = "握手失败：\(Glasses.explain(error))"
             if case LinkError.trustRejected(let code) = error {
@@ -1224,6 +1256,7 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             self.connecting = false
             self.connectingID = nil
             self.note("L2CAP up psm=0x\(String(ch.psm, radix: 16))")
+            self.phase = .handshaking
             // Always ask for trust when we actually hold a key. Gating this on the "isOwner"
             // flag meant a fresh key never got tested, so the app opened the link and then
             // quietly did nothing — indistinguishable from "no idea whether I'm the owner".

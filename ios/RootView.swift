@@ -54,11 +54,17 @@ struct StatusCapsule: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
-                Circle()
-                    .fill(g.connected ? Color.green : Color.orange)
-                    .frame(width: 7, height: 7)
-                Text(g.connected ? "已连接" : "未连接")
+                if g.phaseBusy {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Circle()
+                        .fill(g.connected ? Color.green
+                              : { if case .failed = g.phase { return Color.red }; return Color.orange }())
+                        .frame(width: 7, height: 7)
+                }
+                Text(g.phaseText)
                     .font(.caption.weight(.semibold))
+                    .lineLimit(1)
                 if g.connected, let b = g.status.batteryPercent {
                     Text("\(b)%")
                         .font(.caption.monospacedDigit())
@@ -688,15 +694,18 @@ struct DeviceTabBody: View {    @ObservedObject var g: Glasses
                                     }
                                 }
                                 Spacer()
-                                if g.connectingID == d.id {
-                                    ProgressView().controlSize(.small)
+                                if g.connectingID == d.id || (g.phaseBusy && d.isGlasses) {
+                                    HStack(spacing: 6) {
+                                        ProgressView().controlSize(.small)
+                                        Text(g.phaseText).font(.caption2).foregroundStyle(.secondary)
+                                    }
                                 } else {
                                     Text("\(d.rssi) dBm").font(.caption2.monospacedDigit())
                                         .foregroundStyle(.secondary)
                                 }
                             }
                         }
-                        .disabled(g.connectingID != nil)
+                        .disabled(g.connectingID != nil || g.phaseBusy)
                     }
                     if !g.otherDevices.isEmpty {
                         DisclosureGroup("其他 \(g.otherDevices.count) 个蓝牙信号") {
