@@ -189,17 +189,22 @@ enum PB {
                 }
                 out[field, default: []].append(v)
             } else if wire == 2 {
-                var n = 0; shift = 0
+                var length: UInt64 = 0
+                shift = 0
                 while true {
                     guard i < b.count else { throw LinkError.shortBuffer }
                     let x = b[i]; i += 1
-                    n |= Int(x & 0x7F) << shift
+                    guard shift < UInt64.bitWidth - 1 || x <= 1 else {
+                        throw LinkError.unexpected("protobuf field length exceeds 64 bits")
+                    }
+                    length |= UInt64(x & 0x7F) << shift
                     if x & 0x80 == 0 { break }
                     shift += 7
                 }
-                guard i + n <= b.count else { throw LinkError.shortBuffer }
-                out[field, default: []].append(Data(b[i ..< i + n]))
-                i += n
+                guard length <= UInt64(b.count - i) else { throw LinkError.shortBuffer }
+                let end = i + Int(length)
+                out[field, default: []].append(Data(b[i ..< end]))
+                i = end
             } else {
                 throw LinkError.unsupportedWireType(wire)
             }

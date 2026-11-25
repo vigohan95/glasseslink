@@ -321,6 +321,7 @@ final class Session {
     private var rxSolved = false
     private var ivSolved = false
     private var rxIVs: [Data] = []
+    private var pendingSetupMessages: [DataX.Message] = []
 
     static func uniqueIVs(_ list: [Data]) -> [Data] {
         var out: [Data] = []
@@ -443,7 +444,15 @@ final class Session {
         return nil
     }
 
-    private func recvMessage(timeout: TimeInterval) throws -> DataX.Message {
+    static func isEndLinkSetupRequest(_ message: DataX.Message) -> Bool {
+        message.channel == DataX.chSetup && message.service == nil
+            && message.type == 0x1000 && message.error == nil
+    }
+
+    private func recvMessage(timeout: TimeInterval, includePending: Bool = true) throws -> DataX.Message {
+        if includePending, !pendingSetupMessages.isEmpty {
+            return pendingSetupMessages.removeFirst()
+        }
         while true {
             let sdu = try stream.nextFrame(timeout: timeout)
             var plain: Data
@@ -493,7 +502,7 @@ final class Session {
 
             // The glasses start EndLinkSetup; the answer is a bare 0x1000 status on the
             // mirror channel. Callers never see this message.
-            if msg.channel == DataX.chSetup, msg.type == 0x1000 {
+            if Self.isEndLinkSetupRequest(msg) {
                 try sendAny(AirShield.endLinkStatus)
                 emit("answered the glasses' EndLinkSetup")
                 continue
@@ -525,7 +534,7 @@ final class Session {
 
     // MARK: handshake
 
-    /// RequestEncryption -> EnableEncryption -> [trust] -> EndLinkSetup.
+    /// RequestEncryption -> EnableEncryption -> EndLinkSetup -> optional trust.
     /// `trust: false` is the provisioning link: the glasses accept it even before
     /// they know our key, which is what makes an Android-free first pairing possible.
     func handshake(timeout: TimeInterval = 12, trust: Bool = true) throws {
@@ -553,7 +562,10 @@ final class Session {
             } else if t == 2, peerEnable == nil,
                       let s = f[2]?.first as? Data, let i = f[3]?.first as? Data {
                 let q = (f[6]?.first as? Int) ?? 0
-                peerEnable = (s, i, UInt32((f[4]?.first as? Int) ?? 0), q == 1 ? .qcs7 : .none)
+                guard let base = UInt32(exactly: (f[4]?.first as? Int) ?? 0) else {
+                    throw LinkError.unexpected("peer EnableEncryption base sequence out of range")
+                }
+                peerEnable = (s, i, base, q == 1 ? .qcs7 : .none)
             }
         }
 
@@ -610,7 +622,7 @@ final class Session {
         }
 
         let shared = try owner.sharedSecret(peerPubkeyXy: req.pub)
-        emit("ecdh ok, shared=\(shared.hexShort) quirks=\(quirks)")
+        emit("ecdh ok, quirks=\(quirks)")
 
         // Already sent above, together with the request (Visor does the same). Nothing left to do
         // here but remember that the peer's own EnableEncryption is what the rx key needs.
@@ -667,8 +679,8 @@ final class Session {
         // "sealed (114B) … twelve seconds of nothing".
         do {
             try endLinkSetup(timeout: min(timeout, 2))
-        } catch {
-            emit("EndLinkSetup 未应答（\(error)）——继续尝试 trust")
+        } catch LinkError.unexpected(let reason) {
+            emit("EndLinkSetup 未应答（\(reason)）")
         }
         if trust { try doTrust(timeout: timeout) }
     }
@@ -697,38 +709,24 @@ final class Session {
         }
     }
 
-    /// Both directions of EndLinkSetup, in whatever order the glasses choose.
-    ///
-    /// The glasses ask us to set up the link and we answer with a bare status frame
-    /// (`0x1000`); separately, our own request is answered the same way. The old code only
-    /// looked at `type`, but a status frame carries an error code and no type at all, so it
-    /// sat there until the 12 s timeout — exactly what the wrist log showed.
+    /// Wait for the mirror status. The reader answers peer setup requests as they arrive.
     private func endLinkSetup(timeout: TimeInterval) throws {
         let frame = try AirShield.endLinkSetup(streamUUID: streamUUID, linkUUID: linkUUID)
         emit("EndLinkSetup (\(frame.count)B)")
         try sendAny(frame)
 
-        var answeredPeer = false
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            let m = try recvMessage(timeout: max(0.5, deadline.timeIntervalSinceNow))
-
-            if let code = m.error {
-                guard code == Int(AirShield.stSuccess) || code == Int(AirShield.stOK) else {
-                    throw LinkError.serviceError("EndLinkSetup", UInt16(truncatingIfNeeded: code))
-                }
-                if !answeredPeer {
-                    try sendAny(AirShield.endLinkStatus)
-                    answeredPeer = true
-                }
-                emit("link up")
-                return
+            let m = try recvMessage(timeout: max(0.5, deadline.timeIntervalSinceNow), includePending: false)
+            guard m.channel == DataX.chSetupMirror, m.service == nil, m.type == nil, let code = m.error else {
+                pendingSetupMessages.append(m)
+                continue
             }
-            if m.type == 0x1000, !answeredPeer {
-                try sendAny(AirShield.endLinkStatus)
-                answeredPeer = true
-                emit("answered the glasses' own EndLinkSetup")
+            guard code == Int(AirShield.stSuccess) || code == Int(AirShield.stOK) else {
+                throw LinkError.serviceError("EndLinkSetup", UInt16(truncatingIfNeeded: code))
             }
+            emit("link up")
+            return
         }
         throw LinkError.unexpected("EndLinkSetup: no status frame from the glasses")
     }

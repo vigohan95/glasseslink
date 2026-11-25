@@ -102,7 +102,8 @@ final class Glasses: NSObject, ObservableObject {
     private let scanRounds = 6
     @Published var connected = false
     private var connecting = false
-    private var lastConnectAt = Date.distantPast
+    private var connectionAttempt: UUID?
+    private var retriedL2CAP = false
     @Published var busy = false
     @Published var ownerLine = "owner key: 未知"
     /// Human-readable result of the last ownership proof, e.g. "已通过" or a code with a fix.
@@ -138,10 +139,13 @@ final class Glasses: NSObject, ObservableObject {
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
+    private var reconnectAfterDisconnect: (id: UUID, forRegistration: Bool)?
+    private var connectingForRegistration = false
     private var channel: CBL2CAPChannel?
     private var stream: SDUStream?
     private var session: Session?
     private var owner: OwnerMaterial?
+    private(set) var ownerRegistrationCompleted = false
 
     /// Ray-Ban Meta Gen 2 exposes its link on L2CAP PSM 0x80.
     let psm: CBL2CAPPSM = 0x80
@@ -298,7 +302,8 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
-    func connect(_ id: UUID) {
+    func connect(_ id: UUID, forRegistration: Bool = false) {
+        guard central.state == .poweredOn else { note("蓝牙不可用：\(central.state.rawValue)"); return }
         if channel != nil {
             note("链路已经打开了，不用再点；要重来先「断开」")
             return
@@ -313,11 +318,11 @@ final class Glasses: NSObject, ObservableObject {
         connecting = true
         connectingID = id
         phase = .connecting
-        lastConnectAt = Date()
         note("▶︎ 已收到点击，开始连接 …")
         guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
             connecting = false
             connectingID = nil
+            phase = .failed("找不到这台眼镜")
             // Visor issue #114: after the glasses reboot, the cached identifier can go stale and
             // every connect attempt says "Out of reach" while Bluetooth audio stays fine. Rescan
             // instead of making the user guess.
@@ -326,11 +331,26 @@ final class Glasses: NSObject, ObservableObject {
             return
         }
         central.stopScan()
+        connectingForRegistration = forRegistration
         peripheral = p
         p.delegate = self
         UserDefaults.standard.set(id.uuidString, forKey: "lastPeripheral")
         note("连接 \(p.name ?? "?") …")
-        central.connect(p, options: nil)
+        let attempt = UUID()
+        connectionAttempt = attempt
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard let self, self.connectionAttempt == attempt else { return }
+            let reason = p.state == .connected ? "打开眼镜蓝牙通道超时" : "蓝牙连接眼镜超时"
+            self.failConnection(reason, peripheral: p)
+        }
+        if p.state == .connected {
+            openLink(p)
+        } else if p.state == .disconnecting {
+            reconnectAfterDisconnect = (id, forRegistration)
+        } else {
+            central.connect(p, options: nil)
+        }
     }
 
     /// The glasses stay paired at the iOS level, so a cold launch can go straight back to
@@ -346,14 +366,8 @@ final class Glasses: NSObject, ObservableObject {
         }
         guard let saved = UserDefaults.standard.string(forKey: "lastPeripheral"),
               let id = UUID(uuidString: saved) else { return }
-        guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else {
-            note("上次的眼镜现在不在系统里，点「扫描」一次")
-            return
-        }
-        peripheral = p
-        p.delegate = self
-        note("自动连接上次的眼镜 \(p.name ?? saved) …")
-        central.connect(p, options: nil)
+        note("自动连接上次的眼镜 …")
+        connect(id)
     }
 
     // MARK: link bring-up
@@ -366,10 +380,9 @@ final class Glasses: NSObject, ObservableObject {
         // No key yet is not a dead end: the setup link only needs *a* key pair so the
         // handshake can run, and provisioning replaces it with the real one afterwards.
         if owner == nil {
-            owner = try? OwnerMaterial.generate()
             note("还没有 owner key：先用临时密钥把链路打通（成为主人时会换成正式那把）")
         }
-        guard let own = owner else { note("建不出密钥对"); return }
+        let own = owner ?? OwnerMaterial.generate()
         let sess = Session(stream: s, owner: own, log: { [weak self] in self?.note($0) })
         sess.forcedQuirks = Glasses.pendingQuirks
         sess.blockOTA = Glasses.blockOTA
@@ -378,7 +391,9 @@ final class Glasses: NSObject, ObservableObject {
         // launch, which is exactly the "闪退十几次" loop. We mark the attempt in flight and
         // clear it on the way out, so a leftover flag at next launch means "it died here".
         UserDefaults.standard.set(true, forKey: "linkInFlight")
-        defer { UserDefaults.standard.set(false, forKey: "linkInFlight") }
+        defer {
+            if session === sess { UserDefaults.standard.set(false, forKey: "linkInFlight") }
+        }
         do {
             // handshake() blocks on NSCondition while it waits for the glasses (up to 12 s).
             // Calling it straight from a @MainActor method froze the whole UI for the whole
@@ -386,6 +401,7 @@ final class Glasses: NSObject, ObservableObject {
             try await Task.detached(priority: .userInitiated) {
                 try sess.handshake(trust: trust)
             }.value
+            guard session === sess else { return }
             connected = true
             phase = .connected
             if trust {
@@ -402,6 +418,7 @@ final class Glasses: NSObject, ObservableObject {
             UserDefaults.standard.set(trust ? "verified" : "unverified", forKey: "ownerState")
             UserDefaults.standard.set(Self.ts(), forKey: "ownerStateAt")
         } catch {
+            guard session === sess else { return }
             trustLine = Glasses.explain(error)
             phase = .failed(Glasses.explain(error))
             note("❌ 握手中断：\(error)")
@@ -413,10 +430,7 @@ final class Glasses: NSObject, ObservableObject {
             }
             // Release the link on failure: otherwise the next tap only reports
             // "链路已经打开了" and the user is stuck until the app is killed.
-            sess.close()
-            s.close()
-            channel = nil
-            connected = false
+            clearLink()
             if let p = peripheral { central.cancelPeripheralConnection(p) }
             // The glasses never say which AirShield variant they want, and the wrong one
             // makes them drop our sealed frames (or answer with a MAC we cannot verify).
@@ -452,8 +466,7 @@ final class Glasses: NSObject, ObservableObject {
         return "\(error)"
     }
 
-    /// Connect without proving ownership — used before the first provisioning.
-    func connectSetup() { Task { await bringUp(trust: false) } }
+    func connectSetup() { reconnect(forRegistration: true) }
 
     /// `nil` follows whatever the glasses advertise; 0/1 force one AirShield variant.
     static var pendingQuirks: UInt64? {
@@ -471,24 +484,56 @@ final class Glasses: NSObject, ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "blockOTA") }
     }
 
-    /// Tear the link down so the next connect starts from a clean slate. Without this a failed
-    /// attempt leaves the PSM occupied and every retry just says "L2CAP PSM already connected".
-    func disconnect() {
-        session?.close()
+    private func clearLink() {
+        if session != nil { UserDefaults.standard.set(false, forKey: "linkInFlight") }
         session = nil
         stream?.close()
         stream = nil
         channel = nil
-        if let p = peripheral { central.cancelPeripheralConnection(p) }
         connected = false
         connecting = false
         connectingID = nil
+        connectingForRegistration = false
+        connectionAttempt = nil
+        retriedL2CAP = false
+        ownerRegistrationCompleted = false
+    }
+
+    private func failConnection(_ reason: String, peripheral p: CBPeripheral) {
+        reconnectAfterDisconnect = nil
+        clearLink()
+        phase = .failed(reason)
+        glassesLine = reason
+        note(reason)
+        if p.state != .disconnected { central.cancelPeripheralConnection(p) }
+    }
+
+    func disconnect() {
+        reconnectAfterDisconnect = nil
+        clearLink()
+        if let p = peripheral { central.cancelPeripheralConnection(p) }
+        phase = .idle
         glassesLine = "未连接"
         note("已断开，可以重新点了")
     }
 
-    /// Normal connect: prove we hold the owner key.
-    func connectTrusted() { Task { await bringUp(trust: true) } }
+    func reconnectForOwnerVerification() { reconnect(forRegistration: false) }
+
+    private func reconnect(forRegistration: Bool) {
+        guard !phaseBusy else { return }
+        guard let p = peripheral else { startScan(); return }
+        clearLink()
+        if p.state == .disconnected {
+            connect(p.identifier, forRegistration: forRegistration)
+            return
+        }
+        reconnectAfterDisconnect = (p.identifier, forRegistration)
+        connecting = true
+        connectingID = p.identifier
+        phase = .connecting
+        glassesLine = "正在重新连接眼镜"
+        central.cancelPeripheralConnection(p)
+    }
 
     // MARK: capture
 
@@ -917,14 +962,17 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: provisioning (no Android, no PC)
 
+    var canStartOwnerRegistration: Bool {
+        connected && channel != nil && session != nil && ownerState == .unverified
+            && !busy && !ownerRegistrationCompleted
+    }
+
     func becomeOwner(userToken: String) {
-        guard let sess = session else {
-            note("先点「连接（setup 链路）」，再登录")
+        guard canStartOwnerRegistration, let sess = session else {
+            note("注册需要已完成的设置连接，请重新连接眼镜再登录")
             return
         }
-        let key = owner ?? OwnerMaterial.generate()
-        owner = key
-        ownerLine = "owner key: 新建 \(key.publicKeyXy.hexShort)"
+        let key = sess.owner
         busy = true
         Task {
             defer { busy = false }
@@ -932,6 +980,8 @@ final class Glasses: NSObject, ObservableObject {
                 let bundle = try await Provisioner.becomeOwner(session: sess, owner: key,
                                                                userToken: userToken,
                                                                log: { [weak self] in self?.note($0) })
+                owner = key
+                ownerRegistrationCompleted = session === sess
                 UserDefaults.standard.set(true, forKey: "isOwner")
                 ownerLine = "owner key: 已注册 · serial \(bundle.serial)"
                 note("✅ 这台 iPhone 现在是主人。断开重连一次走 trust 链路")
@@ -1146,14 +1196,9 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             return
         }
         Task { @MainActor in
-            peripheral = restored
-            restored.delegate = self
-            if restored.state == .connected {
-                note("后台恢复：\(restored.name ?? "眼镜") 仍连着")
-            } else {
-                note("后台恢复：重连 \(restored.name ?? "眼镜") …")
-                c.connect(restored, options: nil)
-            }
+            guard !connecting, channel == nil else { return }
+            UserDefaults.standard.set(restored.identifier.uuidString, forKey: "lastPeripheral")
+            if c.state == .poweredOn { autoReconnect() }
         }
     }
 
@@ -1196,43 +1241,43 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     nonisolated func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
         Task { @MainActor in
-            self.note("已连接，打开 L2CAP PSM 0x\(String(self.psm, radix: 16))")
-            p.discoverServices(nil)
             self.openLink(p)
         }
     }
 
-    /// CoreBluetooth keeps the PSM marked as occupied for a few seconds after an abrupt drop,
-    /// so "L2CAP PSM already connected" is normal right after a retry. Wait it out and try again
-    /// rather than making the user tap again.
-    private func openLink(_ p: CBPeripheral, attempt: Int = 1) {
-        guard channel == nil else { return }
-        if attempt == 1 { p.openL2CAPChannel(psm); return }
-        Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { _ in
-            Task { @MainActor in
-                guard self.channel == nil else { return }
-                self.note("重试打开 L2CAP（第 \(attempt) 次）")
-                p.openL2CAPChannel(self.psm)
-            }
-        }
+    private func openLink(_ p: CBPeripheral) {
+        guard connectingID == p.identifier, connectionAttempt != nil,
+              reconnectAfterDisconnect == nil, channel == nil, p.state == .connected else { return }
+        note("打开 L2CAP PSM 0x\(String(psm, radix: 16))")
+        p.openL2CAPChannel(psm)
     }
 
     nonisolated func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         Task { @MainActor in
-            self.connected = false
-            self.connecting = false
-            self.connectingID = nil
-            self.glassesLine = "断开"
+            guard self.peripheral?.identifier == p.identifier, p.state == .disconnected else { return }
+            let reconnect = self.reconnectAfterDisconnect
+            self.reconnectAfterDisconnect = nil
+            self.clearLink()
+            if self.phaseBusy || self.phase == .connected {
+                self.phase = .idle
+                self.glassesLine = "断开"
+            }
             self.note("断开：\(error?.localizedDescription ?? "正常")")
+            if let reconnect, reconnect.id == p.identifier {
+                self.connect(reconnect.id, forRegistration: reconnect.forRegistration)
+            }
         }
     }
 
     nonisolated func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
         Task { @MainActor in
-            self.connected = false
-            self.connecting = false
-            self.connectingID = nil
-            self.note("连接失败：\(error?.localizedDescription ?? "?")")
+            guard self.connectingID == p.identifier, p.state == .disconnected else { return }
+            let reconnect = self.reconnectAfterDisconnect
+            let reason = error?.localizedDescription ?? "蓝牙连接未建立"
+            self.failConnection("连接失败：\(reason)", peripheral: p)
+            if let reconnect, reconnect.id == p.identifier {
+                self.connect(reconnect.id, forRegistration: reconnect.forRegistration)
+            }
         }
     }
 
@@ -1244,32 +1289,40 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     nonisolated func peripheral(_ p: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
         Task { @MainActor in
+            guard self.connectingID == p.identifier, let attempt = self.connectionAttempt,
+                  self.reconnectAfterDisconnect == nil, self.channel == nil, p.state == .connected else {
+                channel?.inputStream?.close()
+                channel?.outputStream?.close()
+                return
+            }
             guard let ch = channel else {
-                let msg = error?.localizedDescription ?? "?"
-                self.note("L2CAP 打开失败：\(msg)")
-                if msg.lowercased().contains("already connected") {
-                    self.openLink(p, attempt: 2)
+                let reason = error?.localizedDescription ?? "蓝牙通道未建立"
+                if reason.localizedCaseInsensitiveContains("already connected"), !self.retriedL2CAP {
+                    self.retriedL2CAP = true
+                    self.note("蓝牙通道仍被占用，准备重试一次")
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    if self.connectionAttempt == attempt { self.openLink(p) }
+                } else {
+                    self.failConnection("L2CAP 打开失败：\(reason)", peripheral: p)
                 }
                 return
             }
             self.channel = ch
             self.connecting = false
             self.connectingID = nil
+            self.connectionAttempt = nil
             self.note("L2CAP up psm=0x\(String(ch.psm, radix: 16))")
             self.phase = .handshaking
-            // Always ask for trust when we actually hold a key. Gating this on the "isOwner"
-            // flag meant a fresh key never got tested, so the app opened the link and then
-            // quietly did nothing — indistinguishable from "no idea whether I'm the owner".
-            let hasKey = self.owner != nil
-            await self.bringUp(trust: hasKey)
+            let requireTrust = self.owner != nil && !self.connectingForRegistration
+            await self.bringUp(trust: requireTrust)
         }
     }
 
     nonisolated func peripheral(_ p: CBPeripheral, didClose channel: CBL2CAPChannel?,
                                 error: Error?) {
         Task { @MainActor in
-            self.channel = nil
-            self.note("L2CAP 关闭（\(error?.localizedDescription ?? "正常")）")
+            guard let channel, self.channel === channel else { return }
+            self.failConnection("L2CAP 关闭（\(error?.localizedDescription ?? "正常")）", peripheral: p)
         }
     }
 }

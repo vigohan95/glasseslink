@@ -633,13 +633,10 @@ struct OwnerBadge: View {
                 Text("上次验证：\(at)").font(.caption2).foregroundStyle(.secondary)
             }
             HStack(spacing: 10) {
-                Button("重新验证") {
-                    g.disconnect()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { g.connectTrusted() }
-                }
+                Button("重新验证") { g.reconnectForOwnerVerification() }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(g.connectingID != nil)
+                .disabled(g.phaseBusy)
                 Text(g.ownerFingerprint).font(.caption2).foregroundStyle(.secondary)
             }
         }
@@ -877,7 +874,17 @@ struct BecomeOwnerView: View {
     var body: some View {
         List {
             Section {
-                Button("开始注册流程") { g.route = .login }
+                if g.ownerRegistrationCompleted {
+                    Button("重新连接并验证") { g.reconnectForOwnerVerification() }
+                        .disabled(g.phaseBusy)
+                } else if g.canStartOwnerRegistration {
+                    Button("开始注册流程") { g.route = .login }
+                } else {
+                    Button("为注册连接眼镜") { g.connectSetup() }
+                        .disabled(g.phaseBusy || g.busy)
+                    Text("请先在「设备」页选中眼镜。设置连接建立后就能登录注册。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Text(g.ownerLine).font(.caption).foregroundStyle(.secondary)
             }
             Section("会看到什么") {

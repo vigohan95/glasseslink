@@ -63,6 +63,40 @@ final class SessionLoopbackTests: XCTestCase {
         let trimmed = sliced.dropFirst(2)
         XCTAssertEqual(SDUStream.frameLength(trimmed), frame.count)
     }
+
+    func testFrameLengthWithPartialHeadersAndNonzeroStartIndex() {
+        let plain = DataX.header(DataX.chSetup, 0x3FFF, hasExtension: true)
+        let encrypted = Data([Direction.frameData]) + Data(repeating: 0, count: 8) + Data([UInt8.max])
+        let padding = Data(repeating: 0, count: 16)
+
+        for (header, expectedLength) in [(plain, 16_387), (encrypted, 4_106)] {
+            let slice = (padding + header).dropFirst(padding.count)
+            XCTAssertGreaterThan(slice.startIndex, 0)
+            for n in 0 ..< header.count {
+                XCTAssertNil(SDUStream.frameLength(slice.prefix(n)))
+            }
+            XCTAssertEqual(SDUStream.frameLength(slice), expectedLength)
+        }
+    }
+
+    func testLoopbackPipeKeepsTrailingPartialFrame() throws {
+        let (a, b) = SDUStream.loopbackPair()
+        let first = DataX.status(DataX.chSetup, 0)
+        let second = Data([Direction.frameData]) + Data(repeating: 0, count: 25)
+        let partial = second.dropLast()
+        try a.write(first + partial)
+
+        XCTAssertEqual(try b.nextFrame(timeout: 0), first)
+        XCTAssertThrowsError(try b.nextFrame(timeout: 0))
+        XCTAssertEqual(b.debugBufferCount, partial.count)
+
+        try a.write(Data(second.suffix(1)))
+        let received = try b.nextFrame(timeout: 0)
+        XCTAssertEqual(received, second)
+        XCTAssertEqual(received.startIndex, 0)
+        XCTAssertEqual(b.debugBufferCount, 0)
+    }
+
     func testFullHandshakeCaptureListAndTransfer() throws {
 
         // The fake peer still does not complete its side of the link; the signer it uses is

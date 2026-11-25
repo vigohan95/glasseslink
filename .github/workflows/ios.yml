@@ -43,6 +43,8 @@ jobs:
             -only-testing:GlassesLinkTests/ProtocolTests \
             -only-testing:GlassesLinkTests/CompatibilityTests \
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testLoopbackPipeDeliversAFrame \
+            -only-testing:GlassesLinkTests/SessionLoopbackTests/testFrameLengthWithPartialHeadersAndNonzeroStartIndex \
+            -only-testing:GlassesLinkTests/SessionLoopbackTests/testLoopbackPipeKeepsTrailingPartialFrame \
             -destination "platform=iOS Simulator,name=$DEVICE" \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO

@@ -19,6 +19,20 @@ final class ProtocolTests: XCTestCase {
 
     // MARK: - varint
 
+    func testProtobufLengthDelimitedFieldAtBufferBoundary() throws {
+        let payload = Data(repeating: 0x5A, count: 128)
+        let encoded = PB.bytes(1, payload) + PB.bytes(2, Data())
+        let fields = try PB.parse(encoded)
+
+        XCTAssertEqual(fields[1]?.first as? Data, payload)
+        XCTAssertEqual(fields[2]?.first as? Data, Data())
+        XCTAssertThrowsError(try PB.parse(Data(PB.bytes(1, payload).dropLast()))) { error in
+            guard case LinkError.shortBuffer = error else {
+                return XCTFail("Expected shortBuffer, got \(error)")
+            }
+        }
+    }
+
     /// The glasses verify svc36 with NONEwithECDSA, so the channel binding must be signed
     /// verbatim. tools/p256_ref.py is the executable spec: it produces r||s for the same
     /// digest with a fixed nonce and checks it with `cryptography`'s prehashed verifier.
@@ -192,10 +206,20 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(frame, hex("802a8001020010000801121000112233445546778999aabbccddeeff"
                                   + "1a100f1e2d3c4b5a49678896a5b4c3d2e1f0"))
         XCTAssertEqual(frame.count, 46)
+        XCTAssertTrue(Session.isEndLinkSetupRequest(try DataX.parse(frame)))
 
         XCTAssertThrowsError(try AirShield.endLinkSetup(streamUUID: Data(repeating: 0x11, count: 16),
                                                         linkUUID: hex("0f1e2d3c4b5a49678896a5b4c3d2e1f0")),
                              "a non-v4 UUID must be refused before it reaches the wire")
+    }
+
+    func testIdentityMessageWithSameTypeIsNotEndLinkSetup() throws {
+        let tags = [DataX.tag(1, UInt16(AirShield.svcIdentity), last: false),
+                    DataX.tag(2, AirShield.idEnableTrust, last: true)]
+        for channel in [UInt16(0x8004), DataX.chSetup] {
+            let identity = try DataX.parse(DataX.message(channel, tags: tags))
+            XCTAssertFalse(Session.isEndLinkSetupRequest(identity))
+        }
     }
 
     // MARK: - camera shutter
