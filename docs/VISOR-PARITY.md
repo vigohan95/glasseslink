@@ -24,6 +24,7 @@
 | Visor 早期用户报告取景数秒后卡住，再打开收到服务错误。 [取景 #22](https://github.com/macedonga/visor/issues/22) | 记录首帧、持续帧间隔、耗电和温升。分别验证停止、异常断开、连续重新进入。取景失败后相册和其它控制仍能用。 |
 | Visor 1.4.2 有文件已入手机而相册仍显示传输中的报告，维护者在 1.4.4 修复。Reddit 用户报告只能走蓝牙，视频导入很慢。 [相册 #41](https://github.com/macedonga/visor/issues/41) · [Reddit 讨论](https://www.reddit.com/r/MetaGlasses/comments/1x56b2d/comment/ph3wo8d/) | 以同一批小图、短片、大视频分别测首字节和完成时间。拔断链路后重试，核对系统照片、校验、进度退出与重启后的导入记录。 |
 | Visor 1.4.8 有时长选 10 分钟而固件仍为 3 分钟的报告。另有视频设置收到回复但输出参数未变的反馈。 [时长 #72](https://github.com/macedonga/visor/issues/72) · [视频 #35](https://github.com/macedonga/visor/issues/35) | 查看眼镜真实读回值，测导入成片的时长、编码、分辨率、画面与音轨，记录固件提前终止时 App 的提示。 |
+| 有用户报告普通连接仍可用时语音唤醒已经失效，界面仍显示就绪。另一份报告记录了 Live AI 半启动后麦克风持续开启，视觉问答缺失实际照片。 [语音 #47](https://github.com/macedonga/visor/issues/47) · [Live AI #115](https://github.com/macedonga/visor/issues/115) | 语音就绪单独验证实际收到的唤醒事件和回复。覆盖音频超时与停止状态。图像问答需要收到当前回合的有效照片才能以画面为依据。 |
 
 同一副眼镜、同一固件、同批素材分别测 GlassesLink 与 Visor。连接和快门各重复至少 20 次，记录成功率、中位和最慢的 5% 耗时。导入记首字节与完成时间，取景记首帧与最长停顿，按各自所用的链路标注结果。
 
