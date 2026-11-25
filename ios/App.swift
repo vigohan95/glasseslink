@@ -828,7 +828,7 @@ final class Glasses: NSObject, ObservableObject {
     func stopAssistant() {
         guard let assistantRef else { return }
         assistantRef.stop()
-        assistantRef = nil
+        self.assistantRef = nil
         assistantOn = false
         disconnect()
         note("助手接管已关闭")

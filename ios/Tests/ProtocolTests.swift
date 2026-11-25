@@ -158,6 +158,24 @@ final class ProtocolTests: XCTestCase {
         XCTAssertThrowsError(try DataX.parseMessages(frame, requireComplete: true))
     }
 
+    func testDataXReassemblesSplitHeaderAndBody() {
+        let status = DataX.status(0x0006, AirShield.stSuccess)
+        let body = Data(repeating: 0x31, count: 32)
+        let record = DataX.message(0x0007, tags: [DataX.tag(2, 6, last: true)], payload: body)
+
+        for boundary in [2, 10] {
+            var carry = Data()
+            let first = DataX.splitMessages(status + record.prefix(boundary), carry: &carry)
+            XCTAssertEqual(first.map { $0.message.channel }, [0x0006])
+            XCTAssertEqual(carry, record.prefix(boundary))
+
+            let second = DataX.splitMessages(Data(record.dropFirst(boundary)) + status, carry: &carry)
+            XCTAssertEqual(second.map { $0.message.channel }, [0x0007, 0x0006])
+            XCTAssertEqual(second.first?.message.payload, body)
+            XCTAssertTrue(carry.isEmpty)
+        }
+    }
+
     func testDataXFrameMatchesReference() {
         // pi: dx_message(0x8002, [dx_tag(1, 31, False), dx_tag(2, 2, True)])
         let frame = DataX.message(0x8002, tags: [DataX.tag(1, 31, last: false),

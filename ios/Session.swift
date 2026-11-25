@@ -322,6 +322,7 @@ final class Session {
     private var rxSolved = false
     private var ivSolved = false
     private var rxIVs: [Data] = []
+    private var dataXCarry = Data()
     private var decodedMessages: ArraySlice<DataX.Message> = []
     private var pendingSetupMessages: [DataX.Message] = []
 
@@ -453,7 +454,7 @@ final class Session {
     }
 
     private func openFrame(_ sdu: Data) throws -> Data {
-        guard let receiver = recv else { return sdu }
+        guard let receiver = recv else { throw LinkError.unexpected("receive direction unavailable") }
         if let plain = try? receiver.open(sdu) {
             rxSolved = true
             return plain
@@ -468,45 +469,39 @@ final class Session {
         throw LinkError.badMAC
     }
 
-    private func parseFrame(_ plain: Data, requireComplete: Bool = false) throws -> [DataX.Message] {
-        let messages = try DataX.parseMessages(plain, requireComplete: requireComplete)
-        var remaining = plain
-        for msg in messages {
-            emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
-                 remaining.prefix(msg.consumed), inbound: true)
-            remaining = remaining.dropFirst(msg.consumed)
+    private func resolveFirstIV(_ plain: Data, frame sdu: Data) -> Data {
+        guard !ivSolved, let receiver = recv else { return plain }
+        // Later frames use the previous ciphertext block, even if this plaintext is partial.
+        ivSolved = true
+        guard (try? DataX.parse(plain)) == nil else { return plain }
+        for iv in rxIVs {
+            let keys = AirShield.Keys(aes: receiver.aes, hmac: receiver.hmac,
+                                      iv: iv, macWord: receiver.macWord)
+            let candidate = Direction(keys, seq: receiver.seq &- 1)
+            if let rebuilt = try? candidate.open(sdu),
+               (try? DataX.parseMessages(rebuilt, requireComplete: true)) != nil {
+                emit("rx IV solved after a garbled first frame", nil, inbound: true)
+                return rebuilt
+            }
         }
-        if !remaining.isEmpty {
-            emit("ignored \(remaining.count)B after complete DataX messages", nil, inbound: true)
-        }
-        return messages
+        return plain
     }
 
     private func decodeFrame(_ sdu: Data) throws -> [DataX.Message] {
-        let plain = try openFrame(sdu)
-        do {
-            let messages = try parseFrame(plain)
-            if recv != nil { ivSolved = true }
-            return messages
-        } catch {
-            // The first frame's MAC covers ciphertext, not the IV. Test alternate IVs
-            // against that same authenticated frame without changing the live CBC state.
-            if !ivSolved, let receiver = recv {
-                for iv in rxIVs {
-                    let keys = AirShield.Keys(aes: receiver.aes, hmac: receiver.hmac,
-                                              iv: iv, macWord: receiver.macWord)
-                    let candidate = Direction(keys, seq: receiver.seq &- 1)
-                    if let rebuilt = try? candidate.open(sdu),
-                       let messages = try? parseFrame(rebuilt, requireComplete: true) {
-                        ivSolved = true
-                        emit("rx IV solved after a garbled first frame", nil, inbound: true)
-                        return messages
-                    }
-                }
-            }
-            emit("parse FAILED (\(error)) — skipping this frame", plain, inbound: true)
-            return []
+        let plain = resolveFirstIV(try openFrame(sdu), frame: sdu)
+        let available = dataXCarry.count + plain.count
+        let packets = DataX.splitMessages(plain, carry: &dataXCarry)
+        var consumed = 0
+        let messages = packets.map { packet in
+            let msg = packet.message
+            consumed += msg.consumed
+            emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
+                 packet.wire, inbound: true)
+            return msg
         }
+        let skipped = available - consumed - dataXCarry.count
+        if skipped > 0 { emit("skipped \(skipped)B of malformed DataX messages", nil, inbound: true) }
+        return messages
     }
 
     private func recvMessage(timeout: TimeInterval, includePending: Bool = true) throws -> DataX.Message {
@@ -1172,7 +1167,7 @@ final class Session {
 
     // MARK: svc28 device state
 
-    private func statusChannel() -> UInt16 { channel(named: "status") ?? allocChannel("status") }
+    private func statusChannel() -> UInt16 { serviceChannel("status", service: Status.service) }
 
     private func isDeviceStatus(_ message: DataX.Message, channel: UInt16) -> Bool {
         guard let type = message.type, Status.isStateType(type), message.error == nil else { return false }

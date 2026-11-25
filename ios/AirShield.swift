@@ -114,14 +114,18 @@ enum DataX {
         let consumed: Int
     }
 
+    private static func messageLength(_ buf: Data) -> Int? {
+        guard buf.count >= 4 else { return nil }
+        let start = buf.startIndex
+        return 4 + (Int(buf[start] & 0x3F) << 8 | Int(buf[start + 1]))
+    }
+
     /// Parse one plaintext DataX message.
     static func parse(_ buf: Data) throws -> Message {
-        guard buf.count >= 4 else { throw LinkError.shortBuffer }
+        guard let length = messageLength(buf), length <= buf.count else { throw LinkError.shortBuffer }
         let start = buf.startIndex
         let b0 = buf[start]
-        let payloadLen = Int(b0 & 0x3F) << 8 | Int(buf[start + 1])
-        guard payloadLen <= buf.count - 4 else { throw LinkError.shortBuffer }
-        let end = start + 4 + payloadLen
+        let end = start + length
         let channel = buf.u16be(start + 2)
         var service: Int?, type: Int?, error: Int?
         var i = start + 4
@@ -144,16 +148,27 @@ enum DataX {
                        payload: Data(buf[i ..< end]), consumed: end - start)
     }
 
-    /// Keep complete messages in order even if the frame ends with a partial header or body.
-    static func parseMessages(_ frame: Data, requireComplete: Bool = false) throws -> [Message] {
-        let first = try parse(frame)
-        var messages = [first]
-        var remainder = frame.dropFirst(first.consumed)
-        while !remainder.isEmpty, let next = try? parse(remainder) {
-            messages.append(next)
-            remainder = remainder.dropFirst(next.consumed)
+    /// Walk complete messages in order and retain the incomplete suffix for the next frame.
+    /// The retained suffix is always smaller than the largest 14-bit message plus its header.
+    static func splitMessages(_ bytes: Data, carry: inout Data) -> [(message: Message, wire: Data)] {
+        var remainder = carry.isEmpty ? bytes : carry + bytes
+        var packets: [(message: Message, wire: Data)] = []
+        while let length = messageLength(remainder), length <= remainder.count {
+            let wire = remainder.prefix(length)
+            if let message = try? parse(wire) { packets.append((message, wire)) }
+            remainder = remainder.dropFirst(length)
         }
-        if requireComplete && !remainder.isEmpty { throw LinkError.shortBuffer }
+        carry = Data(remainder)
+        return packets
+    }
+
+    static func parseMessages(_ frame: Data, requireComplete: Bool = false) throws -> [Message] {
+        var carry = Data()
+        let messages = splitMessages(frame, carry: &carry).map { $0.message }
+        guard !messages.isEmpty else { throw LinkError.shortBuffer }
+        if requireComplete && messages.reduce(0, { $0 + $1.consumed }) != frame.count {
+            throw LinkError.shortBuffer
+        }
         return messages
     }
 }
