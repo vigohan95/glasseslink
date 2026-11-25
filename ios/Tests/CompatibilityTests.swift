@@ -157,8 +157,11 @@ final class CompatibilityTests: XCTestCase {
         let returned = expectation(description: "Handshake exited after the data link closed")
         DispatchQueue.global(qos: .userInitiated).async {
             defer { returned.fulfill() }
-            XCTAssertThrowsError(try session.handshake(timeout: 1, trust: false)) {
-                XCTAssertEqual(String(describing: $0), "io: stream closed")
+            do {
+                try session.handshake(timeout: 1, trust: false)
+                XCTFail("Handshake unexpectedly succeeded on a closed transport")
+            } catch {
+                XCTAssertEqual(String(describing: error), "io: stream closed")
             }
         }
         wait(for: [returned], timeout: 2)
