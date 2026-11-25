@@ -78,6 +78,7 @@ gh workflow run ios.yml     # 产物在 Actions 的 GlassesLink-ipa artifact
 | 签名与分发 | `docs/SIGNING.md`、`docs/BUY-SIGNING.md`、`docs/DISTRIBUTION.md` |
 | 换手机 / 迁移钥匙 | `docs/OWNER-MIGRATION.md` |
 | 协议细节 | `docs/PROTOCOL-NOTES.md` |
+| 参考实现与协议笔记（索引） | `docs/REFERENCE/README.md` |
 
 ## 许可
 
