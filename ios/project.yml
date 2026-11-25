@@ -61,7 +61,16 @@ targets:
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
-        NSLocalNetworkUsageDescription: 访问局域网内的桥接服务。
+        NSLocalNetworkUsageDescription: 连接你配置的局域网模型或桥接服务。
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            "10.0.0.0/8":
+              NSExceptionAllowsInsecureHTTPLoads: true
+            "172.16.0.0/12":
+              NSExceptionAllowsInsecureHTTPLoads: true
+            "192.168.0.0/16":
+              NSExceptionAllowsInsecureHTTPLoads: true
         NSPhotoLibraryAddUsageDescription: 把眼镜拍的照片存到你的相册。
         NSPhotoLibraryUsageDescription: 选择并查看眼镜拍的照片。
         UIBackgroundModes:

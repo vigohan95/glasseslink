@@ -784,12 +784,14 @@ final class Glasses: NSObject, ObservableObject {
     func snap() {
         Task {
             _ = await withGlassesOperation { active in
+                let started = Date()
                 mediaMessage = "正在等待眼镜确认拍照…"
                 let cameraState = try await onGlassesQueue { try active.shutterPhoto() }
                 try checkActive(active)
                 status.camera = cameraState.camera
-                mediaMessage = "眼镜已确认拍照。可在相册中刷新并导入。"
-                note("眼镜确认拍照")
+                mediaMessage = "眼镜已响应快门，正在检查新照片…"
+                note("眼镜确认拍照开始")
+                await verifyNewCapture(on: active, since: started, photo: true)
             }
         }
     }
@@ -811,7 +813,9 @@ final class Glasses: NSObject, ObservableObject {
                     recordDeadline = nil
                     mediaMessage = "眼镜已确认停止录像，正在查询新视频…"
                     note("眼镜确认停止录像")
-                    await verifyStoppedVideo(on: active)
+                    let started = recordStartedAt
+                    recordStartedAt = nil
+                    await verifyNewCapture(on: active, since: started, photo: false)
                 } else {
                     recordStartedAt = Date()
                     scheduleAutoStop()
@@ -836,29 +840,33 @@ final class Glasses: NSObject, ObservableObject {
 
     private var autoStopTask: Task<Void, Never>?
 
-    private func verifyStoppedVideo(on active: Session) async {
-        let started = recordStartedAt
-        recordStartedAt = nil
+    private func verifyNewCapture(on active: Session, since started: Date?, photo: Bool) async {
+        let kind = photo ? "照片" : "视频"
+        let result = photo ? "眼镜已响应快门" : "眼镜已停止录像"
         let known = Set(captures.map(\.id))
-        try? await Task.sleep(nanoseconds: 600_000_000)
+        try? await Task.sleep(nanoseconds: photo ? 300_000_000 : 600_000_000)
         guard session === active else { return }
         do {
-            let list = try await onGlassesQueue { try active.captureList() }
+            let list = try await onGlassesQueue { try active.captureList(timeout: 5) }
             try checkActive(active)
             updateCaptures(list)
-            let newVideo = list.contains { item in
-                guard item.kind == 3074, !known.contains(item.id), let started,
+            let expectedKind = photo ? 3073 : 3074
+            let expectedAssetType = photo ? 2 : 1
+            let newCapture = list.contains { item in
+                guard item.kind == expectedKind,
+                      item.assets.contains(where: { $0.type == expectedAssetType && $0.size > 0 }),
+                      !known.contains(item.id), let started,
                       let timestamp = item.timestampNS else { return false }
                 let recorded = Date(timeIntervalSince1970: Double(timestamp) / 1_000_000_000)
                 return recorded >= started.addingTimeInterval(-10) && recorded <= Date().addingTimeInterval(10)
             }
-            mediaMessage = newVideo
-                ? "眼镜相册已出现新视频，可以导入播放。"
-                : "眼镜已停止录像，暂未找到带时间的新视频。"
+            mediaMessage = newCapture
+                ? "眼镜相册已出现新\(kind)，可以导入。"
+                : "\(result)，暂未查到新\(kind)。"
         } catch {
             guard session === active else { return }
-            mediaMessage = "眼镜已停止录像。相册暂时读不到，请稍后刷新。"
-            note("停止录像后读取相册失败：\(error)")
+            mediaMessage = "\(result)。相册暂时读不到，请稍后刷新。"
+            note("拍摄后读取相册失败：\(error)")
         }
     }
 
