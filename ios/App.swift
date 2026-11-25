@@ -151,6 +151,7 @@ final class Glasses: NSObject, ObservableObject {
     private var recoveryTask: Task<Void, Never>?
     private var recoveringID: UUID?
     private var recoveryAttempts = 0
+    private var useQuickHandshake = false
     private var verifiedAt: ContinuousClock.Instant?
     private var autoReconnectSuppressed = false
     private var connectingForRegistration = false
@@ -379,6 +380,8 @@ final class Glasses: NSObject, ObservableObject {
         }
         stopScan()
         connectingForRegistration = forRegistration
+        useQuickHandshake = !forRegistration && owner != nil && recoveryAttempts <= 1
+            && savedGlassesID == id && UserDefaults.standard.bool(forKey: "isOwner")
         discoveryMessage = nil
         peripheral = p
         p.delegate = self
@@ -453,6 +456,7 @@ final class Glasses: NSObject, ObservableObject {
         }
         let own = owner ?? OwnerMaterial.generate()
         let sess = Session(stream: s, owner: own, log: { [weak self] in self?.note($0) })
+        let quickStart = trust && useQuickHandshake
         sess.blockOTA = Glasses.blockOTA
         session = sess
         // A crash inside handshake() would otherwise be repeated by auto-reconnect on every
@@ -467,7 +471,7 @@ final class Glasses: NSObject, ObservableObject {
             // Calling it straight from a @MainActor method froze the whole UI for the whole
             // wait — that is the "tapping anything takes seconds" report. Run it off-main.
             try await Task.detached(priority: .userInitiated) {
-                try sess.handshake(trust: trust)
+                try sess.handshake(trust: trust, quickStart: quickStart)
             }.value
             guard session === sess else { return }
             connected = true
@@ -493,6 +497,13 @@ final class Glasses: NSObject, ObservableObject {
             guard session === sess else { return }
             trustLine = Glasses.explain(error)
             note("❌ 握手中断：\(error)")
+            if quickStart, case LinkError.unexpected(let reason) = error,
+               reason == Session.missingPeerEncryptionRequest,
+               let id = peripheral?.identifier {
+                recoveringID = id
+                recoveryAttempts = max(1, recoveryAttempts)
+                note("眼镜未回应快速握手，改用完整等待窗口")
+            }
             if case LinkError.trustRejected(let code) = error {
                 resetRecovery()
                 ownerState = .rejected(code)
@@ -558,6 +569,7 @@ final class Glasses: NSObject, ObservableObject {
         connecting = false
         connectingID = nil
         connectingForRegistration = false
+        useQuickHandshake = false
         connectionAttempt = nil
         connectionStartedAt = nil
         retriedL2CAP = false

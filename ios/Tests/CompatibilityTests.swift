@@ -150,6 +150,20 @@ final class CompatibilityTests: XCTestCase {
         return (session, peer)
     }
 
+    func testHandshakePropagatesClosedTransportDuringPassiveWait() {
+        let (client, _) = SDUStream.loopbackPair()
+        client.close()
+        let session = Session(stream: client, owner: OwnerMaterial(scalar: Data(repeating: 1, count: 32)))
+        let returned = expectation(description: "Handshake exited after the data link closed")
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { returned.fulfill() }
+            XCTAssertThrowsError(try session.handshake(timeout: 1, trust: false)) {
+                XCTAssertEqual(String(describing: $0), "io: stream closed")
+            }
+        }
+        wait(for: [returned], timeout: 2)
+    }
+
     func testCatalogDeclinesAnUnrequestedOfferOnItsMirror() throws {
         let (session, peer) = try encryptedLoopback()
         let id = bytes("00112233445546778999aabbccddeeff")

@@ -605,7 +605,9 @@ final class Session {
     /// RequestEncryption -> EnableEncryption -> EndLinkSetup -> optional trust.
     /// `trust: false` is the provisioning link: the glasses accept it even before
     /// they know our key, which is what makes an Android-free first pairing possible.
-    func handshake(timeout: TimeInterval = 12, trust: Bool = true) throws {
+    static let missingPeerEncryptionRequest = "no RequestEncryption from the glasses"
+
+    func handshake(timeout: TimeInterval = 12, trust: Bool = true, quickStart: Bool = false) throws {
         let pub = owner.publicKeyXy
         let challenge = Data.random(16)
         let seed = Data.random(32)
@@ -637,14 +639,15 @@ final class Session {
             }
         }
 
-        // Fresh pairings: the glasses usually announce themselves first, and they ignore a
-        // request that lands while they are still switching out of pairing mode. Waiting a
-        // few seconds costs nothing; sending blind is what produced twelve seconds of
-        // silence in the field.
+        // Fresh pairings may ignore a request while they switch out of pairing mode.
+        // Already trusted Gen 2 (build 94, device log 25, 1728–1731) waited six seconds
+        // without an incoming frame, then answered the phone's active request immediately.
         var passive = 0
-        let passiveUntil = Date().addingTimeInterval(6)
-        while Date() < passiveUntil, peerRequest == nil {
-            guard let sdu = try? stream.nextFrame(timeout: 1.0) else { continue }
+        let passiveUntil = Date().addingTimeInterval(quickStart ? 0.75 : 6)
+        while peerRequest == nil, passiveUntil.timeIntervalSinceNow > 0 {
+            let sdu: Data
+            do { sdu = try stream.nextFrame(timeout: min(1, passiveUntil.timeIntervalSinceNow)) }
+            catch LinkError.unexpected(_) { continue }
             guard let m = try? DataX.parse(sdu) else { continue }
             emit("passive inbound ch=0x\(String(m.channel, radix: 16)) type=\(m.type.map(String.init) ?? "-")",
                  sdu, inbound: true)
@@ -670,12 +673,14 @@ final class Session {
         while Date() < deadline {
             let done = peerRequest != nil && (peerEnable != nil || Date() > enableWindow)
             if done { break }
-            guard let sdu = try? stream.nextFrame(timeout: 2.0) else { continue }
+            let sdu: Data
+            do { sdu = try stream.nextFrame(timeout: min(2, deadline.timeIntervalSinceNow)) }
+            catch LinkError.unexpected(_) { continue }
             guard let m = try? DataX.parse(sdu) else { continue }
             try absorb(m)
         }
         guard let req = peerRequest else {
-            throw LinkError.unexpected("no RequestEncryption from the glasses")
+            throw LinkError.unexpected(Self.missingPeerEncryptionRequest)
         }
         let en = peerEnable
         emit("peer version=\(req.version) quirks req=\(req.quirks) enable=\(en == nil ? "absent" : "\(en!.quirks)")")
@@ -694,8 +699,10 @@ final class Session {
         if peerEnable == nil {
             let until = Date().addingTimeInterval(3)
             while Date() < until, peerEnable == nil {
-                guard let sdu = try? stream.nextFrame(timeout: 1.0),
-                      let m = try? DataX.parse(sdu) else { continue }
+                let sdu: Data
+                do { sdu = try stream.nextFrame(timeout: min(1, until.timeIntervalSinceNow)) }
+                catch LinkError.unexpected(_) { continue }
+                guard let m = try? DataX.parse(sdu) else { continue }
                 try? absorb(m)
             }
             emit("post-enable read: peer enable=\(peerEnable == nil ? "absent" : "present")")
