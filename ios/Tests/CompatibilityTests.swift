@@ -101,9 +101,57 @@ final class CompatibilityTests: XCTestCase {
         return DataX.message(channel, tags: tags, payload: payload)
     }
 
-    func testCatalogDeclinesAnUnrequestedOfferOnItsMirror() throws {
-        let (client, peer) = SDUStream.loopbackPair()
+    private struct EncryptedPeer {
+        let stream: SDUStream
+        let send: Direction
+        let recv: Direction
+
+        func write(_ frame: Data) throws { try stream.write(send.seal(frame)) }
+        func nextFrame(timeout: TimeInterval) throws -> Data { try recv.open(stream.nextFrame(timeout: timeout)) }
+    }
+
+    private func encryptedLoopback() throws -> (Session, EncryptedPeer) {
+        let (client, stream) = SDUStream.loopbackPair()
         let session = Session(stream: client, owner: OwnerMaterial(scalar: Data(repeating: 1, count: 32)))
+        let owner = OwnerMaterial(scalar: Data(repeating: 2, count: 32))
+        let challenge = Data(repeating: 3, count: 16)
+        let seed = Data(repeating: 4, count: 32)
+        let iv = Data(repeating: 5, count: 16)
+        let base: UInt32 = 9
+
+        // Preload the peer's plaintext offers so setup does not wait for the passive window.
+        try stream.write(AirShield.requestEncryption(pubkey: owner.publicKeyXy, challenge: challenge))
+        try stream.write(AirShield.enableEncryption(pubkey: owner.publicKeyXy, seed: seed, iv: iv, baseSeq: base))
+        let ready = expectation(description: "The encrypted setup link opened")
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { ready.fulfill() }
+            do { try session.handshake(timeout: 4, trust: false) }
+            catch { XCTFail("Encrypted test setup failed: \(error)") }
+        }
+        defer { wait(for: [ready], timeout: 5) }
+
+        let request = try PB.parse(DataX.parse(stream.nextFrame(timeout: 4)).payload)
+        let enable = try PB.parse(DataX.parse(stream.nextFrame(timeout: 4)).payload)
+        let phonePublicKey = try XCTUnwrap(request[1]?.first as? Data)
+        let phoneChallenge = try XCTUnwrap(request[2]?.first as? Data)
+        let phoneSeed = try XCTUnwrap(enable[2]?.first as? Data)
+        let phoneIV = try XCTUnwrap(enable[3]?.first as? Data)
+        let phoneBase = try XCTUnwrap(UInt32(exactly: (enable[4]?.first as? Int) ?? -1))
+        let shared = try owner.sharedSecret(peerPubkeyXy: phonePublicKey)
+        let keys = try AirShield.sessionKeys(shared: shared, ownChallenge: challenge, ownSeed: seed,
+                                             peerChallenge: phoneChallenge, peerSeed: phoneSeed,
+                                             ownIV: iv, peerIV: phoneIV, peerBaseSeq: phoneBase,
+                                             quirks: .none, multikey: true)
+        keys.send.seq = base
+        let peer = EncryptedPeer(stream: stream, send: keys.send, recv: keys.recv)
+        let endSetup = try DataX.parse(peer.nextFrame(timeout: 4))
+        XCTAssertTrue(Session.isEndLinkSetupRequest(endSetup))
+        try peer.write(AirShield.endLinkStatus)
+        return (session, peer)
+    }
+
+    func testCatalogDeclinesAnUnrequestedOfferOnItsMirror() throws {
+        let (session, peer) = try encryptedLoopback()
         let id = bytes("00112233445546778999aabbccddeeff")
         try peer.write(mediaOffer(channel: 0x8006, id: id, size: 256))
         try peer.write(DataX.message(0x0002, tags: [DataX.tag(2, Session.capEnd, last: true)]))
@@ -118,8 +166,7 @@ final class CompatibilityTests: XCTestCase {
     }
 
     func testMediaImportAcceptsSelectedOfferBeforeTheAssetAcknowledgement() throws {
-        let (client, peer) = SDUStream.loopbackPair()
-        let session = Session(stream: client, owner: OwnerMaterial(scalar: Data(repeating: 1, count: 32)))
+        let (session, peer) = try encryptedLoopback()
         let id = bytes("00112233445546778999aabbccddeeff")
         let content = Data("example".utf8)
         let offerChannel: UInt16 = 0x8008
@@ -150,8 +197,7 @@ final class CompatibilityTests: XCTestCase {
     }
 
     func testShutterConfirmationUsesCameraEventsOnSubscriptionMirror() throws {
-        let (client, peer) = SDUStream.loopbackPair()
-        let session = Session(stream: client, owner: OwnerMaterial(scalar: Data(repeating: 1, count: 32)))
+        let (session, peer) = try encryptedLoopback()
         let mirror = Session.chLocalFirst ^ 0x8000
         let snapshot = PB.bytes(1, PB.uint(3, 60)) + PB.bytes(21, PB.uint(1, 1024))
         try peer.write(DataX.message(mirror, tags: [DataX.tag(2, 2005, last: true)], payload: snapshot))
@@ -171,8 +217,7 @@ final class CompatibilityTests: XCTestCase {
     }
 
     func testSettingsReadMatchesRequestAndFinishesTheSyncOnEitherChannel() throws {
-        let (client, peer) = SDUStream.loopbackPair()
-        let session = Session(stream: client, owner: OwnerMaterial(scalar: Data(repeating: 1, count: 32)))
+        let (session, peer) = try encryptedLoopback()
         let settingsPeer: UInt16 = 0x8009
         let key = "example_setting"
         let value = "true"
@@ -208,8 +253,8 @@ final class CompatibilityTests: XCTestCase {
             }
         }
 
-        let values = try session.driveObjects(types: [Drive.kv], timeout: 2)
-        wait(for: [answered], timeout: 2)
+        defer { wait(for: [answered], timeout: 3) }
+        let values = try session.driveObjects(types: [Drive.kv], timeout: 3)
         XCTAssertEqual(values.count, 1)
         XCTAssertEqual(values.first?.uri, key)
         XCTAssertEqual(values.first?.data, value)
