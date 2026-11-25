@@ -75,9 +75,23 @@ struct ModelSheet: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .accessibilityLabel("服务地址")
-                    SecureField("API Key", text: $key)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                }
+
+                Section {
+                    LabeledContent("API Key", value: key.isEmpty ? "未添加" : "已添加")
+                    HStack {
+                        PasteButton(payloadType: String.self) { values in
+                            updateKey(from: values.first)
+                        }
+                        .accessibilityLabel("粘贴 API Key")
+                        if !key.isEmpty {
+                            Spacer()
+                            Button("清除", role: .destructive) { key = "" }
+                                .buttonStyle(.borderless)
+                        }
+                    }
+                } footer: {
+                    Text("复制服务提供商的 API Key 后点粘贴。本地无密钥服务可以留空。")
                 }
 
                 Section("模型") {
@@ -139,6 +153,16 @@ struct ModelSheet: View {
     }
 
     private var client: ModelClient { ModelClient(baseURL: baseURL, model: model, apiKey: key) }
+
+    private func updateKey(from value: String?) {
+        let token = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !token.isEmpty, !token.unicodeScalars.contains(where: CharacterSet.whitespacesAndNewlines.contains) else {
+            responseOK = false
+            response = "请只复制 API Key 本身。"
+            return
+        }
+        key = token
+    }
 
     private var modelPicker: some View {
         NavigationStack {

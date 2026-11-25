@@ -358,12 +358,16 @@ private final class MicrophoneCheck: ObservableObject {
         player?.stop()
         player = nil
         if let previousSettings {
-            if activatedAudio { try? audio.setActive(false, options: .notifyOthersOnDeactivation) }
-            try? audio.setCategory(previousSettings.category, mode: previousSettings.mode, options: previousSettings.options)
-            if let id = previousSettings.preferredInputID,
-               let input = audio.availableInputs?.first(where: { $0.uid == id }) {
-                try? audio.setPreferredInput(input)
+            if activatedAudio {
+                if audio.category == .playAndRecord {
+                    let preferred = previousSettings.preferredInputID.flatMap { id in
+                        audio.availableInputs?.first { $0.uid == id }
+                    }
+                    try? audio.setPreferredInput(preferred)
+                }
+                try? audio.setActive(false, options: .notifyOthersOnDeactivation)
             }
+            try? audio.setCategory(previousSettings.category, mode: previousSettings.mode, options: previousSettings.options)
         }
         activatedAudio = false
         previousSettings = nil
