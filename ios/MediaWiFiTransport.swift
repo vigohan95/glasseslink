@@ -101,7 +101,7 @@ final class MediaWiFiTransport: SessionTransport, @unchecked Sendable {
         return try await open(endpoint, ownedSSID: nil, timeout: connectTimeout)
     }
 
-    private static func open(_ endpoint: NWEndpoint, ownedSSID: String?,
+    private static func open(_ endpoint: Network.NWEndpoint, ownedSSID: String?,
                              timeout: TimeInterval) async throws -> MediaWiFiTransport {
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         var retries = 0
@@ -135,8 +135,8 @@ final class MediaWiFiTransport: SessionTransport, @unchecked Sendable {
         }
     }
 
-    private static func localEndpoint(host: String, port: UInt16) throws -> NWEndpoint {
-        guard port != 0, let endpointPort = NWEndpoint.Port(String(port)) else {
+    private static func localEndpoint(host: String, port: UInt16) throws -> Network.NWEndpoint {
+        guard port != 0, let endpointPort = Network.NWEndpoint.Port(rawValue: port) else {
             throw MediaWiFiError.invalidEndpoint
         }
         if let address = IPv4Address(host) {
@@ -155,7 +155,7 @@ final class MediaWiFiTransport: SessionTransport, @unchecked Sendable {
         throw MediaWiFiError.invalidEndpoint
     }
 
-    private init(endpoint: NWEndpoint) {
+    private init(endpoint: Network.NWEndpoint) {
         let options = NWProtocolTCP.Options()
         options.noDelay = true
         let parameters = NWParameters(tls: nil, tcp: options)

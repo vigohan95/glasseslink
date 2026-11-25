@@ -1,3 +1,4 @@
+import Compression
 import Foundation
 
 /// The authenticated text assistant session on service 15.
@@ -37,6 +38,7 @@ final class Assistant {
         static let interactionClosed = 59
         static let voiceComplete = 60
         static let startOfUserSpeech = 71
+        static let sessionModeUpdateResponse = 289
         static let sessionStateBroadcast = 333
         static let sessionStateUpdate = 339
         static let onPhoneUnderstanding = 342
@@ -65,7 +67,7 @@ final class Assistant {
         case stream = "assistant-s0"
     }
 
-    private struct Turn {
+    struct Turn {
         let wakeID: String
         var relatedWakeID: String?
         var requestID: String?
@@ -73,12 +75,24 @@ final class Assistant {
         var supportsSpeech: Bool?
         var replying = false
         var microphone: MicrophoneStream?
+        var confirmedSpeechStart = false
         var deadline = ProcessInfo.processInfo.systemUptime + 30
         var keepaliveSequence = 0
         var nextKeepalive = TimeInterval.infinity
 
         func includes(_ id: String) -> Bool {
             wakeID == id || relatedWakeID == id || requestID == id
+        }
+
+        mutating func claimSpeechStart(_ fields: [Int: Any]) -> String? {
+            // Mode 2 is Live AI. Its audio belongs to a separate flow.
+            guard !confirmedSpeechStart, requestID == nil, supportsSpeech != false,
+                  deadline > ProcessInfo.processInfo.systemUptime,
+                  let mode = fields.int(2), mode >= 0, mode != 2 else { return nil }
+            let interaction = fields.text(1)
+            guard !interaction.isEmpty, includes(interaction) else { return nil }
+            confirmedSpeechStart = true
+            return interaction
         }
     }
 
@@ -404,16 +418,24 @@ final class Assistant {
     }
 
     private func handleEvent(_ payload: Data) throws {
-        guard let fields = try? ThriftCompact.loads(payload), let id = fields.int(1),
-              let body = fields.bytes(2) else { return }
-        guard let inner = try? ThriftCompact.loads(body) else { return }
+        guard payload.count <= Self.maxMessageBytes,
+              let fields = try? ThriftCompact.loads(payload), let id = fields.int(1) else { return }
+        guard let body = Self.netEventBody(fields), let inner = try? ThriftCompact.loads(body) else {
+            if id == EV.fulfillmentRequest || id == EV.sessionModeUpdateResponse {
+                log("assistant: could not decode event \(id) body (compressed=\(fields.bool(3)))")
+            }
+            return
+        }
         switch id {
         case EV.fulfillmentRequest:
             guard let request = Self.spokenRequest(inner) else {
+                log("assistant: glasses fulfillment event did not contain a supported question")
                 closeTurn(inner.text(1))
                 return
             }
             acceptTranscript(request.transcript, interaction: request.interaction, simplified: request.simplified)
+        case EV.sessionModeUpdateResponse:
+            try acknowledgeSpeechStart(inner)
         case EV.interactionClosed, EV.remoteInteractionComplete:
             closeTurn(inner.text(1))
         case EV.sessionStateUpdate:
@@ -427,6 +449,61 @@ final class Assistant {
         default:
             break
         }
+    }
+
+    static func netEventBody(_ fields: [Int: Any]) -> Data? {
+        guard let body = fields.bytes(2), body.count <= maxMessageBytes else { return nil }
+        if !fields.bool(3) { return body }
+        // The sender uses an RFC 1950 zlib stream. Apple's Compression decoder takes raw DEFLATE.
+        guard body.count > 6 else { return nil }
+        let header = Int(body[body.startIndex])
+        let flags = Int(body[body.startIndex + 1])
+        guard header & 15 == 8, header >> 4 <= 7, (header * 256 + flags) % 31 == 0,
+              flags & 32 == 0 else { return nil }
+        let compressed = body.dropFirst(2).dropLast(4)
+        let expectedChecksum = body.suffix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        let stream = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
+        defer { stream.deallocate() }
+        guard compression_stream_init(stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else {
+            return nil
+        }
+        defer { compression_stream_destroy(stream) }
+        var decoded = Data(count: maxMessageBytes + 1)
+        let count: Int? = compressed.withUnsafeBytes { (input: UnsafeRawBufferPointer) in
+            decoded.withUnsafeMutableBytes { (output: UnsafeMutableRawBufferPointer) in
+                guard let source = input.bindMemory(to: UInt8.self).baseAddress,
+                      let destination = output.bindMemory(to: UInt8.self).baseAddress else { return nil }
+                stream.pointee.src_ptr = source
+                stream.pointee.src_size = input.count
+                stream.pointee.dst_ptr = destination
+                stream.pointee.dst_size = output.count
+                while true {
+                    let beforeInput = stream.pointee.src_size
+                    let beforeOutput = stream.pointee.dst_size
+                    let result = compression_stream_process(stream, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
+                    if result == COMPRESSION_STATUS_END, stream.pointee.src_size == 0 {
+                        return output.count - stream.pointee.dst_size
+                    }
+                    guard result == COMPRESSION_STATUS_OK, stream.pointee.dst_size > 0,
+                          beforeInput != stream.pointee.src_size || beforeOutput != stream.pointee.dst_size else { return nil }
+                }
+            }
+        }
+        guard let count, count <= maxMessageBytes else { return nil }
+        decoded.removeSubrange(count..<decoded.count)
+        return Session.adler32(decoded) == expectedChecksum ? decoded : nil
+    }
+
+    private func acknowledgeSpeechStart(_ fields: [Int: Any]) throws {
+        stateLock.lock()
+        let interaction = stopped ? nil : turn?.claimSpeechStart(fields)
+        stateLock.unlock()
+        guard let interaction else {
+            log("assistant: session mode response did not match a pending plain turn")
+            return
+        }
+        try send(EV.startOfUserSpeech, ThriftWriter().string(1, interaction).done())
+        log("assistant: confirmed speech start for a matching glasses turn")
     }
 
     static func spokenRequest(_ fields: [Int: Any]) -> (interaction: String, transcript: String, simplified: Bool)? {

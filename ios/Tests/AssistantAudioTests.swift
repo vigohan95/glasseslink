@@ -3,6 +3,37 @@ import XCTest
 @testable import GlassesLink
 
 final class AssistantAudioTests: XCTestCase {
+    func testNetEventSupportsPlainAndZlibWrappedBodies() throws {
+        let body = ThriftWriter().string(1, "test-wake-1").i32(2, 1).done()
+        // Independent zlib fixture for the compact-Thrift body above.
+        let compressed = Data([
+            0x78, 0x9C, 0x93, 0xE0, 0x2E, 0x49, 0x2D, 0x2E, 0xD1, 0x2D, 0x4F, 0xCC,
+            0x4E, 0xD5, 0x35, 0x14, 0x65, 0x62, 0x00, 0x00, 0x28, 0x3A, 0x04, 0x2E,
+        ])
+        let plainFields = try ThriftCompact.loads(ThriftWriter().i32(1, 289).binary(2, body).bool(3, false).done())
+        let compressedFields = try ThriftCompact.loads(ThriftWriter().i32(1, 289).binary(2, compressed).bool(3, true).done())
+
+        XCTAssertEqual(Assistant.netEventBody(plainFields), body)
+        XCTAssertEqual(Assistant.netEventBody(compressedFields), body)
+
+        var invalidChecksum = compressed
+        invalidChecksum[invalidChecksum.count - 1] = 0
+        XCTAssertNil(Assistant.netEventBody([2: invalidChecksum, 3: true]))
+        XCTAssertNil(Assistant.netEventBody([2: compressed.dropLast(), 3: true]))
+    }
+
+    func testSpeechStartRequiresMatchingPlainTurnAndIsClaimedOnce() {
+        var turn = Assistant.Turn(wakeID: "active-wake", relatedWakeID: "active-mic")
+        XCTAssertNil(turn.claimSpeechStart([1: "other-wake", 2: 1]))
+        XCTAssertNil(turn.claimSpeechStart([1: "active-wake", 2: 2]))
+        XCTAssertNil(turn.claimSpeechStart([1: "active-wake"]))
+        XCTAssertEqual(turn.claimSpeechStart([1: "active-mic", 2: 1]), "active-mic")
+        XCTAssertNil(turn.claimSpeechStart([1: "active-mic", 2: 1]))
+
+        var unsupported = Assistant.Turn(wakeID: "active-wake", supportsSpeech: false)
+        XCTAssertNil(unsupported.claimSpeechStart([1: "active-wake", 2: 1]))
+    }
+
     func testUntaggedMessagesInheritOnlyFromTheSameWireChannel() throws {
         let messages: UInt16 = 5
         let microphone: UInt16 = 6

@@ -781,7 +781,7 @@ struct ShootTab: View {
             ScrollView {
                 VStack(spacing: 14) {
                     cameraStage
-                    if !g.canUseGlasses {
+                    if !g.canUseGlasses && !g.mediaImportInProgress {
                         Button(g.connected ? "验证主人身份" : "连接眼镜") { openDevice() }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.large)
@@ -802,7 +802,7 @@ struct ShootTab: View {
             }
             .background(GlassesTheme.page.ignoresSafeArea())
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                if g.canUseGlasses {
+                if g.canUseGlasses || g.mediaImportInProgress {
                     shutterControls
                         .padding(.horizontal, 18)
                         .padding(.vertical, 8)
@@ -1061,6 +1061,13 @@ struct AssistantTab: View {
             }
             if let message = g.assistantMessage {
                 Text(message).font(.subheadline).foregroundStyle(.secondary)
+            }
+            if g.assistantTranscriptMissing {
+                Button("打开键盘听写") { typing = true }
+                    .buttonStyle(.bordered)
+                Text("点键盘上的麦克风，说完后确认文字，再发送。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

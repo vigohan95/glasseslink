@@ -567,7 +567,7 @@ final class Session {
             let bulk = msg.channel == bulkChannel && msg.error == nil
                 && (msg.type == nil || msg.type == Int(Self.airData))
             if !bulk {
-                let atc = serviceChannels["media-wifi-atc"]
+                let atc = serviceChannels[MediaWiFiProtocol.channelName]
                 let sensitive = msg.service == Int(Assistant.service) || msg.service == 10
                     || atc.map { msg.channel == $0 || msg.channel == ($0 ^ 0x8000) } == true
                 emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
@@ -890,7 +890,7 @@ final class Session {
         }
         tags.append(DataX.tag(2, type, last: true))
         try sendAny(DataX.message(ch, tags: tags, payload: payload),
-                    tracePayload: tracePayload && service != Int(Assistant.service) && service != 10)
+                    tracePayload: tracePayload && service != Int(Assistant.service) && service != MediaWiFiProtocol.service)
     }
 
     private var servicesNamed: Set<UInt16> = []
