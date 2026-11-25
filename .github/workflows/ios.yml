@@ -1,9 +1,20 @@
 name: ios
 
+# Private repos are billed: free plan = 2000 minutes/month, and macOS is charged at a 10x
+# multiplier, i.e. ~200 real macOS minutes. A full run with the simulator suite costs ~12 min,
+# a build-only run costs ~2 min. So: every push builds (fast, cheap), the simulator suite runs
+# on demand and once a week. Flip `full_tests` to true when you need the whole thing.
 on:
   push:
     paths: ["ios/**", ".github/workflows/ios.yml"]
   workflow_dispatch:
+    inputs:
+      full_tests:
+        description: "Run the simulator test suite (costs ~10 extra macOS minutes)"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 18 * * 0"
 
 jobs:
   build:
@@ -20,7 +31,8 @@ jobs:
       - name: Generate project
         run: cd ios && xcodegen generate
 
-      - name: Unit tests (protocol golden vectors)
+      - name: Unit tests (golden vectors)
+        if: github.event_name == 'schedule' || inputs.full_tests == true
         run: |
           cd ios
           DEVICE=$(xcrun simctl list devices available | grep -Eo 'iPhone [0-9]+( Pro)?' | head -1)
@@ -57,5 +69,3 @@ jobs:
           name: GlassesLink-ipa
           path: out/GlassesLink.ipa
           retention-days: 14
-
-
