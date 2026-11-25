@@ -327,7 +327,7 @@ enum AirShield {
     static let endLinkStatus = Data([0x80, 0x04, 0x00, 0x01, 0x03, 0x00, 0x10, 0x00])
 
     /// svc36 type 4096: {1: SHA-256(owner pubkey x||y), 2: r||s, 3: capabilities 2}
-    static func trustMessage(ownerPubkey: Data, signatureRaw: Data) throws -> Data {
+    static func trustMessage(channel: UInt16, ownerPubkey: Data, signatureRaw: Data) throws -> Data {
         guard signatureRaw.count == 64 else {
             throw LinkError.unexpected("trustMessage: signature=\(signatureRaw.count)B (DER leaking through?)")
         }
@@ -336,7 +336,7 @@ enum AirShield {
         }
         let digest = Data(SHA256.hash(data: ownerPubkey))
         let body = PB.bytes(1, digest) + PB.bytes(2, signatureRaw) + PB.uint(3, 2)
-        return DataX.message(DataX.chSetupMirror,
+        return DataX.message(channel,
                              tags: [DataX.tag(1, UInt16(svcIdentity), last: false),
                                     DataX.tag(2, idEnableTrust, last: true)],
                              payload: body)

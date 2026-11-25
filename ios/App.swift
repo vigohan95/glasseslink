@@ -88,16 +88,14 @@ final class Glasses: NSObject, ObservableObject {
     /// Which row is currently being connected, so the list can show a spinner instead of a button.
     @Published var connectingID: UUID?
     @Published var scanning = false
+    @Published private(set) var discoveryMessage: String?
 
-    /// The glasses first, then anything with a real name. Unnamed noise goes behind a disclosure —
-    /// a busy room otherwise fills the screen with a dozen UUIDs.
     var primaryDevices: [ScanEntry] {
-        devices.filter { $0.isGlasses || !$0.displayName.hasPrefix("未命名设备") }
-    }
-    var otherDevices: [ScanEntry] {
-        devices.filter { !($0.isGlasses || !$0.displayName.hasPrefix("未命名设备")) }
+        devices.filter(\.isVisibleCandidate)
     }
     private var scanTimer: Timer?
+    private var ignoredAdvertisers: Set<UUID> = []
+    private var sawGlassesAdvertisement = false
     private var scanRound = 0
     private let scanRounds = 6
     @Published var connected = false
@@ -146,13 +144,14 @@ final class Glasses: NSObject, ObservableObject {
     private var session: Session?
     private var owner: OwnerMaterial?
     private(set) var ownerRegistrationCompleted = false
+    @Published private(set) var registrationMessage: String?
 
     /// Ray-Ban Meta Gen 2 exposes its link on L2CAP PSM 0x80.
     let psm: CBL2CAPPSM = 0x80
 
     /// Meta's BLE service. Asking the system for this service is the most reliable way to have
     /// iOS report a peripheral that only advertises service UUIDs (no local name).
-    static let metaService = "0000FD5F-0000-1000-8000-00805F9B34FB"
+    nonisolated static let metaService = "0000FD5F-0000-1000-8000-00805F9B34FB"
     /// Meta's Bluetooth SIG company identifier, little-endian in the advertisement payload.
     static let metaVendorID: UInt16 = 0x01AB
 
@@ -231,11 +230,38 @@ final class Glasses: NSObject, ObservableObject {
     /// Scanning in rounds instead of once: getting the glasses into pairing mode and starting
     /// the scan are never in sync, and the glasses only announce themselves for a moment.
     func startScan() {
-        guard central.state == .poweredOn else { note("蓝牙不可用：\(central.state.rawValue)"); return }
+        guard central.state == .poweredOn else {
+            discoveryMessage = bluetoothUnavailableMessage
+            return
+        }
+        stopScan()
         devices.removeAll()
+        loadSystemPaired()
+        discoveryMessage = nil
+        ignoredAdvertisers.removeAll()
+        sawGlassesAdvertisement = false
         scanRound = 0
         scanning = true
         beginScanRound()
+    }
+
+    func stopScan() {
+        scanTimer?.invalidate()
+        scanTimer = nil
+        if central.state == .poweredOn { central.stopScan() }
+        if scanning, !ignoredAdvertisers.isEmpty {
+            note("附近还有 \(ignoredAdvertisers.count) 个未列出的蓝牙信号")
+        }
+        scanning = false
+    }
+
+    private var bluetoothUnavailableMessage: String {
+        switch central.state {
+        case .poweredOff: return "请在系统设置中打开蓝牙。"
+        case .unauthorized: return "请允许 GlassesLink 使用蓝牙。"
+        case .unsupported: return "这台设备不支持所需的蓝牙功能。"
+        default: return "蓝牙暂不可用，请稍后再试。"
+        }
     }
 
     private func beginScanRound() {
@@ -251,24 +277,18 @@ final class Glasses: NSObject, ObservableObject {
         central.scanForPeripherals(withServices: services,
                                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         scanTimer?.invalidate()
-        scanTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: false) { _ in
+        scanTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: false) { timer in
             Task { @MainActor in
+                guard self.scanTimer === timer else { return }
                 self.central.stopScan()
-                if self.devices.contains(where: { $0.isGlasses }) {
-                    self.scanning = false
-                    self.note("看到眼镜了，点列表最上面那条")
-                    return
-                }
-                if self.scanRound < self.scanRounds {
+                if !self.sawGlassesAdvertisement, self.scanRound < self.scanRounds {
                     self.beginScanRound()
                     return
                 }
-                self.scanning = false
-                if self.devices.isEmpty {
-                    self.note("六轮都没扫到任何设备：确认蓝牙是开的、GlassesLink 有蓝牙权限")
-                } else {
-                    let unnamed = self.devices.filter { $0.name == "?" }.count
-                    self.note("扫到 \(self.devices.count) 台设备（其中 \(unnamed) 台没报名字、按厂商号通常是眼镜的）但没有命中眼镜名。两个原因：① 安卓还连着它（关掉安卓蓝牙）② 眼镜没进配对模式（折叠 → 长按拍摄键 5 秒 → 指示灯闪蓝）")
+                self.stopScan()
+                if self.primaryDevices.isEmpty {
+                    self.discoveryMessage = "没找到可连接的眼镜。看到眼镜指示灯闪蓝后，再扫描一次。"
+                    self.note("扫描结束，未发现兼容的眼镜")
                 }
             }
         }
@@ -283,27 +303,28 @@ final class Glasses: NSObject, ObservableObject {
         let connected = central.retrieveConnectedPeripherals(withServices: [service])
         var added = 0
         for p in connected {
-            let entry = ScanEntry(id: p.identifier, name: p.name ?? "Meta 眼镜（已连接）",
-                                  rssi: 0, isGlasses: true)
+            let entry = ScanEntry(id: p.identifier, name: p.name ?? "", rssi: 0,
+                                  isGlasses: true, source: .systemConnected)
             if let i = devices.firstIndex(where: { $0.id == p.identifier }) { devices[i] = entry }
             else { devices.insert(entry, at: 0); added += 1 }
         }
         for saved in [UserDefaults.standard.string(forKey: "lastPeripheral")].compactMap({ $0 }) {
-            guard let id = UUID(uuidString: saved),
+            guard let id = UUID(uuidString: saved), !connected.contains(where: { $0.identifier == id }),
                   let p = central.retrievePeripherals(withIdentifiers: [id]).first else { continue }
-            let entry = ScanEntry(id: p.identifier, name: p.name ?? "上次连过的设备",
-                                  rssi: 0, isGlasses: p.name?.lowercased().contains("meta") ?? false)
+            let name = p.name ?? ""
+            let entry = ScanEntry(id: p.identifier, name: name, rssi: 0,
+                                  isGlasses: Self.matchesGlassesName(name), source: .previouslySelected)
             if let i = devices.firstIndex(where: { $0.id == p.identifier }) { devices[i] = entry }
             else { devices.insert(entry, at: 0); added += 1 }
         }
-        note("系统里已配对/已连接 \(connected.count) 台 Meta 服务设备，新加 \(added) 条")
-        if connected.isEmpty {
-            note("系统里没有已配对的眼镜：这副眼镜从没和这台 iPhone 配过（它现在的主人是那台安卓），所以必须靠它自己广播 + 进配对模式才能被发现")
-        }
+        note("找到 \(connected.count) 副系统已连接的眼镜，新增 \(added) 条记录")
     }
 
     func connect(_ id: UUID, forRegistration: Bool = false) {
-        guard central.state == .poweredOn else { note("蓝牙不可用：\(central.state.rawValue)"); return }
+        guard central.state == .poweredOn else {
+            discoveryMessage = bluetoothUnavailableMessage
+            return
+        }
         if channel != nil {
             note("链路已经打开了，不用再点；要重来先「断开」")
             return
@@ -330,8 +351,9 @@ final class Glasses: NSObject, ObservableObject {
             startScan()
             return
         }
-        central.stopScan()
+        stopScan()
         connectingForRegistration = forRegistration
+        discoveryMessage = nil
         peripheral = p
         p.delegate = self
         UserDefaults.standard.set(id.uuidString, forKey: "lastPeripheral")
@@ -384,7 +406,6 @@ final class Glasses: NSObject, ObservableObject {
         }
         let own = owner ?? OwnerMaterial.generate()
         let sess = Session(stream: s, owner: own, log: { [weak self] in self?.note($0) })
-        sess.forcedQuirks = Glasses.pendingQuirks
         sess.blockOTA = Glasses.blockOTA
         session = sess
         // A crash inside handshake() would otherwise be repeated by auto-reconnect on every
@@ -403,6 +424,7 @@ final class Glasses: NSObject, ObservableObject {
             }.value
             guard session === sess else { return }
             connected = true
+            connectingID = nil
             phase = .connected
             if trust {
                 UserDefaults.standard.set(true, forKey: "isOwner")
@@ -414,7 +436,6 @@ final class Glasses: NSObject, ObservableObject {
             }
             glassesLine = "已连上 · serial \(sess.peerSerial)"
             note("✅ 握手完成（quirks=\(sess.quirks)）")
-            UserDefaults.standard.set(Int(sess.quirks.rawValue), forKey: "quirkMode")
             UserDefaults.standard.set(trust ? "verified" : "unverified", forKey: "ownerState")
             UserDefaults.standard.set(Self.ts(), forKey: "ownerStateAt")
         } catch {
@@ -432,13 +453,7 @@ final class Glasses: NSObject, ObservableObject {
             // "链路已经打开了" and the user is stuck until the app is killed.
             clearLink()
             if let p = peripheral { central.cancelPeripheralConnection(p) }
-            // The glasses never say which AirShield variant they want, and the wrong one
-            // makes them drop our sealed frames (or answer with a MAC we cannot verify).
-            // So each failed attempt flips the variant: tap again and we try the other one.
-            let used = UserDefaults.standard.object(forKey: "quirkMode") as? Int ?? -1
-            let next = (used == 1) ? 0 : 1
-            UserDefaults.standard.set(next, forKey: "quirkMode")
-            note("已释放这条链路。下次点击会用 \(next == 1 ? "QCS7" : "普通") 兼容模式重试（这次是 \(used < 0 ? "自动" : used == 1 ? "QCS7" : "普通")）")
+            note("已释放连接，可以重试")
         }
     }
 
@@ -466,13 +481,11 @@ final class Glasses: NSObject, ObservableObject {
         return "\(error)"
     }
 
-    func connectSetup() { reconnect(forRegistration: true) }
-
-    /// `nil` follows whatever the glasses advertise; 0/1 force one AirShield variant.
-    static var pendingQuirks: UInt64? {
-        let v = UserDefaults.standard.object(forKey: "quirkMode") as? Int ?? -1
-        return v < 0 ? nil : UInt64(v)
+    func connectSetup() {
+        registrationMessage = nil
+        reconnect(forRegistration: true)
     }
+
 
     /// Refuse every svc29 (firmware update) request. Default on: the phone is the only
     /// thing that can feed an update, so saying no is the real "do not update" switch.
@@ -969,24 +982,34 @@ final class Glasses: NSObject, ObservableObject {
 
     func becomeOwner(userToken: String) {
         guard canStartOwnerRegistration, let sess = session else {
-            note("注册需要已完成的设置连接，请重新连接眼镜再登录")
+            registrationMessage = "设置连接已断开，请重新连接眼镜后再登录。"
+            if let registrationMessage { note(registrationMessage) }
             return
         }
         let key = sess.owner
         busy = true
+        registrationMessage = "正在注册眼镜。需要确认时，App 会提示你按拍摄键。"
         Task {
             defer { busy = false }
             do {
                 let bundle = try await Provisioner.becomeOwner(session: sess, owner: key,
                                                                userToken: userToken,
-                                                               log: { [weak self] in self?.note($0) })
+                                                               log: { [weak self] line in
+                    self?.note(line)
+                    if line.contains("请按一下"), line.contains("拍摄键") {
+                        Task { @MainActor [weak self] in
+                            self?.registrationMessage = "请按一下眼镜上的拍摄键。"
+                        }
+                    }
+                })
                 owner = key
                 ownerRegistrationCompleted = session === sess
                 UserDefaults.standard.set(true, forKey: "isOwner")
                 ownerLine = "owner key: 已注册 · serial \(bundle.serial)"
-                note("✅ 这台 iPhone 现在是主人。断开重连一次走 trust 链路")
-                shareOwner()
+                registrationMessage = "注册已完成。请重新连接并验证主人身份。"
+                note("主人注册已完成，接下来重新连接验证")
             } catch {
+                registrationMessage = "注册失败。\(Glasses.explain(error))"
                 note("❌ 改 owner 失败：\(error)")
             }
         }
@@ -1044,6 +1067,10 @@ final class Glasses: NSObject, ObservableObject {
             try normalised.write(to: OwnerMaterial.defaultURL, options: .atomic)
             try parsed.0.saveToKeychain()
             owner = parsed.0
+            ownerState = .unverified
+            UserDefaults.standard.set(false, forKey: "isOwner")
+            UserDefaults.standard.set("unverified", forKey: "ownerState")
+            UserDefaults.standard.removeObject(forKey: "ownerStateAt")
             ownerLine = "owner key: 已导入 \(parsed.1.serial) · \(ownerFingerprint)"
             note("已从\(source)导入 \(parsed.1.serial) 的 owner key · \(ownerFingerprint)")
             trustLine = "未验证（钥匙已就位，连接一次看结果）"
@@ -1181,10 +1208,13 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
         Task { @MainActor in
             switch c.state {
             case .poweredOn:
+                discoveryMessage = nil
                 note("蓝牙就绪")
                 autoReconnect()
-            case .unauthorized: note("蓝牙权限被拒——检查 Info.plist")
-            case .poweredOff: note("蓝牙关闭")
+            case .unauthorized, .poweredOff, .unsupported:
+                stopScan()
+                discoveryMessage = bluetoothUnavailableMessage
+                note(bluetoothUnavailableMessage)
             default: note("central state \(c.state.rawValue)")
             }
         }
@@ -1202,40 +1232,48 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
 
+    private nonisolated static func matchesGlassesName(_ name: String) -> Bool {
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.hasPrefix("rb meta") || normalized.hasPrefix("ray-ban meta")
+            || normalized.hasPrefix("ray ban meta")
+    }
+
     nonisolated func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
                                     advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let localName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
-        let name = localName ?? p.name ?? "?"
+        let name = localName ?? p.name ?? ""
         let services = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
-        let mfr = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data
-        // Meta registers company id 0x01AB (little-endian on the wire). The glasses often
-        // advertise without a local name at all, so this is the only reliable marker.
-        let metaMfr = (mfr?.count ?? 0) >= 2
-            && (UInt16(mfr![0]) | (UInt16(mfr![1]) << 8)) == 0x01AB
-        let isGlasses = name.localizedCaseInsensitiveContains("meta")
-            || name.localizedCaseInsensitiveContains("rb ")
-            || metaMfr
-            || services.contains { $0.uuidString.lowercased().hasPrefix("fd5") }
-        let shown = (name == "?" && isGlasses) ? "Meta 眼镜（无名广播）" : name
-        let entry = ScanEntry(id: p.identifier, name: shown, rssi: RSSI.intValue, isGlasses: isGlasses)
+        let serviceData = (advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data]) ?? [:]
+        let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data
+        let hasMetaManufacturer = manufacturerData?.prefix(2).elementsEqual([0xAB, 0x01]) ?? false
+        let hasMetaService = (services + Array(serviceData.keys)).contains {
+            $0.uuidString == "FD5F" || $0.uuidString == Self.metaService
+        }
+        let isConnectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue != false
+        let isGlasses = isConnectable && (hasMetaService || hasMetaManufacturer || Self.matchesGlassesName(name))
+        let id = p.identifier
+        let rssi = RSSI.intValue
         Task { @MainActor in
-            if let i = self.devices.firstIndex(where: { $0.id == p.identifier }) {
-                self.devices[i] = entry
-            } else {
-                self.devices.append(entry)
-                // Noise control: a busy room has dozens of advertisers, and logging every
-                // one of them (each line = a timestamp + a UI update) is what made scanning
-                // feel like the app had hung. Log the glasses always, others only up to 8.
-                let tag = isGlasses ? " ← 像眼镜" : ""
-                if isGlasses || self.devices.count <= 8 {
-                    self.note("发现 \(shown) rssi=\(RSSI)\(tag)")
+            guard self.scanning else { return }
+            guard isGlasses else {
+                self.ignoredAdvertisers.insert(id)
+                return
+            }
+            self.sawGlassesAdvertisement = true
+            self.ignoredAdvertisers.remove(id)
+            if let index = self.devices.firstIndex(where: { $0.id == id }) {
+                let previous = self.devices[index]
+                let entry = ScanEntry(id: id, name: name.isEmpty ? previous.name : name,
+                                      rssi: rssi, isGlasses: true, source: previous.source)
+                if entry.name != previous.name || entry.isGlasses != previous.isGlasses
+                    || entry.signalLabel != previous.signalLabel {
+                    self.devices[index] = entry
                 }
+                return
             }
-            self.devices.sort { a, b in
-                if a.isGlasses != b.isGlasses { return a.isGlasses }
-                return a.rssi > b.rssi
-            }
-            if self.devices.count > 40 { self.devices.removeLast(self.devices.count - 40) }
+            let entry = ScanEntry(id: id, name: name, rssi: rssi, isGlasses: true)
+            self.devices.append(entry)
+            self.note("找到眼镜候选：\(entry.displayName)")
         }
     }
 
@@ -1309,7 +1347,6 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             }
             self.channel = ch
             self.connecting = false
-            self.connectingID = nil
             self.connectionAttempt = nil
             self.note("L2CAP up psm=0x\(String(ch.psm, radix: 16))")
             self.phase = .handshaking
@@ -1437,7 +1474,7 @@ struct ContentView: View {
                             }
                         }
                     }
-                    Text("眼镜排在前面（有眼镜图标）。列表里没有 `RB Meta` 时：①眼镜折叠后长按拍摄键 5 秒，等指示灯闪蓝 ②把那台安卓的蓝牙关掉，否则眼镜不会广播。")
+                    Text("这里只列出眼镜候选和已知设备。找不到眼镜时，等指示灯闪蓝后再扫描。")
                         .font(.caption).foregroundStyle(.secondary)
                     Button("重新握手（setup 链路，不验 owner）") { g.connectSetup() }
                     Toggle("详细日志（抓完整帧，排查用）", isOn: $verboseLog)

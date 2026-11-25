@@ -222,6 +222,17 @@ final class ProtocolTests: XCTestCase {
         }
     }
 
+    func testPeerTrustRepliesUseTheIncomingChannelMirror() throws {
+        for type in [AirShield.idEnableTrust, AirShield.idEnableTrustEC] {
+            let tags = [DataX.tag(1, UInt16(AirShield.svcIdentity), last: false),
+                        DataX.tag(2, type, last: true)]
+            let peer = try DataX.parse(DataX.message(0x8004, tags: tags))
+            XCTAssertEqual(Session.peerTrustReplyChannel(peer), 0x0004)
+            let mirror = try DataX.parse(DataX.message(0x0004, tags: tags))
+            XCTAssertNil(Session.peerTrustReplyChannel(mirror))
+        }
+    }
+
     // MARK: - camera shutter
 
     func testPhotoIntentStructure() throws {

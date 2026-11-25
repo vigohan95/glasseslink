@@ -32,10 +32,10 @@ struct RootView: View {
                 case .login:
                     LoginWebView(url: Meta.authorize(state: UUID().uuidString),
                                  onCode: { code in
-                                     g.route = nil
+                                     g.route = .becomeOwner
                                      g.becomeOwner(userToken: code)
                                  },
-                                 onCancel: { g.route = nil })
+                                 onCancel: { g.route = .becomeOwner })
                         .ignoresSafeArea()
                 }
             }
@@ -589,7 +589,7 @@ struct OwnerBadge: View {
     private var title: String {
         switch g.ownerState {
         case .unknown: return "还不知道（还没连过眼镜）"
-        case .unverified: return "未验证（当前用临时密钥）"
+        case .unverified: return "待验证主人身份"
         case .verified: return "已验证 · 这台 iPhone 是主人"
         case .rejected(let code): return "被拒绝 · 0x\(String(code, radix: 16).uppercased())"
         }
@@ -598,7 +598,7 @@ struct OwnerBadge: View {
     private var detail: String {
         switch g.ownerState {
         case .unknown: return "连一次眼镜就会拿到答案。"
-        case .unverified: return "导入过钥匙却仍显示未验证，说明连接时没有走 trust —— 点下面「重新验证」再看日志。"
+        case .unverified: return "\(g.trustLine)。导入或注册钥匙后，点「重新验证」。"
         case .verified: return "拍照、录像、取照片、改设置都已经解锁。"
         case .rejected(let code):
             return Glasses.explain(LinkError.trustRejected(code))
@@ -644,31 +644,72 @@ struct OwnerBadge: View {
     }
 }
 
-struct DeviceTabBody: View {    @ObservedObject var g: Glasses
+struct DeviceTabBody: View {
+    @ObservedObject var g: Glasses
     @State private var showSettings = false
     @State private var showQuick = false
     @State private var showDiagnostics = false
     @State private var showAbout = false
 
+    private var candidates: [ScanEntry] {
+        g.primaryDevices.sorted { $0.isListedBefore($1) }
+    }
+
+    private var connectionTitle: String {
+        if g.connected && g.ownerState == .unverified { return "已连接，待验证主人身份" }
+        if case .failed = g.phase { return "连接失败" }
+        return g.phaseText
+    }
+
     var body: some View {
+        let deviceCandidates = candidates
         List {
             Section {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(g.connected ? "已连接" : "未连接").font(.headline)
-                        Text(g.glassesLine).font(.caption).foregroundStyle(.secondary)
+                        Text(connectionTitle).font(.headline)
+                        if g.glassesLine != connectionTitle {
+                            Text(g.glassesLine).font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                     Spacer()
-                    if g.connected {
+                    if g.phaseBusy {
+                        Button("取消连接") { g.disconnect() }.buttonStyle(.bordered).controlSize(.small)
+                    } else if g.connected {
                         Button("断开") { g.disconnect() }.buttonStyle(.bordered).controlSize(.small)
+                    } else if g.scanning {
+                        Button("停止扫描") { g.stopScan() }.buttonStyle(.bordered).controlSize(.small)
                     } else {
-                        Button("扫描") { g.startScan() }.buttonStyle(.borderedProminent).controlSize(.small)
+                        Button("扫描眼镜") { g.startScan() }
+                            .buttonStyle(.borderedProminent).controlSize(.small)
                     }
+                }
+            }
+            if !g.connected {
+                Section {
+                    if let message = g.discoveryMessage {
+                        Text(message).font(.footnote).foregroundStyle(.secondary)
+                    } else if deviceCandidates.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label(g.scanning ? "正在扫描眼镜…" : "还没找到眼镜", systemImage: "eyeglasses")
+                                .font(.subheadline.weight(.semibold))
+                            Text("折叠两侧镜腿，按住拍摄键，直到镜框内侧的指示灯闪蓝。")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    ForEach(deviceCandidates) { device in
+                        candidateRow(device)
+                    }
+                } header: {
+                    Text("已知与附近设备")
+                } footer: {
+                    if g.scanning && !deviceCandidates.isEmpty { Text("仍在扫描附近的眼镜。") }
                 }
             }
             Section("主人身份") {
                 OwnerBadge(g: g)
-                Button("一次性设置（导入或注册钥匙）") { g.route = .ownerSetup }
+                Button("设置主人身份") { g.route = .ownerSetup }
             }
 
             Section {
@@ -686,61 +727,6 @@ struct DeviceTabBody: View {    @ObservedObject var g: Glasses
                 Text("眼镜要升级，必须是手机把固件文件喂给它。打开这个开关后，所有升级请求（svc29）都会被拒绝，眼镜就停在当前版本。云端那个设置是礼貌请求，这个开关是真正拦下的那道门。")
                     .font(.caption2)
             }
-            if !g.connected {
-                Section {
-                    if g.devices.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Label("还没看到眼镜", systemImage: "eyeglasses")
-                                .font(.subheadline.weight(.semibold))
-                            Text("① 把双镜腿折起来\n② 长按右侧拍摄键 5 秒，直到镜框内侧闪蓝\n③ 回到这里点「扫描」")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    ForEach(g.primaryDevices) { d in
-                        Button { g.connect(d.id) } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: d.isGlasses ? "eyeglasses" : "dot.radiowaves.left.and.right")
-                                    .foregroundStyle(d.isGlasses ? Color.cyan : Color.secondary)
-                                    .frame(width: 22)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(d.displayName).foregroundStyle(.primary)
-                                    if d.isGlasses {
-                                        Text("点一下连接").font(.caption2).foregroundStyle(.secondary)
-                                    }
-                                }
-                                Spacer()
-                                if g.connectingID == d.id || (g.phaseBusy && d.isGlasses) {
-                                    HStack(spacing: 6) {
-                                        ProgressView().controlSize(.small)
-                                        Text(g.phaseText).font(.caption2).foregroundStyle(.secondary)
-                                    }
-                                } else {
-                                    Text("\(d.rssi) dBm").font(.caption2.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        .disabled(g.connectingID != nil || g.phaseBusy)
-                    }
-                    if !g.otherDevices.isEmpty {
-                        DisclosureGroup("其他 \(g.otherDevices.count) 个蓝牙信号") {
-                            ForEach(g.otherDevices) { d in
-                                HStack {
-                                    Text(d.displayName).font(.footnote)
-                                    Spacer()
-                                    Text("\(d.rssi) dBm").font(.caption2.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                } header: {
-                    Text("附近的眼镜")
-                } footer: {
-                    if g.scanning { Text("正在扫描…（20 秒自动停）") }
-                }
-            }
             if g.connected {
                 Section("日常") {
                     Button { showQuick = true } label: {
@@ -753,9 +739,6 @@ struct DeviceTabBody: View {    @ObservedObject var g: Glasses
                         Label("刷新设备状态", systemImage: "arrow.clockwise")
                     }
                 }
-            }
-            Section("一次性设置") {
-                Button("成为这副眼镜的主人") { g.route = .ownerSetup }
             }
             Section("高级") {
                 Button { showDiagnostics = true } label: {
@@ -770,6 +753,28 @@ struct DeviceTabBody: View {    @ObservedObject var g: Glasses
         .sheet(isPresented: $showSettings) { NavigationStack { SettingsView(g: g) } }
         .sheet(isPresented: $showDiagnostics) { NavigationStack { ContentView(g: g) } }
         .sheet(isPresented: $showAbout) { AboutView() }
+    }
+
+    private func candidateRow(_ device: ScanEntry) -> some View {
+        Button { g.connect(device.id) } label: {
+            HStack(spacing: 12) {
+                Image(systemName: device.isGlasses ? "eyeglasses" : "dot.radiowaves.left.and.right")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(device.displayName).foregroundStyle(.primary)
+                    Text(device.sourceLabel).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if g.phaseBusy && g.connectingID == device.id {
+                    ProgressView().controlSize(.small)
+                        .accessibilityLabel(Text(g.phaseText))
+                } else if let signal = device.signalLabel {
+                    Text(signal).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .disabled(g.phaseBusy)
     }
 }
 
@@ -874,21 +879,29 @@ struct BecomeOwnerView: View {
     var body: some View {
         List {
             Section {
-                if g.ownerRegistrationCompleted {
+                if g.connected && g.ownerState == .verified {
+                    Label("主人身份已验证", systemImage: "checkmark.seal.fill")
+                } else if g.busy {
+                    ProgressView("正在处理…")
+                } else if g.ownerRegistrationCompleted {
                     Button("重新连接并验证") { g.reconnectForOwnerVerification() }
                         .disabled(g.phaseBusy)
                 } else if g.canStartOwnerRegistration {
                     Button("开始注册流程") { g.route = .login }
+                } else if g.phaseBusy {
+                    ProgressView("正在连接眼镜…")
+                    Button("取消连接") { g.disconnect() }
                 } else {
                     Button("为注册连接眼镜") { g.connectSetup() }
-                        .disabled(g.phaseBusy || g.busy)
                     Text("请先在「设备」页选中眼镜。设置连接建立后就能登录注册。")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
-                Text(g.ownerLine).font(.caption).foregroundStyle(.secondary)
+                if let message = g.registrationMessage {
+                    Text(message).font(.footnote)
+                }
             }
             Section("会看到什么") {
-                Text("① Meta 登录页（只这一次）\n② 眼镜连按拍摄键 3–5 次确认\n③ 成功后立刻导出 owner-export.json")
+                Text("登录 Meta 后，请按页面提示在眼镜上确认。注册成功后，点「重新连接并验证」。")
                     .font(.footnote)
             }
             Section("不想再碰 Meta？") {

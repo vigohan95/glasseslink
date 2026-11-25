@@ -300,11 +300,6 @@ final class Session {
     let stream: SDUStream
     let owner: OwnerMaterial
     var quirks: AirShield.Quirk = .none
-    /// Set by the caller to stop trusting the advertisement: `nil` follows the glasses,
-    /// `0` forces the plain HKDF/MAC word, `1` forces the QCS7 variant (136-byte HKDF info
-    /// and a different MAC word). Gen 2 firmware has been seen to advertise nothing and then
-    /// silently drop frames sealed with the plain variant.
-    var forcedQuirks: UInt64?
     // Parameters are 31 on both ends and 31 & 31 & 31 & MULTIKEY(4) != 0, so the two
     // directions use different AES and HMAC keys. With this false the tag can never
     // match, which looks exactly like a wrong key.
@@ -612,14 +607,7 @@ final class Session {
         let en = peerEnable
         emit("peer version=\(req.version) quirks req=\(req.quirks) enable=\(en == nil ? "absent" : "\(en!.quirks)")")
 
-        if let forced = forcedQuirks {
-            quirks = forced == 1 ? .qcs7 : .none
-            emit("quirks forced to \(quirks)")
-        } else {
-            // Each direction carries its own quirks; the request's value is the one our
-            // transmitter must use (Visor derives the two sides separately).
-            quirks = req.quirks
-        }
+        quirks = req.quirks
 
         let shared = try owner.sharedSecret(peerPubkeyXy: req.pub)
         emit("ecdh ok, quirks=\(quirks)")
@@ -678,39 +666,65 @@ final class Session {
         // DATA frame*. Trust rides svc36 after that; sending trust first is what produced
         // "sealed (114B) … twelve seconds of nothing".
         do {
-            try endLinkSetup(timeout: min(timeout, 2))
+            try endLinkSetup(timeout: min(timeout, 2), continueOnPeerTrust: trust)
         } catch LinkError.unexpected(let reason) {
             emit("EndLinkSetup 未应答（\(reason)）")
         }
         if trust { try doTrust(timeout: timeout) }
     }
 
+    static func peerTrustReplyChannel(_ message: DataX.Message) -> UInt16? {
+        guard message.channel > DataX.chSetup, message.service == AirShield.svcIdentity,
+              message.error == nil,
+              message.type == Int(AirShield.idEnableTrust) || message.type == Int(AirShield.idEnableTrustEC)
+        else { return nil }
+        return message.channel ^ 0x8000
+    }
+
     private func doTrust(timeout: TimeInterval) throws {
+        let channel = allocChannel("trust")
+        let statusChannel = channel ^ 0x8000
         let sig = try owner.signRaw(digest: binding)
-        emit("trust: binding=\(binding.hexShort) sig=\(sig.hexShort) key=\(owner.publicKeyXy.hexShort)")
-        try sendAny(try AirShield.trustMessage(ownerPubkey: owner.publicKeyXy, signatureRaw: sig))
-        // 1) the glasses' own ENABLE_TRUST (0x1001), 2) a status frame on the mirror channel
-        while true {
-            let m = try recvMessage(timeout: timeout)
-            if m.service == AirShield.svcIdentity, m.type == Int(AirShield.idEnableTrustEC) { break }
-            log("   (ignoring during trust: ch=0x\(String(m.channel, radix: 16)) type=\(m.type.map(String.init) ?? "-"))")
-        }
-        // The glasses answer svc36 with 0x1000 on success; anything else is a real
-        // rejection (0x1010 key not found, 0x1044 bad signature, …).
-        while true {
-            let m = try recvMessage(timeout: timeout)
-            if let code = m.error {
+        try sendAny(try AirShield.trustMessage(channel: channel, ownerPubkey: owner.publicKeyXy, signatureRaw: sig))
+        emit("trust: sent signed request on ch=0x\(String(channel, radix: 16))")
+
+        let deadline = Date().addingTimeInterval(timeout)
+        var receivedAcceptance = false
+        var acknowledgedPeer = false
+        var deferred: [DataX.Message] = []
+        defer { pendingSetupMessages.insert(contentsOf: deferred, at: 0) }
+        while !(receivedAcceptance && acknowledgedPeer) {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { break }
+            let message: DataX.Message
+            do {
+                message = try recvMessage(timeout: remaining)
+            } catch LinkError.unexpected(_) {
+                break
+            }
+            if message.channel == statusChannel, let code = message.error {
                 guard code == Int(AirShield.stSuccess) else {
                     throw LinkError.trustRejected(UInt16(truncatingIfNeeded: code))
                 }
-                emit("trust ok (0x1000)")
-                return
+                receivedAcceptance = true
+            } else if let replyChannel = Self.peerTrustReplyChannel(message) {
+                // Acknowledge the peer's message independently of the result of our signed request.
+                try sendStatus(replyChannel, AirShield.stSuccess)
+                acknowledgedPeer = true
+                emit("trust: acknowledged peer on ch=0x\(String(replyChannel, radix: 16))")
+            } else {
+                deferred.append(message)
             }
         }
+        guard receivedAcceptance && acknowledgedPeer else {
+            let step = receivedAcceptance ? "未收到眼镜的主人验证消息" : "眼镜未确认本机的签名请求"
+            throw LinkError.unexpected("主人验证超时：\(step)")
+        }
+        emit("trust ok (0x1000)")
     }
 
     /// Wait for the mirror status. The reader answers peer setup requests as they arrive.
-    private func endLinkSetup(timeout: TimeInterval) throws {
+    private func endLinkSetup(timeout: TimeInterval, continueOnPeerTrust: Bool) throws {
         let frame = try AirShield.endLinkSetup(streamUUID: streamUUID, linkUUID: linkUUID)
         emit("EndLinkSetup (\(frame.count)B)")
         try sendAny(frame)
@@ -721,6 +735,7 @@ final class Session {
             guard m.channel == DataX.chSetupMirror, m.service == nil, m.type == nil, let code = m.error else {
                 // Keep early service messages, but keep their status replies out of trust.
                 if m.error == nil { pendingSetupMessages.append(m) }
+                if continueOnPeerTrust, Self.peerTrustReplyChannel(m) != nil { return }
                 continue
             }
             guard code == Int(AirShield.stSuccess) || code == Int(AirShield.stOK) else {
