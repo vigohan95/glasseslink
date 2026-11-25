@@ -59,6 +59,10 @@ final class LiveStream {
     private(set) var framesPerSecond = 0
     private(set) var kbitPerSecond = 0
     private(set) var decodedSize: CGSize?
+    var previewReadyForDisplay: Bool? {
+        if #available(iOS 17.4, *) { return layer.isReadyForDisplay }
+        return nil
+    }
 
     var onPhoto: ((LivePhoto) -> Void)?
     var onPhase: ((Phase) -> Void)?
@@ -354,7 +358,7 @@ final class LiveStream {
         if now >= nextVisibilityCheck {
             nextVisibilityCheck = now.addingTimeInterval(1)
             DispatchQueue.main.async { [weak self] in
-                guard let self, !self.reportedVisibleFrame, self.isRunning, self.layer.isReadyForDisplay else { return }
+                guard let self, !self.reportedVisibleFrame, self.isRunning, self.previewReadyForDisplay == true else { return }
                 self.reportedVisibleFrame = true
                 self.log("first preview frame ready for display")
             }

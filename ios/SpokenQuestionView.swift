@@ -188,12 +188,12 @@ private final class SpokenQuestionCapture: ObservableObject {
 
     private func selectInput(glassesName: String?) async throws -> AVAudioSessionPortDescription? {
         if let glassesName {
-            let wanted = normalized(glassesName)
+            let wanted = GlassesAudioInput.normalizedName(glassesName)
             if !wanted.isEmpty {
                 for _ in 0..<10 {
                     try Task.checkCancellation()
                     let matches = (audio.availableInputs ?? []).filter {
-                        $0.portType == .bluetoothHFP && normalized($0.portName) == wanted
+                        GlassesAudioInput.isWirelessMicrophone($0) && GlassesAudioInput.normalizedName($0.portName) == wanted
                     }
                     if matches.count == 1 {
                         if let selected = try? await activateInput(matches[0]) { return selected }
@@ -219,11 +219,6 @@ private final class SpokenQuestionCapture: ObservableObject {
             try await Task.sleep(for: .milliseconds(100))
         }
         return nil
-    }
-
-    private func normalized(_ name: String) -> String {
-        String(name.lowercased().filter { $0.isLetter || $0.isNumber })
-            .replacingOccurrences(of: "raybanmeta", with: "rbmeta")
     }
 
     private func startEngine(recognizer: SFSpeechRecognizer, input: AVAudioSessionPortDescription, id: UUID) throws {
@@ -259,7 +254,7 @@ private final class SpokenQuestionCapture: ObservableObject {
         }
         text = ""
         inputID = input.uid
-        inputName = input.portType == .builtInMic ? "iPhone 麦克风" : input.portName
+        inputName = input.portType == .builtInMic ? "iPhone 麦克风" : GlassesAudioInput.label(input)
         phase = .recording
         message = "正在本机转写，请说话。"
         timer = Task { [weak self] in

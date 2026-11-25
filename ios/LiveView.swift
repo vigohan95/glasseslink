@@ -51,7 +51,7 @@ struct LiveView: View {
                         .aspectRatio(9.0 / 16.0, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                         .overlay {
-                            if !live.layer.isReadyForDisplay, live.lastError == nil {
+                            if (live.previewReadyForDisplay == false || live.frames == 0), live.lastError == nil {
                                 Text("正在等待取景画面…").font(.footnote).foregroundStyle(.white)
                             }
                         }

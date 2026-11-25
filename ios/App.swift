@@ -232,7 +232,6 @@ final class Glasses: NSObject, ObservableObject {
     override init() {
         super.init()
         ModelCredentials.migrateLegacyKey(for: modelBaseURL)
-        readAudioOutput()
         audioRouteObserver = NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)
             .sink { [weak self] _ in Task { @MainActor in self?.readAudioOutput() } }
         central = CBCentralManager(delegate: self, queue: .main,
@@ -254,6 +253,7 @@ final class Glasses: NSObject, ObservableObject {
         LogStore.shared.start(fileURL: logURL)
         note("GlassesLink \(short) (\(build)) · iOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
         note("启动。owner=\(owner == nil ? "无" : "有")")
+        readAudioOutput()
         switch UserDefaults.standard.string(forKey: "ownerState") ?? "" {
         case "verified": ownerState = .verified
         case "unverified": ownerState = .unverified
@@ -1747,7 +1747,12 @@ final class Glasses: NSObject, ObservableObject {
         let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
         let route = outputs.map { $0.portType == .builtInSpeaker ? "iPhone 扬声器" : $0.portName }
             .joined(separator: "、")
-        audioRouteName = route.isEmpty ? "未检测到媒体输出" : route
+        let name = route.isEmpty ? "未检测到媒体输出" : route
+        if audioRouteName != name {
+            audioRouteName = name
+            let types = outputs.map { $0.portType.rawValue }.joined(separator: ",")
+            note("音频：iOS 当前输出类型 \(types.isEmpty ? "无" : types)")
+        }
         audioRouteUsesBluetooth = outputs.contains {
             [.bluetoothA2DP, .bluetoothLE, .bluetoothHFP].contains($0.portType)
         }

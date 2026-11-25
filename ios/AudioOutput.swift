@@ -18,6 +18,25 @@ struct AudioOutputPicker: UIViewRepresentable {
     }
 }
 
+enum GlassesAudioInput {
+    static func isWirelessMicrophone(_ port: AVAudioSessionPortDescription) -> Bool {
+        port.portType == .bluetoothHFP || port.portType == .bluetoothLE
+    }
+
+    static func normalizedName(_ name: String) -> String {
+        String(name.lowercased().filter { $0.isLetter || $0.isNumber })
+            .replacingOccurrences(of: "raybanmeta", with: "rbmeta")
+    }
+
+    static func label(_ port: AVAudioSessionPortDescription) -> String {
+        switch port.portType {
+        case .bluetoothHFP: return "\(port.portName) · HFP"
+        case .bluetoothLE: return "\(port.portName) · LE 音频"
+        default: return port.portName
+        }
+    }
+}
+
 @MainActor
 final class AudioRouteTest: ObservableObject {
     @Published private(set) var isPlaying = false

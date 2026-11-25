@@ -70,7 +70,7 @@ struct MicrophoneCheckView: View {
                         AudioOutputPicker().frame(width: 44, height: 44)
                     }
                 } footer: {
-                    Text("本页测试 iPhone 的蓝牙通话麦克风。语音助手的唤醒和听写通过独立连接。")
+                    Text("本页测试 iPhone 可用的眼镜蓝牙麦克风。Hey Meta 使用独立的语音链路。")
                 }
             }
             .navigationTitle("眼镜麦克风测试")
@@ -116,7 +116,7 @@ private final class MicrophoneCheck: ObservableObject {
     }
 
     @Published private(set) var activity: Activity = .idle
-    @Published private(set) var message = "点开始后，App 会检查眼镜是否提供蓝牙通话麦克风。"
+    @Published private(set) var message = "点开始后，App 会检查 iPhone 能否使用眼镜的蓝牙麦克风。"
     @Published private(set) var availableInputs: [Input] = []
     @Published private(set) var activeInput: String?
     @Published private(set) var sampleRate: Int?
@@ -131,7 +131,7 @@ private final class MicrophoneCheck: ObservableObject {
     private var recorder: AVAudioRecorder?
     private var player: AVAudioPlayer?
     private var sampleURL: URL?
-    private var selectedHFP: String?
+    private var selectedWirelessInput: String?
 
     func start(glassesName: String?, inputID: String?) {
         guard activity == .idle else { return }
@@ -162,26 +162,26 @@ private final class MicrophoneCheck: ObservableObject {
         }
 
         do {
-            message = "正在查找眼镜的蓝牙通话输入…"
+            message = "正在查找眼镜的蓝牙音频输入…"
             let hadBluetoothMedia = audio.currentRoute.outputs.contains {
                 $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE
             }
             try activate(.playAndRecord, options: .allowBluetooth)
-            var ports = hfpInputs()
+            var ports = wirelessInputs()
             var selected = selectedPort(in: ports, glassesName: glassesName, inputID: inputID)
             for _ in 0 ..< 12 {
                 if selected != nil { break }
                 try await Task.sleep(for: .milliseconds(100))
-                ports = hfpInputs()
+                ports = wirelessInputs()
                 selected = selectedPort(in: ports, glassesName: glassesName, inputID: inputID)
             }
-            availableInputs = ports.map { Input(id: $0.uid, name: $0.portName) }
+            availableInputs = ports.map { Input(id: $0.uid, name: GlassesAudioInput.label($0)) }
             guard let port = selected else {
                 describeCurrentInput()
                 if ports.isEmpty {
                     message = hadBluetoothMedia
-                        ? "检测到蓝牙媒体输出。iPhone 没有提供蓝牙通话麦克风（HFP）。请在「设置 → 蓝牙」确认眼镜已连接后重试。"
-                        : "iPhone 没有提供蓝牙通话麦克风（HFP）。请在「设置 → 蓝牙」确认眼镜已连接后重试。"
+                        ? "检测到蓝牙媒体输出。iPhone 尚未提供蓝牙麦克风。请在「设置 → 蓝牙」确认眼镜已连接后重试。"
+                        : "iPhone 尚未提供蓝牙麦克风。请在「设置 → 蓝牙」确认眼镜已连接后重试。"
                 } else {
                     message = "未找到此次测试要用的眼镜。请在「测试输入」中选择眼镜名称后重试。"
                 }
@@ -189,12 +189,12 @@ private final class MicrophoneCheck: ObservableObject {
             }
             try audio.setPreferredInput(port)
             for _ in 0 ..< 15 {
-                if hasActiveHFP(port.uid) { break }
+                if isInputActive(port.uid) { break }
                 try await Task.sleep(for: .milliseconds(100))
             }
             try Task.checkCancellation()
             describeCurrentInput()
-            guard hasActiveHFP(port.uid) else {
+            guard isInputActive(port.uid) else {
                 message = "系统没有切换到选中的蓝牙麦克风，未开始录音。"
                 return
             }
@@ -215,19 +215,19 @@ private final class MicrophoneCheck: ObservableObject {
                 AVLinearPCMBitDepthKey: 16,
             ])
             recorder.isMeteringEnabled = true
-            guard hasActiveHFP(port.uid), recorder.record(forDuration: 5) else {
+            guard isInputActive(port.uid), recorder.record(forDuration: 5) else {
                 describeCurrentInput()
                 message = "无法开始蓝牙麦克风录音。"
                 return
             }
             self.recorder = recorder
-            selectedHFP = port.uid
+            selectedWirelessInput = port.uid
             message = "正在录音，请说话。"
 
             let deadline = ContinuousClock.now.advanced(by: .seconds(5))
             while recorder.isRecording && ContinuousClock.now < deadline {
                 try Task.checkCancellation()
-                guard hasActiveHFP(port.uid) else {
+                guard isInputActive(port.uid) else {
                     invalidateSample("录音输入已切换，已丢弃本次样本。")
                     return
                 }
@@ -239,7 +239,7 @@ private final class MicrophoneCheck: ObservableObject {
                 try await Task.sleep(for: .milliseconds(100))
             }
             try Task.checkCancellation()
-            guard hasActiveHFP(port.uid) else {
+            guard isInputActive(port.uid) else {
                 invalidateSample("录音输入已切换，已丢弃本次样本。")
                 return
             }
@@ -264,43 +264,36 @@ private final class MicrophoneCheck: ObservableObject {
         }
     }
 
-    private func hfpInputs() -> [AVAudioSessionPortDescription] {
-        (audio.availableInputs ?? []).filter { $0.portType == .bluetoothHFP }
+    private func wirelessInputs() -> [AVAudioSessionPortDescription] {
+        (audio.availableInputs ?? []).filter(GlassesAudioInput.isWirelessMicrophone)
     }
 
     private func selectedPort(in ports: [AVAudioSessionPortDescription], glassesName: String?,
                               inputID: String?) -> AVAudioSessionPortDescription? {
         if let inputID { return ports.first { $0.uid == inputID } }
         if let glassesName, !glassesName.isEmpty {
-            let expected = normalized(glassesName)
-            let sameName = ports.filter { normalized($0.portName) == expected }
+            let expected = GlassesAudioInput.normalizedName(glassesName)
+            let sameName = ports.filter { GlassesAudioInput.normalizedName($0.portName) == expected }
             if sameName.count == 1 { return sameName[0] }
             return nil
         }
 
-        let namedGlasses = ports.filter { normalized($0.portName).hasPrefix("rbmeta") }
+        let namedGlasses = ports.filter { ScanEntry.matchesRayBanMetaName($0.portName) }
         return namedGlasses.count == 1 ? namedGlasses[0] : nil
-    }
-
-    private func normalized(_ name: String) -> String {
-        String(name.lowercased().filter { $0.isLetter || $0.isNumber })
-            .replacingOccurrences(of: "raybanmeta", with: "rbmeta")
     }
 
     private func describeCurrentInput() {
         let inputs = audio.currentRoute.inputs
-        activeInput = inputs.isEmpty ? "无" : inputs.map { input in
-            input.portType == .bluetoothHFP ? "\(input.portName) · HFP" : input.portName
-        }.joined(separator: "、")
+        activeInput = inputs.isEmpty ? "无" : inputs.map(GlassesAudioInput.label).joined(separator: "、")
     }
 
-    private func hasActiveHFP(_ id: String) -> Bool {
+    private func isInputActive(_ id: String) -> Bool {
         let inputs = audio.currentRoute.inputs
-        return inputs.count == 1 && inputs.contains { $0.uid == id && $0.portType == .bluetoothHFP }
+        return inputs.count == 1 && inputs.contains { $0.uid == id && GlassesAudioInput.isWirelessMicrophone($0) }
     }
 
     func checkRoute() {
-        guard let selectedHFP, activity == .measuring, !hasActiveHFP(selectedHFP) else { return }
+        guard let selectedWirelessInput, activity == .measuring, !isInputActive(selectedWirelessInput) else { return }
         invalidateSample("录音输入已切换，已丢弃本次样本。")
     }
 
@@ -368,7 +361,7 @@ private final class MicrophoneCheck: ObservableObject {
     }
 
     private func finishActivity() {
-        selectedHFP = nil
+        selectedWirelessInput = nil
         recorder?.stop()
         recorder = nil
         player?.stop()
