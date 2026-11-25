@@ -23,6 +23,8 @@ final class Assistant {
         static let initStreamRequest: Int32 = 5000
         static let initStreamResponse: Int32 = 5001
         static let streamHeader: Int32 = 5002
+        static let streamAudio: Int32 = 5003
+        static let streamEnd: Int32 = 6000
         static let envelope: Int32 = 9000
         static let envelopeAck: Int32 = 9001
     }
@@ -54,6 +56,7 @@ final class Assistant {
     private var turn: Turn?
     private var recentInteractions: [String] = []
     private var segments: [Data: Segment] = [:]
+    private var incomingTypes = IncomingTypes()
     private var m0: UInt16 = 0
     private var s0: UInt16 = 0
 
@@ -69,12 +72,48 @@ final class Assistant {
         var simplified = true
         var supportsSpeech: Bool?
         var replying = false
+        var microphone: MicrophoneStream?
         var deadline = ProcessInfo.processInfo.systemUptime + 30
         var keepaliveSequence = 0
         var nextKeepalive = TimeInterval.infinity
 
         func includes(_ id: String) -> Bool {
             wakeID == id || relatedWakeID == id || requestID == id
+        }
+    }
+
+    struct MicrophoneStream {
+        private(set) var frames = 0
+        private(set) var bytes = 0
+        private(set) var endedAt: TimeInterval?
+        var reportedMissingTranscript = false
+
+        mutating func noteAudio(bytes count: Int) {
+            guard endedAt == nil, count > 0 else { return }
+            frames = min(frames + 1, 4_096)
+            bytes += min(count, 1_048_576 - bytes)
+        }
+
+        mutating func finish(at time: TimeInterval) -> Bool {
+            guard endedAt == nil else { return false }
+            endedAt = time
+            return true
+        }
+
+        func shouldReportMissingTranscript(at time: TimeInterval) -> Bool {
+            guard let endedAt else { return false }
+            return frames > 0 && !reportedMissingTranscript && time - endedAt >= 3
+        }
+    }
+
+    struct IncomingTypes {
+        private var last: [UInt16: Int] = [:]
+
+        // DataX delta-encodes types per wire channel. Status-only frames never inherit a type.
+        mutating func resolve(_ message: DataX.Message) -> Int? {
+            guard message.error == nil else { return nil }
+            if let type = message.type { last[message.channel] = type }
+            return last[message.channel]
         }
     }
 
@@ -93,6 +132,8 @@ final class Assistant {
     var onTurn: ((String) -> Void)?
     /// (transcript, interaction): an actual spoken question from the glasses.
     var onTranscript: ((String, String) -> Void)?
+    /// A finished plain microphone turn had audio but the glasses did not provide usable text.
+    var onAudioWithoutTranscript: (() -> Void)?
     var onTurnEnded: ((String) -> Void)?
     var onFailure: ((Error) -> Void)?
 
@@ -165,11 +206,15 @@ final class Assistant {
                   let message = try nextIfAvailable(timeout: remaining) else {
                 throw LinkError.unexpected("助手注册未收到眼镜确认（\(type)）")
             }
-            if accepts(message, on: channel) {
+            let awaitingChannel = accepts(message, on: channel)
+            let messageChannel = accepts(message, on: m0)
+            guard awaitingChannel || messageChannel else { continue }
+            let receivedType = incomingTypes.resolve(message)
+            if awaitingChannel {
                 try checkStatus(message, operation: "助手注册 \(type)")
-                if message.type == Int(type) { return message.payload }
+                if receivedType == Int(type) { return message.payload }
             }
-            if accepts(message, on: m0), message.type == Int(MT.runningLocale) {
+            if messageChannel, receivedType == Int(MT.runningLocale) {
                 readLocale(message.payload)
             }
         }
@@ -265,17 +310,33 @@ final class Assistant {
     private func handle(_ message: DataX.Message) throws {
         if accepts(message, on: s0) {
             try checkStatus(message, operation: "助手语音通道")
-            if message.type == Int(MT.streamHeader),
-               let fields = try? PB.parse(message.payload),
-               let bytes = fields[2]?.first as? Data,
-               let interaction = String(data: bytes, encoding: .utf8) {
-                beginTurn(interaction)
+            guard let type = incomingTypes.resolve(message) else { return }
+            switch type {
+            case Int(MT.streamHeader):
+                if let fields = try? PB.parse(message.payload),
+                   let bytes = fields[2]?.first as? Data,
+                   let interaction = String(data: bytes, encoding: .utf8) {
+                    beginTurn(interaction)
+                    stateLock.lock()
+                    if turn?.includes(interaction) == true, turn?.microphone == nil {
+                        turn?.microphone = MicrophoneStream()
+                    }
+                    stateLock.unlock()
+                }
+            case Int(MT.streamAudio), 0:
+                stateLock.lock()
+                turn?.microphone?.noteAudio(bytes: message.payload.count)
+                stateLock.unlock()
+            case Int(MT.streamEnd):
+                finishMicrophoneStream()
+            default:
+                break
             }
             return
         }
         guard accepts(message, on: m0) else { return }
         try checkStatus(message, operation: "助手消息通道")
-        guard let type = message.type else { return }
+        guard let type = incomingTypes.resolve(message) else { return }
         switch Int32(truncatingIfNeeded: type) {
         case MT.envelope:
             guard let fields = try? PB.parse(message.payload) else { return }
@@ -482,6 +543,27 @@ final class Assistant {
         return !stopped && turn?.requestID == interaction && turn?.supportsSpeech != false
     }
 
+    private func finishMicrophoneStream() {
+        stateLock.lock()
+        let finished = turn?.microphone?.finish(at: ProcessInfo.processInfo.systemUptime) == true
+            ? turn?.microphone : nil
+        stateLock.unlock()
+        if let finished {
+            log("assistant: glasses microphone stream ended, \(finished.frames) audio frames, \(finished.bytes) audio bytes")
+        }
+    }
+
+    private func notifyMissingTranscript(_ wakeID: String) {
+        log("assistant: glasses sent microphone audio without a usable transcript")
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            let waiting = !self.stopped && self.turn?.wakeID == wakeID && self.turn?.requestID == nil
+            self.stateLock.unlock()
+            if waiting { self.onAudioWithoutTranscript?() }
+        }
+    }
+
     private func maintainTurn() throws {
         let now = ProcessInfo.processInfo.systemUptime
         stateLock.lock()
@@ -493,6 +575,11 @@ final class Assistant {
             forgetTurn()
             stateLock.unlock()
             notifyTurnEnded(active.requestID ?? active.wakeID)
+        } else if active.requestID == nil, active.supportsSpeech != false,
+                  active.microphone?.shouldReportMissingTranscript(at: now) == true {
+            turn?.microphone?.reportedMissingTranscript = true
+            stateLock.unlock()
+            notifyMissingTranscript(active.wakeID)
         } else if now >= active.nextKeepalive {
             let next = active.keepaliveSequence + 1
             turn?.nextKeepalive = now + 3

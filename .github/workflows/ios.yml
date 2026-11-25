@@ -42,6 +42,8 @@ jobs:
             -scheme GlassesLink \
             -only-testing:GlassesLinkTests/ProtocolTests \
             -only-testing:GlassesLinkTests/CompatibilityTests \
+            -only-testing:GlassesLinkTests/MediaWiFiTests \
+            -only-testing:GlassesLinkTests/AssistantAudioTests \
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testLoopbackPipeDeliversAFrame \
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testFrameLengthWithPartialHeadersAndNonzeroStartIndex \
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testLoopbackPipeKeepsTrailingPartialFrame \

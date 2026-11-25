@@ -21,11 +21,13 @@ enum TC {
 enum ThriftError: Error, CustomStringConvertible {
     case truncated(String)
     case badType(UInt8)
+    case limit(String)
 
     var description: String {
         switch self {
         case .truncated(let what): return "truncated \(what)"
         case .badType(let t): return "bad compact type \(t)"
+        case .limit(let what): return "compact \(what) exceeds its limit"
         }
     }
 }
@@ -131,11 +133,13 @@ enum Varint {
     }
 
     static func decode(_ data: Data, _ offset: Int) throws -> (UInt64, Int) {
+        guard offset >= data.startIndex else { throw ThriftError.truncated("varint") }
         var shift: UInt64 = 0
         var value: UInt64 = 0
         var i = offset
-        while i < data.count {
+        while i < data.endIndex {
             let b = data[i]
+            guard shift < 63 || b <= 1 else { throw ThriftError.limit("varint") }
             value |= UInt64(b & 0x7F) << shift
             i += 1
             if b & 0x80 == 0 { return (value, i) }
@@ -148,15 +152,18 @@ enum Varint {
 
 /// Reads a compact struct into `[fieldId: value]`, where values are Int64, Data, Bool or [Any].
 enum ThriftCompact {
+    private static let maximumDepth = 64
+
     static func loads(_ data: Data) throws -> [Int: Any] {
-        try readStruct(data, 0).fields
+        try readStruct(data, data.startIndex, depth: 0).fields
     }
 
-    static func readStruct(_ data: Data, _ offset: Int) throws -> (fields: [Int: Any], next: Int) {
+    private static func readStruct(_ data: Data, _ offset: Int, depth: Int) throws -> (fields: [Int: Any], next: Int) {
+        guard depth < maximumDepth else { throw ThriftError.limit("nesting") }
         var fields: [Int: Any] = [:]
         var fid = 0
         var i = offset
-        while i < data.count {
+        while i < data.endIndex {
             let head = data[i]
             i += 1
             if head == TC.stop { return (fields, i) }
@@ -164,26 +171,30 @@ enum ThriftCompact {
             let delta = Int(head >> 4)
             if delta == 0 {
                 let (raw, next) = try Varint.decode(data, i)
-                let signed = Int64(bitPattern: raw)
-                fid = Int((signed >> 1) ^ -(signed & 1))
+                let field = Int64(raw >> 1) ^ -Int64(raw & 1)
+                guard let id = Int16(exactly: field) else { throw ThriftError.limit("field ID") }
+                fid = Int(id)
                 i = next
             } else {
                 fid += delta
+                guard fid <= Int(Int16.max) else { throw ThriftError.limit("field ID") }
             }
-            let read = try readValue(data, i, type)
+            let read = try readValue(data, i, type, depth: depth)
             fields[fid] = read.value
             i = read.next
         }
         return (fields, i)
     }
 
-    private static func readValue(_ data: Data, _ start: Int, _ type: UInt8) throws -> (value: Any, next: Int) {
+    private static func readValue(_ data: Data, _ start: Int, _ type: UInt8, depth: Int) throws -> (value: Any, next: Int) {
+        guard depth < maximumDepth else { throw ThriftError.limit("nesting") }
         var i = start
+        let end = data.endIndex
         switch type {
         case TC.tTrue, TC.tFalse:
             return (type == TC.tTrue, i)
         case TC.i8:
-            guard i < data.count else { throw ThriftError.truncated("i8") }
+            guard i < end else { throw ThriftError.truncated("i8") }
             return (Int64(Int8(bitPattern: data[i])), i + 1)
         case TC.i16, TC.i32, TC.i64:
             let (raw, next) = try Varint.decode(data, i)
@@ -191,7 +202,7 @@ enum ThriftCompact {
             let decoded = (signed >> 1) ^ -(signed & 1)
             return (decoded, next)
         case TC.double:
-            guard i + 8 <= data.count else { throw ThriftError.truncated("double") }
+            guard end - i >= 8 else { throw ThriftError.truncated("double") }
             var bits: UInt64 = 0
             for k in 0..<8 { bits = (bits << 8) | UInt64(data[i + k]) }
             i += 8
@@ -199,29 +210,39 @@ enum ThriftCompact {
         case TC.bin:
             let (len, next) = try Varint.decode(data, i)
             i = next
+            guard len <= UInt64(end - i) else { throw ThriftError.truncated("binary") }
             let n = Int(len)
-            guard i + n <= data.count else { throw ThriftError.truncated("binary") }
             return (data.subdata(in: i..<(i + n)), i + n)
         case TC.list, TC.set:
-            guard i < data.count else { throw ThriftError.truncated("list") }
+            guard i < end else { throw ThriftError.truncated("list") }
             let head = data[i]
             i += 1
             var count = Int(head >> 4)
             let etype = head & 0x0F
             if count == 15 {
                 let (len, next) = try Varint.decode(data, i)
-                count = Int(len)
                 i = next
+                guard len <= UInt64(end - i) else { throw ThriftError.truncated("list") }
+                count = Int(len)
+            }
+            guard count <= end - i else { throw ThriftError.truncated("list") }
+            if etype == TC.tTrue || etype == TC.tFalse {
+                let values = data[i..<(i + count)]
+                guard values.allSatisfy({ $0 == TC.tTrue || $0 == TC.tFalse }) else {
+                    throw ThriftError.badType(etype)
+                }
+                return (values.map { $0 == TC.tTrue }, i + count)
             }
             var items: [Any] = []
             for _ in 0..<count {
-                let read = try readValue(data, i, etype)
+                let read = try readValue(data, i, etype, depth: depth + 1)
+                guard read.next > i else { throw ThriftError.truncated("list element") }
                 items.append(read.value)
                 i = read.next
             }
             return (items, i)
         case TC.structure:
-            let inner = try readStruct(data, i)
+            let inner = try readStruct(data, i, depth: depth + 1)
             return (inner.fields, inner.next)
         default:
             throw ThriftError.badType(type)

@@ -7,19 +7,44 @@
 import Foundation
 import CoreBluetooth
 
-// MARK: - SDU stream: reassembly over the L2CAP byte stream
+// MARK: - SDU reassembly shared by Bluetooth and Wi-Fi
+
+struct SDUFrameBuffer {
+    private var bytes: [UInt8] = []
+    private var cursor = 0
+
+    var count: Int { bytes.count - cursor }
+
+    mutating func append(_ data: Data) {
+        if cursor > 0 {
+            bytes.removeFirst(cursor)
+            cursor = 0
+        }
+        bytes.append(contentsOf: data)
+    }
+
+    mutating func popFirst() -> Data? {
+        guard let need = SDUStream.frameLength(bytes[cursor...]), count >= need else { return nil }
+        let result = Data(bytes[cursor ..< cursor + need])
+        cursor += need
+        if cursor == bytes.count {
+            bytes.removeAll(keepingCapacity: true)
+            cursor = 0
+        }
+        return result
+    }
+}
 
 /// L2CAP CoC hands us a byte stream, not messages. Frame boundaries are recovered
 /// from the first byte:
 ///   * 0x40..0x7F  encrypted DATA frame: 1B header | 8B MAC | 1B blockCount | 16n ct
 ///   * 0x00..0x3F / 0x80..0xBF  plaintext DataX: 2B length (14 bits) | 2B channel
 /// The two ranges are disjoint, which is what makes one-pass demux possible.
-final class SDUStream: NSObject, StreamDelegate {
+final class SDUStream: NSObject, StreamDelegate, SessionTransport {
     private let input: InputStream?
     private let output: OutputStream?
 
-    private var buf: [UInt8] = []
-    private var frames: [Data] = []
+    private var buffer = SDUFrameBuffer()
     private var closed = false
     private var opened = false
     private var terminalFailure: LinkError?
@@ -73,32 +98,28 @@ final class SDUStream: NSObject, StreamDelegate {
                 finish(Self.ioError(input, fallback: "input stream ended"))
                 return
             }
-            ingest(Array(chunk[0 ..< n]))
+            ingest(Data(chunk[0 ..< n]))
         }
     }
 
-    private func ingest(_ bytes: [UInt8]) {
+    private func ingest(_ bytes: Data) {
         cond.lock()
         defer { cond.unlock() }
         guard !closed else { return }
-        buf.append(contentsOf: bytes)
-        while let need = Self.frameLength(buf), buf.count >= need {
-            frames.append(Data(buf[0 ..< need]))
-            buf.removeFirst(need)
-        }
+        buffer.append(bytes)
         cond.broadcast()
     }
 
     static func loopbackPair() -> (a: SDUStream, b: SDUStream) {
         let a = SDUStream(nullStreams: ())
         let b = SDUStream(nullStreams: ())
-        a.writeHook = { [weak b] data in b?.ingest([UInt8](data)) }
-        b.writeHook = { [weak a] data in a?.ingest([UInt8](data)) }
+        a.writeHook = { [weak b] data in b?.ingest(data) }
+        b.writeHook = { [weak a] data in a?.ingest(data) }
         return (a, b)
     }
 
     /// Bytes pushed by a test (or by a hook) enter exactly the same path as the socket.
-    func feed(_ data: Data) { ingest([UInt8](data)) }
+    func feed(_ data: Data) { ingest(data) }
 
     func write(_ data: Data) throws {
         try checkOpen()
@@ -134,36 +155,32 @@ final class SDUStream: NSObject, StreamDelegate {
         if closed { throw terminalFailure ?? LinkError.io("stream closed") }
     }
 
-    static func frameLength(_ b: [UInt8]) -> Int? {
+    static func frameLength<Bytes: RandomAccessCollection>(_ b: Bytes) -> Int?
+        where Bytes.Element == UInt8, Bytes.Index == Int {
         guard b.count >= 1 else { return nil }
-        let b0 = b[0]
+        let start = b.startIndex
+        let b0 = b[start]
         if b0 & 0xC0 == Direction.frameData {          // encrypted DATA frame
             guard b.count >= 10 else { return nil }
-            return 10 + 16 * (Int(b[9]) + 1)
+            return 10 + 16 * (Int(b[start + 9]) + 1)
         }
         guard b.count >= 4 else { return nil }         // plaintext DataX
-        let payloadLen = Int(b0 & 0x3F) << 8 | Int(b[1])
+        let payloadLen = Int(b0 & 0x3F) << 8 | Int(b[start + 1])
         return 4 + payloadLen
-    }
-
-    /// Convenience for tests and for callers that already hold a `Data`.
-    static func frameLength(_ b: Data) -> Int? {
-        frameLength([UInt8](b))
     }
 
     func nextFrame(timeout: TimeInterval) throws -> Data {
         let deadline = Date().addingTimeInterval(timeout)
         cond.lock()
         defer { cond.unlock() }
-        while frames.isEmpty {
-            if closed {
-                throw terminalFailure ?? LinkError.io("stream closed")
-            }
-            if !cond.wait(until: deadline), frames.isEmpty, !closed {
+        while !closed {
+            if let sdu = buffer.popFirst() { return sdu }
+            if deadline.timeIntervalSinceNow <= 0 {
                 throw LinkError.unexpected("timeout waiting for a frame (folded? out of range?)")
             }
+            _ = cond.wait(until: deadline)
         }
-        return frames.removeFirst()
+        throw terminalFailure ?? LinkError.io("stream closed")
     }
 
     func close() {
@@ -188,8 +205,7 @@ final class SDUStream: NSObject, StreamDelegate {
             return first
         }
         closed = true
-        buf.removeAll()
-        frames.removeAll()
+        buffer = SDUFrameBuffer()
         terminalFailure = error
         let handler = failureHandler
         failureHandler = nil
@@ -216,7 +232,7 @@ final class SDUStream: NSObject, StreamDelegate {
     var debugBufferCount: Int {
         cond.lock()
         defer { cond.unlock() }
-        return buf.count + frames.reduce(0) { $0 + $1.count }
+        return buffer.count
     }
 }
 
@@ -349,7 +365,7 @@ final class Session {
     /// reject a trust frame and all you get back is a status code.
     static var verbose = false
 
-    let stream: SDUStream
+    let stream: any SessionTransport
     let owner: OwnerMaterial
     var quirks: AirShield.Quirk = .none
     // Parameters are 31 on both ends and 31 & 31 & 31 & MULTIKEY(4) != 0, so the two
@@ -366,6 +382,8 @@ final class Session {
     private var send: Direction?
     private var recv: Direction?
     private var ownerTrustCompleted = false
+    var hasVerifiedOwner: Bool { ownerTrustCompleted }
+    var verifiedPeerKey: Data? { ownerTrustCompleted ? peerPubkey : nil }
     /// Plausible receive-direction keys, built at handshake time and resolved by the
     /// first inbound frame (see `recvMessage`).
     private var rxOptions: [RxCandidate] = []
@@ -393,7 +411,7 @@ final class Session {
     var linkUUID = Data.uuid4()
     var peerSerial = ""
 
-    init(stream: SDUStream, owner: OwnerMaterial, log: @escaping (String) -> Void = { _ in }) {
+    init(stream: any SessionTransport, owner: OwnerMaterial, log: @escaping (String) -> Void = { _ in }) {
         self.stream = stream
         self.owner = owner
         self.log = log
@@ -549,8 +567,11 @@ final class Session {
             let bulk = msg.channel == bulkChannel && msg.error == nil
                 && (msg.type == nil || msg.type == Int(Self.airData))
             if !bulk {
+                let atc = serviceChannels["media-wifi-atc"]
+                let sensitive = msg.service == Int(Assistant.service) || msg.service == 10
+                    || atc.map { msg.channel == $0 || msg.channel == ($0 ^ 0x8000) } == true
                 emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
-                     tracePayload && msg.service != Int(Assistant.service) ? packet.wire : nil, inbound: true)
+                     tracePayload && !sensitive ? packet.wire : nil, inbound: true)
             }
             return msg
         }
@@ -617,7 +638,8 @@ final class Session {
     /// they know our key, which is what makes an Android-free first pairing possible.
     static let missingPeerEncryptionRequest = "no RequestEncryption from the glasses"
 
-    func handshake(timeout: TimeInterval = 12, trust: Bool = true, quickStart: Bool = false) throws {
+    func handshake(timeout: TimeInterval = 12, trust: Bool = true, quickStart: Bool = false,
+                   expectedPeerKey: Data? = nil) throws {
         ownerTrustCompleted = false
         let pub = owner.publicKeyXy
         let challenge = Data.random(16)
@@ -692,6 +714,9 @@ final class Session {
         }
         guard let req = peerRequest else {
             throw LinkError.unexpected(Self.missingPeerEncryptionRequest)
+        }
+        if let expectedPeerKey, expectedPeerKey != req.pub {
+            throw LinkError.unexpected("Wi-Fi 会话的眼镜身份与蓝牙会话不一致。")
         }
         let en = peerEnable
         emit("peer version=\(req.version) quirks req=\(req.quirks) enable=\(en == nil ? "absent" : "\(en!.quirks)")")
@@ -855,7 +880,8 @@ final class Session {
     }
 
     /// Fire-and-forget on a named service: no waiting, so a push-heavy stream can keep sending.
-    func sendOnService(_ name: String, service: Int, type: UInt16, payload: Data = Data()) throws {
+    func sendOnService(_ name: String, service: Int, type: UInt16, payload: Data = Data(),
+                       tracePayload: Bool = true) throws {
         let ch = serviceChannel(name, service: service)
         var tags: [Data] = []
         if !servicesNamed.contains(ch) {
@@ -863,7 +889,8 @@ final class Session {
             servicesNamed.insert(ch)
         }
         tags.append(DataX.tag(2, type, last: true))
-        try sendAny(DataX.message(ch, tags: tags, payload: payload), tracePayload: service != Int(Assistant.service))
+        try sendAny(DataX.message(ch, tags: tags, payload: payload),
+                    tracePayload: tracePayload && service != Int(Assistant.service) && service != 10)
     }
 
     private var servicesNamed: Set<UInt16> = []
@@ -1088,6 +1115,20 @@ final class Session {
         emit("media: requested selected asset over Bluetooth")
     }
 
+    /// Queue before switching transport. The same capture catalog is shared by both links.
+    func queueAssetForMediaWiFi(handle: String, assetID: String, delivered: Bool) throws {
+        guard ownerTrustCompleted, !handle.isEmpty, handle.utf8.count <= 1024,
+              !handle.contains(":"), !handle.utf8.contains(0), UUID(uuidString: assetID) != nil else {
+            throw LinkError.unexpected("无法验证 Wi-Fi 导入的素材。")
+        }
+        if delivered {
+            try sendOnService("captures", service: Self.svcCaptures, type: Self.capRequestAsset,
+                              payload: Data("\(handle):\(assetID)".utf8))
+        }
+        try sendOnService("captures", service: Self.svcCaptures, type: Self.capSetLink,
+                          payload: Data("\(handle):7".utf8))
+    }
+
     static func parseCapture(_ body: Data) -> Capture? {
         let b = [UInt8](body)
         do {
@@ -1163,8 +1204,18 @@ final class Session {
 
     /// The glasses open the transfer channel. Cursor and Drop use its mirror.
     func receiveFile(timeout: TimeInterval = 120, maximumDuration: TimeInterval? = nil,
+                     expectedAssetID: String? = nil,
                      onBytes: ((Int, Int) -> Void)? = nil) throws -> Transfer? {
-        let wantedID = requestedCaptureAsset.map { asset in withUnsafeBytes(of: asset.uuid) { Data($0) } }
+        let expectedAsset: UUID?
+        if let expectedAssetID {
+            guard let asset = UUID(uuidString: expectedAssetID) else {
+                throw LinkError.unexpected("无法识别要导入的文件。")
+            }
+            expectedAsset = asset
+        } else {
+            expectedAsset = requestedCaptureAsset
+        }
+        let wantedID = expectedAsset.map { asset in withUnsafeBytes(of: asset.uuid) { Data($0) } }
         requestedCaptureAsset = nil
         let capturesMirror = serviceChannels["captures"].map { $0 ^ 0x8000 }
         var accepted: AirshipOffer?
@@ -1381,7 +1432,7 @@ final class Session {
     }
 
     /// Subscribes (or re-asks on the existing channel) and merges pushes until the snapshot has
-    /// battery and storage, allowing one short grace window for a separate volume push.
+    /// battery and storage, allowing one short grace window for volume and case updates.
     func subscribeStatus(timeout: TimeInterval = 4, requireReport: Bool = true) throws -> GlassesState {
         let ch = statusChannel()
         let mirror = ch ^ 0x8000
@@ -1389,10 +1440,10 @@ final class Session {
 
         var state = GlassesState()
         var lastType: Int?
-        var volumeDeadline: Date?
+        var optionalStatusDeadline: Date?
         let deadline = Date().addingTimeInterval(timeout)
         while true {
-            let left = min(deadline, volumeDeadline ?? deadline).timeIntervalSinceNow
+            let left = min(deadline, optionalStatusDeadline ?? deadline).timeIntervalSinceNow
             if left <= 0 { break }
             let m: DataX.Message
             do { m = try recvMessage(timeout: left) } catch LinkError.unexpected(_) { break }
@@ -1408,8 +1459,8 @@ final class Session {
             Status.merge(m.payload, into: &state)
             if state.hasReportedState { statusSubscribed = true }
             if state.batteryPercent != nil, state.storageFreeMb != nil {
-                if state.receivedVolume { break }
-                if volumeDeadline == nil { volumeDeadline = Date().addingTimeInterval(0.3) }
+                if state.receivedVolume, state.receivedCaseBattery { break }
+                if optionalStatusDeadline == nil { optionalStatusDeadline = Date().addingTimeInterval(0.65) }
             }
         }
         if requireReport, !state.hasReportedState {

@@ -30,13 +30,13 @@ struct MicrophoneCheckView: View {
                         .disabled(check.activity != .idle)
                     }
                 } footer: {
-                    Text("开始后请说话。样本只保存在这台 iPhone 上，关闭页面时删除。")
+                    Text("看到「正在录音」后，对着眼镜说话。样本只保存在这台 iPhone 上，关闭页面时删除。")
                 }
 
                 Section("检测结果") {
                     Text(check.message)
                     if let name = check.activeInput {
-                        LabeledContent("实际输入", value: name)
+                        LabeledContent(check.sampleReady ? "录音使用的输入" : "测试时的系统输入", value: name)
                     }
                     if let rate = check.sampleRate {
                         LabeledContent("会话采样率", value: "\(rate) Hz")
@@ -70,7 +70,7 @@ struct MicrophoneCheckView: View {
                         AudioOutputPicker().frame(width: 44, height: 44)
                     }
                 } footer: {
-                    Text("音频输出与麦克风输入分开。测试结果显示录音时实际使用的输入。")
+                    Text("本页测试 iPhone 的蓝牙通话麦克风。语音助手的唤醒和听写通过独立连接。")
                 }
             }
             .navigationTitle("眼镜麦克风测试")
@@ -163,18 +163,28 @@ private final class MicrophoneCheck: ObservableObject {
 
         do {
             message = "正在查找眼镜的蓝牙通话输入…"
+            let hadBluetoothMedia = audio.currentRoute.outputs.contains {
+                $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE
+            }
             try activate(.playAndRecord, options: .allowBluetooth)
             var ports = hfpInputs()
-            for _ in 0 ..< 8 where ports.isEmpty {
+            var selected = selectedPort(in: ports, glassesName: glassesName, inputID: inputID)
+            for _ in 0 ..< 12 {
+                if selected != nil { break }
                 try await Task.sleep(for: .milliseconds(100))
                 ports = hfpInputs()
+                selected = selectedPort(in: ports, glassesName: glassesName, inputID: inputID)
             }
             availableInputs = ports.map { Input(id: $0.uid, name: $0.portName) }
-            guard let port = selectedPort(in: ports, glassesName: glassesName, inputID: inputID) else {
+            guard let port = selected else {
                 describeCurrentInput()
-                message = ports.isEmpty
-                    ? "没有可用的蓝牙通话麦克风。若眼镜只连接了媒体输出，暂时无法测试其麦克风。"
-                    : "没有自动识别到这副眼镜。请从测试输入中选择眼镜，再开始测试。"
+                if ports.isEmpty {
+                    message = hadBluetoothMedia
+                        ? "检测到蓝牙媒体输出。iPhone 没有提供蓝牙通话麦克风（HFP）。请在「设置 → 蓝牙」确认眼镜已连接后重试。"
+                        : "iPhone 没有提供蓝牙通话麦克风（HFP）。请在「设置 → 蓝牙」确认眼镜已连接后重试。"
+                } else {
+                    message = "未找到此次测试要用的眼镜。请在「测试输入」中选择眼镜名称后重试。"
+                }
                 return
             }
             try audio.setPreferredInput(port)
@@ -237,7 +247,13 @@ private final class MicrophoneCheck: ObservableObject {
             describeCurrentInput()
             if let recorded = try? AVAudioPlayer(contentsOf: file), recorded.duration >= 4.5 {
                 sampleReady = true
-                message = "采样完成。可以回放以辨听清晰度和底噪。"
+                if let peak {
+                    message = peak <= -120
+                        ? "蓝牙通话麦克风的电平接近静音。可以回放，或重新测试并在录音时说话。"
+                        : "已录到声音。回放样本可以确认是否录到你说的话，以及声音是否清楚。"
+                } else {
+                    message = "录音完成。未取得电平读数，可以回放样本检查声音。"
+                }
             } else {
                 message = "录音提前结束，未获得完整样本。"
             }

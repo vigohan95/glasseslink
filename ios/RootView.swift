@@ -8,8 +8,11 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var g = Glasses()
     @State private var selectedTab: Tab = .device
+    @State private var manualMediaWiFiSheet: ManualMediaWiFiJoin?
 
     private enum Tab: Hashable { case album, camera, assistant, device }
+
+    private var importBadge: String? { g.mediaImportInProgress ? "导入中" : nil }
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -18,6 +21,7 @@ struct RootView: View {
                 .tag(Tab.device)
             AlbumTab(g: g, openDevice: { selectedTab = .device })
                 .tabItem { Label("相册", systemImage: "photo.stack") }
+                .badge(importBadge)
                 .tag(Tab.album)
             ShootTab(g: g, openDevice: { selectedTab = .device }, openAlbum: { selectedTab = .album })
                 .tabItem { Label("拍摄", systemImage: "camera") }
@@ -32,6 +36,22 @@ struct RootView: View {
                 g.readAudioOutput()
                 g.autoReconnect()
             }
+        }
+        .task(id: selectedTab == .device && scenePhase == .active) {
+            guard selectedTab == .device, scenePhase == .active else { return }
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(15)) } catch { return }
+                g.refreshVisibleDeviceStatus()
+            }
+        }
+        .onChange(of: g.manualMediaWiFi?.id, initial: true) { _, _ in
+            manualMediaWiFiSheet = g.manualMediaWiFi
+        }
+        .sheet(item: $manualMediaWiFiSheet) { request in
+            ManualMediaWiFiSheet(request: request) { useWiFi in
+                resolveManualMediaWiFi(request, useWiFi: useWiFi)
+            }
+            .onDisappear { resolveManualMediaWiFi(request, useWiFi: false) }
         }
         // One-time setup lives at the root, not inside a NavigationLink.
         // A sheet presented from a pushed destination dies the moment `g` publishes
@@ -53,6 +73,44 @@ struct RootView: View {
                         .ignoresSafeArea()
                 }
             }
+        }
+    }
+
+    private func resolveManualMediaWiFi(_ request: ManualMediaWiFiJoin, useWiFi: Bool) {
+        guard g.manualMediaWiFi?.id == request.id else { return }
+        g.resolveManualMediaWiFi(useWiFi)
+        if manualMediaWiFiSheet?.id == request.id { manualMediaWiFiSheet = nil }
+    }
+}
+
+private struct ManualMediaWiFiSheet: View {
+    let request: ManualMediaWiFiJoin
+    let resolve: (Bool) -> Void
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("眼镜 Wi-Fi") {
+                    LabeledContent("网络名称") {
+                        Text(request.ssid).monospaced().textSelection(.enabled)
+                    }
+                    if !request.password.isEmpty {
+                        LabeledContent("密码") {
+                            Text(request.password).monospaced().textSelection(.enabled).privacySensitive()
+                        }
+                    }
+                }
+                Section {
+                    Text("1. 打开 iPhone「设置 → Wi-Fi」，选择上方的眼镜网络，按提示输入密码。")
+                    Text("2. 确认眼镜网络旁出现勾选标记，返回 GlassesLink，点「已加入」。")
+                }
+                Section {
+                    Button("已加入") { resolve(true) }
+                    Button("改用蓝牙") { resolve(false) }
+                }
+            }
+            .navigationTitle("手动加入眼镜 Wi-Fi")
+            .navigationBarTitleDisplayMode(.inline)
         }
     }
 }
@@ -167,7 +225,9 @@ struct AlbumTab: View {
 
     private var displayedLibrary: Library { g.canUseGlasses ? library : .local }
     private var canDelete: Bool { g.canDeleteGlassesCaptures && inFlight == nil && !isDeleting }
-    private var canStartTransfer: Bool { g.canUseGlasses && inFlight == nil && !g.busy && !isSelecting && !isDeleting }
+    private var canStartTransfer: Bool {
+        g.canUseGlasses && inFlight == nil && !g.mediaImportInProgress && !g.busy && !isSelecting && !isDeleting
+    }
 
     private var selectableRows: [Capture] {
         guard displayedLibrary == .glasses else { return [] }
@@ -351,20 +411,40 @@ struct AlbumTab: View {
         if !g.canUseGlasses {
             Button(g.connected ? "去验证" : "连接眼镜") { openDevice() }
                 .buttonStyle(.bordered)
-        } else if !isSelecting && displayedLibrary == .glasses && !pending.isEmpty {
-            Button { transfer(pending) } label: {
-                Label("导入 \(pending.count) 项", systemImage: "arrow.down")
+        } else if !isSelecting && displayedLibrary == .glasses && !rows.isEmpty {
+            VStack(alignment: .trailing, spacing: 7) {
+                if !pending.isEmpty {
+                    Button { transfer(pending) } label: {
+                        Label("导入 \(pending.count) 项", systemImage: "arrow.down")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canStartTransfer)
+                }
+                Menu {
+                    Picker("导入方式", selection: $g.importRoute) {
+                        ForEach(MediaImportRoute.allCases) { route in Text(route.title).tag(route) }
+                    }
+                } label: {
+                    Label(g.importRoute.title, systemImage: "slider.horizontal.3")
+                        .font(.footnote.weight(.medium))
+                        .padding(.vertical, 5)
+                }
+                .accessibilityLabel("导入方式，\(g.importRoute.title)")
+                .disabled(!canStartTransfer)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!canStartTransfer)
         }
     }
 
     @ViewBuilder
     private var transferStatus: some View {
-        if inFlight != nil {
+        if inFlight != nil || g.mediaImportInProgress {
             VStack(alignment: .leading, spacing: 7) {
-                ProgressView(g.mediaMessage ?? "正在传输…").font(.footnote)
+                let title = g.mediaMessage ?? "正在从眼镜导入…"
+                if let inFlight, let fraction = g.progress[inFlight], fraction.isFinite, fraction > 0 {
+                    ProgressView(title, value: min(fraction, 1)).font(.footnote)
+                } else {
+                    ProgressView(title).font(.footnote)
+                }
                 if let detail = g.transferDetail {
                     Text(detail)
                         .font(.caption.monospacedDigit())
@@ -478,8 +558,12 @@ struct AlbumTab: View {
     private func transfer(_ queue: [Capture], originalOnly: Bool = false) {
         guard canStartTransfer, let first = queue.first else { return }
         inFlight = first.id
+        g.beginAlbumTransferBatch()
         Task { @MainActor in
-            defer { inFlight = nil }
+            defer {
+                inFlight = nil
+                g.endAlbumTransferBatch()
+            }
             for capture in queue {
                 guard g.canUseGlasses, !Task.isCancelled else { break }
                 if !originalOnly && g.importedCaptures[capture.id] != nil { continue }
@@ -671,13 +755,20 @@ struct ShootTab: View {
 
     private var cameraTitle: String {
         if g.recording { return "正在录像" }
+        if g.mediaImportInProgress { return "正在从眼镜导入" }
         if g.canUseGlasses { return "蓝牙拍摄已就绪" }
         return g.connected ? "拍摄需要验证主人身份" : "眼镜未连接"
     }
 
     private var shutterTitle: String {
         if g.recording { return "停止录像" }
+        if g.queuedGlassesActionText != nil { return "已排队" }
         return mode == .photo ? "拍照" : "开始录像"
+    }
+
+    private var cameraActionBlocked: Bool {
+        if g.assistantOn || g.assistantRegistering || g.queuedGlassesActionText != nil { return true }
+        return g.mediaImportInProgress ? g.recording : g.busy
     }
 
     private var shutterColor: Color { mode == .video || g.recording ? .red : .white }
@@ -697,7 +788,7 @@ struct ShootTab: View {
                             .frame(maxWidth: .infinity)
                             .glassesPanel()
                     }
-                    if let message = g.mediaMessage {
+                    if let message = g.mediaMessage, !g.mediaImportInProgress {
                         HStack(alignment: .firstTextBaseline, spacing: 9) {
                             if g.busy {
                                 ProgressView().controlSize(.small)
@@ -798,11 +889,26 @@ struct ShootTab: View {
 
     private var shutterControls: some View {
         VStack(spacing: 14) {
+            if let queued = g.queuedGlassesActionText {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Label(queued, systemImage: "clock")
+                        .font(.footnote)
+                    Spacer(minLength: 4)
+                    Button("取消排队") { g.cancelQueuedGlassesAction() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            } else if g.mediaImportInProgress && !cameraActionBlocked {
+                Label("拍摄会在导入结束后执行。", systemImage: "clock")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             Picker("拍摄模式", selection: $mode) {
                 ForEach(CaptureMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented)
-            .disabled(g.busy || g.recording)
+            .disabled(cameraActionBlocked || g.recording)
 
             if mode == .video {
                 Picker("手机端停止计时", selection: $g.maxRecordSeconds) {
@@ -813,7 +919,7 @@ struct ShootTab: View {
                     Text("5 分钟").tag(300)
                 }
                 .pickerStyle(.menu)
-                .disabled(g.busy || g.recording)
+                .disabled(cameraActionBlocked || g.recording)
             }
 
             HStack(alignment: .center, spacing: 12) {
@@ -838,7 +944,7 @@ struct ShootTab: View {
                     .frame(maxWidth: .infinity, minHeight: 48)
                 }
                 .buttonStyle(.plain)
-                .disabled(g.busy || g.recording || g.assistantOn)
+                .disabled(g.busy || g.mediaImportInProgress || g.recording || g.assistantOn || g.assistantRegistering)
             }
         }
         .glassesPanel(padding: 12)
@@ -866,8 +972,8 @@ struct ShootTab: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(g.busy || g.assistantOn)
-        .opacity(g.busy || g.assistantOn ? 0.5 : 1)
+        .disabled(cameraActionBlocked)
+        .opacity(cameraActionBlocked ? 0.5 : 1)
     }
 
     private func timerText(_ deadline: Date, now: Date) -> String {
@@ -1249,9 +1355,12 @@ struct DeviceTabBody: View {
                 .accessibilityLabel("刷新眼镜状态")
                 .disabled(g.statusRefreshing)
             }
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 180 : 89), spacing: 8)], spacing: 8) {
-                statusMetric("电量", value: g.status.batteryPercent.map { "\($0)%" },
-                             icon: g.status.charging == true ? "bolt.fill" : "battery.100")
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 180 : 126), spacing: 8)], spacing: 8) {
+                let charge = g.status.batteryCharge
+                statusMetric("眼镜电量", value: g.status.batteryPercent.map { "\($0)%" },
+                             icon: charge == .charging || charge == .chargingLow ? "bolt.fill" : "battery.100",
+                             detail: charge?.label)
+                caseBatteryMetric
                 statusMetric("可用空间", value: g.status.storageFreeMb.map(storageText), icon: "internaldrive")
                 statusMetric("眼镜音量", value: g.status.volumePercent.map { "\($0)%" }, icon: "speaker.wave.2")
             }
@@ -1262,8 +1371,19 @@ struct DeviceTabBody: View {
         .glassesPanel()
     }
 
+    private var caseBatteryMetric: some View {
+        let current = g.status.caseBattery
+        let reading = current?.reading ?? g.status.lastCaseBatteryReading
+        let time = reading.map { $0.observedAt.formatted(date: .abbreviated, time: .shortened) }
+        let timestamp = time.map { current?.reading != nil ? "上报于 \($0)" : "上次上报 \($0)" }
+        let detail = [current?.label, timestamp].compactMap { $0 }.joined(separator: "\n")
+        return statusMetric("充电盒电量", value: reading?.level.label,
+                            icon: current?.charging == true ? "bolt.fill" : "shippingbox",
+                            detail: detail.isEmpty ? nil : detail)
+    }
+
     private var audioPanel: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 11) {
             HStack(alignment: .center, spacing: 12) {
                 Image(systemName: g.audioRouteUsesBluetooth ? "headphones" : "speaker.wave.2")
                     .font(.title3)
@@ -1271,8 +1391,8 @@ struct DeviceTabBody: View {
                     .frame(width: 28)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("系统音频输出").font(.headline)
-                    Text(g.audioRouteName)
+                    Text("音频与麦克风").font(.headline)
+                    Text("本 App 读到的输出：\(g.audioRouteName)")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                     if let profile = g.audioMediaProfile {
@@ -1285,16 +1405,27 @@ struct DeviceTabBody: View {
                 AudioOutputPicker()
                     .frame(width: 44, height: 44)
             }
-            Text("若列表未列出眼镜，播放音频时可在 iPhone 控制中心的播放卡片中选择输出。")
-                .font(.caption)
+            Text("拍摄和导入使用 GlassesLink 的眼镜连接。抖音、音乐和通话使用 iPhone 的系统蓝牙音频。")
+                .font(.footnote)
                 .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 5) {
+                Text("用眼镜听抖音").font(.subheadline.weight(.semibold))
+                Text("1. 打开 iPhone「设置 → 蓝牙」，确认眼镜显示「已连接」。")
+                Text("2. 播放抖音时打开「控制中心」，点播放卡片的音频输出图标，选择眼镜。")
+            }
+            .font(.footnote)
+            Button { g.readAudioOutput() } label: {
+                Label("重新读取本 App 的音频输出", systemImage: "arrow.clockwise")
+                    .font(.footnote)
+            }
+            .buttonStyle(.bordered)
             Divider()
             actionRow("测试眼镜麦克风", icon: "mic") { showMicrophoneCheck = true }
         }
         .glassesPanel(padding: 13)
     }
 
-    private func statusMetric(_ title: String, value: String?, icon: String) -> some View {
+    private func statusMetric(_ title: String, value: String?, icon: String, detail: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             Image(systemName: icon)
                 .foregroundStyle(GlassesTheme.accent)
@@ -1305,6 +1436,9 @@ struct DeviceTabBody: View {
             Text(title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if let detail {
+                Text(detail).font(.caption2).foregroundStyle(.secondary)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(10)

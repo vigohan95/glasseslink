@@ -24,21 +24,44 @@ enum Status {
         PB.bytes(1, PB.varint(subscriptionDeviceState)) + PB.string(2, UUID().uuidString)
     }
 
-    static func merge(_ payload: Data, into state: inout GlassesState) {
+    static func merge(_ payload: Data, into state: inout GlassesState, receivedAt: Date = Date()) {
         guard let top = try? PB.parse(payload) else { return }
         func inner(_ field: Int) -> [Int: [Any]]? {
             guard let blob = top[field]?.first as? Data else { return nil }
             return try? PB.parse(blob)
         }
         func number(_ f: [Int: [Any]]?, _ field: Int) -> Int? { f?[field]?.first as? Int }
+        func flag(_ value: Int?) -> Bool? {
+            switch value {
+            case 0: return false
+            case 1: return true
+            default: return nil
+            }
+        }
 
         if let battery = inner(1) {
             if let percent = number(battery, 3) {
                 state.batteryPercent = (0 ... 100).contains(percent) ? percent : nil
             }
-            if let charge = number(battery, 2) { state.charging = [1, 2, 3].contains(charge) }
+            if let charge = number(battery, 2) { state.batteryCharge = BatteryCharge(rawValue: charge) ?? .unknown }
             if let milli = number(battery, 4) { state.batteryTempC = Double(milli) / 1000 }
             if let milli = number(battery, 5) { state.volts = Double(milli) / 1000 }
+        }
+        if let battery = inner(2) {
+            let present = flag(number(battery, 8))
+            let charging = present == false ? nil : flag(number(battery, 2))
+            let scale = number(battery, 7) ?? 0
+            var reading: CaseBatteryReading?
+            if present != false, let value = number(battery, 3) {
+                if scale == 100, (0 ... 100).contains(value) {
+                    reading = CaseBatteryReading(level: .percent(value), observedAt: receivedAt)
+                } else if (scale == 0 || scale == 4), (0 ... 4).contains(value) {
+                    // Four steps is the protocol default when scale is omitted or zero.
+                    reading = CaseBatteryReading(level: .bars(value), observedAt: receivedAt)
+                }
+            }
+            state.caseBattery = ChargingCaseState(reading: reading, charging: charging, present: present)
+            if let reading { state.lastCaseBatteryReading = reading }
         }
         if let value = number(top, 3) { state.camera = cameraName(value) }
         if let value = number(top, 6) { state.hinge = value == 1 ? "OPEN" : "CLOSED" }
@@ -89,11 +112,54 @@ enum Status {
     }
 }
 
+enum BatteryCharge: Int {
+    case unknown = 0, charging, full, chargingLow, notCharging
+
+    var label: String? {
+        switch self {
+        case .unknown: return nil
+        case .charging, .chargingLow: return "充电中"
+        case .full: return "已充满"
+        case .notCharging: return "未充电"
+        }
+    }
+}
+
+enum CaseBatteryLevel: Equatable {
+    case percent(Int)
+    case bars(Int)
+
+    var label: String {
+        switch self {
+        case let .percent(value): return "\(value)%"
+        case let .bars(value): return "\(value)/4 格"
+        }
+    }
+}
+
+struct CaseBatteryReading {
+    let level: CaseBatteryLevel
+    let observedAt: Date
+}
+
+struct ChargingCaseState {
+    let reading: CaseBatteryReading?
+    let charging: Bool?
+    let present: Bool?
+
+    var label: String? {
+        if present == false { return "未检测到充电盒" }
+        return charging.map { $0 ? "充电中" : "未充电" }
+    }
+}
+
 struct GlassesState {
     var batteryPercent: Int?
-    var charging: Bool?
+    var batteryCharge: BatteryCharge?
     var batteryTempC: Double?
     var volts: Double?
+    var caseBattery: ChargingCaseState?
+    var lastCaseBatteryReading: CaseBatteryReading?
     var camera: String?
     var hinge: String?
     var mount: String?
@@ -107,17 +173,21 @@ struct GlassesState {
     var volumeStream: String?
     var receivedVolume = false
 
+    var receivedCaseBattery: Bool { caseBattery != nil }
+
     var hasReportedState: Bool {
-        batteryPercent != nil || charging != nil || batteryTempC != nil || volts != nil
+        batteryPercent != nil || batteryCharge != nil || batteryTempC != nil || volts != nil || receivedCaseBattery
             || camera != nil || hinge != nil || mount != nil || thermalC != nil || throttling != nil
             || streaming != nil || storageFreeMb != nil || storageTotalMb != nil || receivedVolume
     }
 
     mutating func mergeReported(from update: GlassesState) {
         batteryPercent = update.batteryPercent ?? batteryPercent
-        charging = update.charging ?? charging
+        batteryCharge = update.batteryCharge ?? batteryCharge
         batteryTempC = update.batteryTempC ?? batteryTempC
         volts = update.volts ?? volts
+        caseBattery = update.caseBattery
+        lastCaseBatteryReading = update.lastCaseBatteryReading ?? lastCaseBatteryReading
         camera = update.camera ?? camera
         hinge = update.hinge ?? hinge
         mount = update.mount ?? mount
@@ -142,8 +212,14 @@ struct GlassesState {
     var lines: [String] {
         var out: [String] = []
         if let batteryPercent {
-            let charge = charging == true ? "（充电中）" : ""
-            out.append("电量 \(batteryPercent)%\(charge)")
+            let charge = batteryCharge?.label.map { "（\($0)）" } ?? ""
+            out.append("眼镜电量 \(batteryPercent)%\(charge)")
+        } else if let label = batteryCharge?.label {
+            out.append("眼镜电池 \(label)")
+        }
+        if let caseBattery {
+            let info = [caseBattery.reading?.level.label, caseBattery.label].compactMap { $0 }.joined(separator: " · ")
+            out.append(info.isEmpty ? "充电盒未上报电量" : "充电盒 \(info)")
         }
         if let volts { out.append(String(format: "电压 %.3f V", volts)) }
         if let batteryTempC { out.append(String(format: "电池温度 %.1f °C", batteryTempC)) }

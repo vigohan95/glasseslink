@@ -401,6 +401,60 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(parsed[11] as? Bool, true)
         XCTAssertEqual(parsed[1] as? Data, Data("x".utf8))
     }
+
+    func testStatusReportsSeparateGlassesAndCaseCharge() {
+        var state = GlassesState()
+        let time = Date(timeIntervalSince1970: 100)
+        let glasses = PB.bytes(1, PB.uint(2, 2) + PB.uint(3, 100))
+        let chargingCase = PB.bytes(2, PB.uint(2, 1) + PB.uint(3, 0) + PB.uint(7, 100) + PB.uint(8, 1))
+        Status.merge(glasses + chargingCase, into: &state, receivedAt: time)
+
+        XCTAssertEqual(state.batteryPercent, 100)
+        XCTAssertEqual(state.batteryCharge, .full)
+        XCTAssertTrue(state.receivedCaseBattery)
+        XCTAssertEqual(state.caseBattery?.charging, true)
+        XCTAssertEqual(state.caseBattery?.reading?.level, .percent(0))
+        XCTAssertEqual(state.caseBattery?.reading?.observedAt, time)
+
+        Status.merge(PB.bytes(1, PB.uint(2, 0)), into: &state)
+        XCTAssertEqual(state.batteryCharge, .unknown)
+        XCTAssertNil(state.batteryCharge?.label)
+    }
+
+    func testStatusShowsCaseBarsAndRetainsTimestampedReadingAfterDetach() {
+        var state = GlassesState()
+        let time = Date(timeIntervalSince1970: 100)
+        let chargingCase = PB.bytes(2, PB.uint(2, 0) + PB.uint(3, 3) + PB.uint(8, 1))
+        Status.merge(chargingCase, into: &state, receivedAt: time)
+        XCTAssertEqual(state.caseBattery?.reading?.level, .bars(3))
+        XCTAssertEqual(state.caseBattery?.charging, false)
+
+        var detached = GlassesState()
+        Status.merge(PB.bytes(2, PB.uint(2, 1) + PB.uint(3, 94) + PB.uint(7, 100) + PB.uint(8, 0)),
+                     into: &detached, receivedAt: time.addingTimeInterval(20))
+        state.mergeReported(from: detached)
+        XCTAssertEqual(state.caseBattery?.present, false)
+        XCTAssertNil(state.caseBattery?.charging)
+        XCTAssertNil(state.caseBattery?.reading)
+        XCTAssertEqual(state.lastCaseBatteryReading?.level, .bars(3))
+        XCTAssertEqual(state.lastCaseBatteryReading?.observedAt, time)
+
+        var partial = GlassesState()
+        Status.merge(PB.bytes(1, PB.uint(3, 90)), into: &partial)
+        state.mergeReported(from: partial)
+        XCTAssertFalse(state.receivedCaseBattery)
+        XCTAssertEqual(state.lastCaseBatteryReading?.observedAt, time)
+    }
+
+    func testStatusDoesNotTreatMissingOrInvalidCaseLevelsAsZero() {
+        var state = GlassesState()
+        for payload in [PB.uint(8, 1), PB.uint(3, 101) + PB.uint(7, 100),
+                        PB.uint(3, UInt64(UInt32.max)) + PB.uint(7, 100), PB.uint(3, 5) + PB.uint(7, 4)] {
+            Status.merge(PB.bytes(2, payload), into: &state)
+            XCTAssertNil(state.caseBattery?.reading)
+            XCTAssertNil(state.lastCaseBatteryReading)
+        }
+    }
 }
 
 extension Data {

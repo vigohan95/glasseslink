@@ -22,6 +22,8 @@ targets:
       - AirShield.swift
       - OwnerKey.swift
       - Session.swift
+      - MediaWiFiProtocol.swift
+      - MediaWiFiTransport.swift
       - Shutter.swift
       - P256.swift
       - SelfTest.swift
@@ -53,6 +55,7 @@ targets:
         TARGETED_DEVICE_FAMILY: 1
         SWIFT_VERSION: "5.9"
         CODE_SIGNING_ALLOWED: NO
+        CODE_SIGN_ENTITLEMENTS: GlassesLink.entitlements
         ENABLE_BITCODE: NO
         ENABLE_TESTABILITY: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -60,13 +63,13 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "0.96"
-        CFBundleVersion: "96"
+        CFBundleShortVersionString: "0.97"
+        CFBundleVersion: "97"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
         NSMicrophoneUsageDescription: 在你主动测试时检查眼镜麦克风，测试录音仅保存在本机。
-        NSLocalNetworkUsageDescription: 连接你配置的局域网模型或桥接服务。
+        NSLocalNetworkUsageDescription: 通过眼镜 Wi-Fi 导入照片和视频，以及连接你配置的局域网模型或桥接服务。
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
           NSExceptionDomains:
