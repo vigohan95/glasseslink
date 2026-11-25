@@ -1017,6 +1017,10 @@ struct DeviceTabBody: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(connectionTitle)
                         .font(.system(.title2, design: .rounded, weight: .bold))
+                    if let name = g.connectedGlassesName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !name.isEmpty, name != "?", UUID(uuidString: name) == nil {
+                        Text(name).font(.subheadline.weight(.medium))
+                    }
                     if g.glassesLine != connectionTitle && g.glassesLine != "未连接" {
                         Text(g.glassesLine)
                             .font(.footnote)
@@ -1044,22 +1048,37 @@ struct DeviceTabBody: View {
     }
 
     private var nearbyPanel: some View {
-        let nearby = candidates
+        let listed = candidates
+        let verified = listed.filter(\.isVerified)
+        let nearby = listed.filter { !$0.isVerified }
+
         return VStack(alignment: .leading, spacing: 12) {
-            Text("已知与附近设备").font(.headline)
-            if let message = g.discoveryMessage {
-                Text(message).font(.footnote).foregroundStyle(.secondary)
-            } else if nearby.isEmpty {
-                if g.scanning {
-                    ProgressView("扫描附近的眼镜…").font(.footnote)
-                }
-                Text(g.hasSavedGlasses && !g.scanning
-                     ? "眼镜开机并在手机附近时，可以直接重连。"
-                     : "首次连接时，折叠两侧镜腿，按住拍摄键直到镜框内侧的指示灯闪蓝。")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+            if !verified.isEmpty {
+                Label("已验证的眼镜", systemImage: "checkmark.shield")
+                    .font(.headline)
+                    .accessibilityAddTraits(.isHeader)
+                ForEach(verified) { candidateRow($0) }
             }
-            ForEach(nearby) { device in candidateRow(device) }
+            if !nearby.isEmpty || verified.isEmpty || g.scanning || g.discoveryMessage != nil {
+                if !verified.isEmpty { Divider() }
+
+                Text("待确认的设备")
+                    .font(.headline)
+                    .accessibilityAddTraits(.isHeader)
+                if let message = g.discoveryMessage {
+                    Text(message).font(.footnote).foregroundStyle(.secondary)
+                } else if nearby.isEmpty {
+                    if g.scanning {
+                        ProgressView("扫描附近的眼镜…").font(.footnote)
+                    }
+                    Text(g.hasSavedGlasses && !g.scanning
+                         ? "眼镜开机并在手机附近时，可以直接重连。"
+                         : "首次连接时，折叠两侧镜腿，按住拍摄键直到镜框内侧的指示灯闪蓝。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(nearby) { candidateRow($0) }
+            }
             if g.hasSavedGlasses && !g.scanning && !g.phaseBusy {
                 Button("扫描眼镜") { g.startScan() }.buttonStyle(.bordered)
             }
@@ -1119,6 +1138,9 @@ struct DeviceTabBody: View {
                 AudioOutputPicker()
                     .frame(width: 44, height: 44)
             }
+            Text("若列表未列出眼镜，播放音频时可在 iPhone 控制中心的播放卡片中选择输出。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Divider()
             actionRow("测试眼镜麦克风", icon: "mic") { showMicrophoneCheck = true }
         }
@@ -1192,14 +1214,17 @@ struct DeviceTabBody: View {
     }
 
     private func candidateRow(_ device: ScanEntry) -> some View {
-        Button { g.connect(device.id) } label: {
+        let detail = device.nameSourceLabel.map { "\(device.sourceLabel) · \($0)" } ?? device.sourceLabel
+        return Button { g.connect(device.id) } label: {
             HStack(spacing: 12) {
-                Image(systemName: device.isGlasses ? "eyeglasses" : "dot.radiowaves.left.and.right")
+                Image(systemName: device.isVerified ? "eyeglasses" : "dot.radiowaves.left.and.right")
                     .foregroundStyle(GlassesTheme.accent)
                     .frame(width: 22)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(device.displayName).font(.subheadline.weight(.semibold))
-                    Text(device.sourceLabel).font(.caption).foregroundStyle(.secondary)
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 6)
                 if g.phaseBusy && g.connectingID == device.id {

@@ -259,6 +259,34 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: scan / connect
 
+    private var discoveredPeripherals: [UUID: CBPeripheral] = [:]
+
+    private var verifiedPeripheralNames: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: "verifiedPeripheralNames") as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "verifiedPeripheralNames") }
+    }
+
+    private func rememberVerifiedPeripheral(_ p: CBPeripheral) {
+        let key = p.identifier.uuidString
+        let name = ScanEntry.usableName(p.name)
+        var saved = verifiedPeripheralNames
+        saved[key] = name ?? saved[key] ?? ""
+        verifiedPeripheralNames = saved
+        discoveredPeripherals[p.identifier] = p
+
+        let index = devices.firstIndex { $0.id == p.identifier }
+        let old = index.map { devices[$0] }
+        let entry = ScanEntry(id: p.identifier, peripheralName: name ?? old?.peripheralName,
+                              verifiedName: saved[key], advertisementName: old?.advertisementName,
+                              rssi: old?.rssi ?? 0, isGlasses: true, isVerified: true,
+                              source: old?.source ?? .previouslySelected)
+        if let index {
+            if entry != devices[index] { devices[index] = entry }
+        } else {
+            devices.append(entry)
+        }
+    }
+
     /// Scanning in rounds instead of once: getting the glasses into pairing mode and starting
     /// the scan are never in sync, and the glasses only announce themselves for a moment.
     func startScan() {
@@ -268,6 +296,7 @@ final class Glasses: NSObject, ObservableObject {
         }
         stopScan()
         devices.removeAll()
+        discoveredPeripherals.removeAll()
         loadSystemPaired()
         discoveryMessage = nil
         ignoredAdvertisers.removeAll()
@@ -326,30 +355,37 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
-    /// Everything iOS already knows about, no scanning involved. If the glasses were ever paired
-    /// with this iPhone — or are held by another app right now — they are here, which sidesteps
-    /// "the glasses never advertise" completely.
+    /// The system's connected service matches and the last explicitly selected peripheral.
     func loadSystemPaired() {
         guard central.state == .poweredOn else { note("蓝牙不可用：\(central.state.rawValue)"); return }
         let service = CBUUID(string: Self.metaService)
         let connected = central.retrieveConnectedPeripherals(withServices: [service])
+        var known: [(CBPeripheral, ScanEntry.Source)] = connected.map { ($0, .systemConnected) }
+        if let id = savedGlassesID, !connected.contains(where: { $0.identifier == id }),
+           let p = central.retrievePeripherals(withIdentifiers: [id]).first {
+            known.append((p, .previouslySelected))
+        }
+        let verified = verifiedPeripheralNames
         var added = 0
-        for p in connected {
-            let entry = ScanEntry(id: p.identifier, name: p.name ?? "", rssi: 0,
-                                  isGlasses: true, source: .systemConnected)
-            if let i = devices.firstIndex(where: { $0.id == p.identifier }) { devices[i] = entry }
-            else { devices.insert(entry, at: 0); added += 1 }
+        for (p, source) in known {
+            let id = p.identifier
+            discoveredPeripherals[id] = p
+            let index = devices.firstIndex { $0.id == id }
+            let old = index.map { devices[$0] }
+            let name = ScanEntry.usableName(p.name) ?? old?.peripheralName
+            let trustedName = verified[id.uuidString]
+            let entry = ScanEntry(id: id, peripheralName: name, verifiedName: trustedName,
+                                  advertisementName: old?.advertisementName, rssi: old?.rssi ?? 0,
+                                  isGlasses: source == .systemConnected || Self.matchesGlassesName(name ?? ""),
+                                  isVerified: trustedName != nil, source: source)
+            if let index {
+                if entry != devices[index] { devices[index] = entry }
+            } else {
+                devices.insert(entry, at: 0)
+                added += 1
+            }
         }
-        for saved in [UserDefaults.standard.string(forKey: "lastPeripheral")].compactMap({ $0 }) {
-            guard let id = UUID(uuidString: saved), !connected.contains(where: { $0.identifier == id }),
-                  let p = central.retrievePeripherals(withIdentifiers: [id]).first else { continue }
-            let name = p.name ?? ""
-            let entry = ScanEntry(id: p.identifier, name: name, rssi: 0,
-                                  isGlasses: Self.matchesGlassesName(name), source: .previouslySelected)
-            if let i = devices.firstIndex(where: { $0.id == p.identifier }) { devices[i] = entry }
-            else { devices.insert(entry, at: 0); added += 1 }
-        }
-        note("找到 \(connected.count) 副系统已连接的眼镜，新增 \(added) 条记录")
+        note("找到 \(connected.count) 台系统已连接的兼容设备，新增 \(added) 条记录")
     }
 
     func connect(_ id: UUID, forRegistration: Bool = false) {
@@ -381,7 +417,7 @@ final class Glasses: NSObject, ObservableObject {
             phase = .connecting
             glassesLine = "正在打开蓝牙连接"
         }
-        let knownPeripheral = peripheral?.identifier == id ? peripheral : nil
+        let knownPeripheral = peripheral?.identifier == id ? peripheral : discoveredPeripherals[id]
         guard let p = knownPeripheral ?? central.retrievePeripherals(withIdentifiers: [id]).first else {
             clearLink()
             let reason = "找不到上次的眼镜，正在搜索附近设备。"
@@ -401,7 +437,8 @@ final class Glasses: NSObject, ObservableObject {
         peripheral = p
         p.delegate = self
         UserDefaults.standard.set(id.uuidString, forKey: "lastPeripheral")
-        note("连接 \(p.name ?? "?") …")
+        let name = ScanEntry.usableName(p.name) ?? ScanEntry.usableName(verifiedPeripheralNames[id.uuidString])
+        note("连接 \(name ?? devices.first(where: { $0.id == id })?.displayName ?? "未命名设备") …")
         let attempt = UUID()
         connectionAttempt = attempt
         connectionStartedAt = Date()
@@ -450,7 +487,11 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     var canUseGlasses: Bool { connected && ownerState == .verified && session != nil }
-    var connectedGlassesName: String? { canUseGlasses ? peripheral?.name : nil }
+    var connectedGlassesName: String? {
+        guard canUseGlasses, let peripheral else { return nil }
+        return ScanEntry.usableName(peripheral.name)
+            ?? ScanEntry.usableName(verifiedPeripheralNames[peripheral.identifier.uuidString])
+    }
 
     // MARK: link bring-up
 
@@ -498,6 +539,7 @@ final class Glasses: NSObject, ObservableObject {
                 UserDefaults.standard.set(true, forKey: "isOwner")
                 trustLine = "已验证（这台 iPhone 是主人）"
                 ownerState = .verified
+                if let peripheral { rememberVerifiedPeripheral(peripheral) }
             } else {
                 trustLine = "未验证（用的是临时密钥）"
                 ownerState = .unverified
@@ -1738,40 +1780,53 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     nonisolated func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
                                     advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        let localName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
-        let name = localName ?? p.name ?? ""
+        let peripheralName = ScanEntry.usableName(p.name)
+        let localName = ScanEntry.usableName(advertisementData[CBAdvertisementDataLocalNameKey] as? String)
         let services = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        let overflow = (advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID]) ?? []
         let serviceData = (advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data]) ?? [:]
         let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data
+        // Bluetooth SIG company allocations identify candidates. The session verifies the device separately.
         let hasMetaManufacturer = manufacturerData?.prefix(2).elementsEqual([0xAB, 0x01]) ?? false
-        let hasMetaService = (services + Array(serviceData.keys)).contains {
+        let hasMetaService = (services + overflow + Array(serviceData.keys)).contains {
             $0.uuidString == "FD5F" || $0.uuidString == Self.metaService
         }
         let isConnectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue != false
-        let isGlasses = isConnectable && (hasMetaService || hasMetaManufacturer || Self.matchesGlassesName(name))
+        let candidate = hasMetaService || hasMetaManufacturer || Self.matchesGlassesName(peripheralName ?? "")
+            || Self.matchesGlassesName(localName ?? "")
         let id = p.identifier
         let rssi = RSSI.intValue
         Task { @MainActor in
             guard self.scanning else { return }
-            guard isGlasses else {
+            let index = self.devices.firstIndex { $0.id == id }
+            let previous = index.map { self.devices[$0] }
+            let verifiedName = self.verifiedPeripheralNames[id.uuidString]
+            guard isConnectable, candidate || previous?.isVisibleCandidate == true || verifiedName != nil else {
                 self.ignoredAdvertisers.insert(id)
                 return
             }
-            self.sawGlassesAdvertisement = true
+            self.discoveredPeripherals[id] = p
+            self.sawGlassesAdvertisement = self.sawGlassesAdvertisement || candidate || verifiedName != nil
             self.ignoredAdvertisers.remove(id)
-            if let index = self.devices.firstIndex(where: { $0.id == id }) {
-                let previous = self.devices[index]
-                let entry = ScanEntry(id: id, name: name.isEmpty ? previous.name : name,
-                                      rssi: rssi, isGlasses: true, source: previous.source)
-                if entry.name != previous.name || entry.isGlasses != previous.isGlasses
-                    || entry.signalLabel != previous.signalLabel {
-                    self.devices[index] = entry
-                }
-                return
+            let entry = ScanEntry(id: id, peripheralName: peripheralName ?? previous?.peripheralName,
+                                  verifiedName: verifiedName, advertisementName: localName ?? previous?.advertisementName,
+                                  rssi: rssi, isGlasses: candidate || previous?.isGlasses == true,
+                                  isVerified: verifiedName != nil, source: previous?.source ?? .advertisement)
+            if let index, let previous {
+                if entry.peripheralName != previous.peripheralName || entry.advertisementName != previous.advertisementName
+                    || entry.isGlasses != previous.isGlasses || entry.isVerified != previous.isVerified
+                    || entry.signalLabel != previous.signalLabel { self.devices[index] = entry }
+            } else {
+                self.devices.append(entry)
+                self.note("找到蓝牙候选：\(entry.displayName)")
             }
-            let entry = ScanEntry(id: id, name: name, rssi: rssi, isGlasses: true)
-            self.devices.append(entry)
-            self.note("找到眼镜候选：\(entry.displayName)")
+        }
+    }
+
+    nonisolated func peripheralDidUpdateName(_ p: CBPeripheral) {
+        Task { @MainActor in
+            guard canUseGlasses, peripheral?.identifier == p.identifier else { return }
+            rememberVerifiedPeripheral(p)
         }
     }
 

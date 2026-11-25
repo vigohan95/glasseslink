@@ -55,6 +55,38 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(hex(DataX.status(DataX.chSetupMirror, 0x1000)), "8004000103001000")
     }
 
+    func testDiscoveryUsesSystemNameBeforeAnAdvertisingAlias() throws {
+        let id = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000001234"))
+        let entry = ScanEntry(id: id, peripheralName: " 我的眼镜 ", verifiedName: "之前的名称",
+                              advertisementName: "广播别名", rssi: -55, isGlasses: true, isVerified: true)
+        XCTAssertEqual(entry.displayName, "我的眼镜")
+        XCTAssertEqual(entry.nameSourceLabel, "蓝牙名称")
+
+        let cached = ScanEntry(id: id, peripheralName: "?", verifiedName: "之前的名称",
+                               advertisementName: "广播别名", rssi: -55, isGlasses: true, isVerified: true)
+        XCTAssertEqual(cached.displayName, "之前的名称")
+        XCTAssertEqual(cached.nameSourceLabel, "曾验证时的名称")
+    }
+
+    func testDiscoveryDoesNotMarkAnUnverifiedAliasAsAKnownDevice() throws {
+        let firstID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000001234"))
+        let secondID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000005678"))
+        let saved = ScanEntry(id: firstID, verifiedName: "同名设备", rssi: 0, isGlasses: true,
+                              isVerified: true, source: .previouslySelected)
+        let candidate = ScanEntry(id: secondID, verifiedName: "同名设备", advertisementName: "同名设备",
+                                   rssi: -60, isGlasses: true)
+        XCTAssertEqual(saved.displayName, candidate.displayName)
+        XCTAssertNotEqual(saved.id, candidate.id)
+        XCTAssertNil(candidate.verifiedName)
+        XCTAssertEqual(candidate.nameSourceLabel, "广播名称")
+        XCTAssertTrue(saved.isListedBefore(candidate))
+
+        let unnamed = ScanEntry(id: secondID, peripheralName: secondID.uuidString, advertisementName: "?",
+                                 rssi: -60, isGlasses: true)
+        XCTAssertEqual(unnamed.displayName, "未命名设备 · 5678")
+        XCTAssertNil(unnamed.nameSourceLabel)
+    }
+
     func testDeviceVolumeDistinguishesUnavailableFromMuted() {
         var state = GlassesState()
         Status.merge(bytes("ca0106080710011823"), into: &state)
