@@ -162,6 +162,7 @@ final class Glasses: NSObject, ObservableObject {
     @Published var importRoute: MediaImportRoute = .automatic
     @Published private(set) var manualMediaWiFi: ManualMediaWiFiJoin?
     @Published private(set) var mediaImportInProgress = false
+    private var mediaWiFiAuthenticating = false
     @Published private(set) var mediaImportCancelling = false
     @Published private(set) var mediaImportCurrentID: String?
     @Published private(set) var mediaImportCompleteCount = 0
@@ -1094,6 +1095,7 @@ final class Glasses: NSObject, ObservableObject {
         cancellation.cancel()
         mediaImportCancelling = true
         mediaWiFiConnectTask?.cancel()
+        if mediaWiFiAuthenticating { mediaWiFiTransport?.close() }
         resolveManualMediaWiFi(false)
         mediaMessage = "正在停止导入…"
     }
@@ -1105,6 +1107,7 @@ final class Glasses: NSObject, ObservableObject {
         mediaImportInProgress = false
         mediaImportCancelling = false
         mediaImportCurrentID = nil
+        mediaWiFiAuthenticating = false
         mediaImportCompleteCount = 0
         mediaImportTotal = 0
         transferDetail = nil
@@ -1121,7 +1124,10 @@ final class Glasses: NSObject, ObservableObject {
 
     private func askToJoinMediaWiFi(_ endpoint: MediaWiFiEndpoint, id: UUID) async -> Bool {
         await withCheckedContinuation { decision in
-            guard mediaImportID == id else { decision.resume(returning: false); return }
+            guard mediaImportID == id, !Task.isCancelled, mediaImportCancellation?.isCancelled == false else {
+                decision.resume(returning: false)
+                return
+            }
             manualMediaDecision = decision
             manualMediaWiFi = ManualMediaWiFiJoin(id: id, ssid: endpoint.ssid, password: endpoint.password)
             manualMediaTimeout = Task { [weak self] in
@@ -1362,11 +1368,13 @@ final class Glasses: NSObject, ObservableObject {
             let connection = Session(stream: transport, owner: control.owner)
             connection.blockOTA = true
             wifi = connection
+            mediaWiFiAuthenticating = true
             transferDetail = "Wi-Fi · 正在验证同一副眼镜"
             try await onGlassesQueue {
                 try connection.handshake(timeout: 10, trust: true, quickStart: true, expectedPeerKey: expectedKey)
             }
             guard mediaImportID == job, !cancellation.isCancelled else { throw CancellationError() }
+            mediaWiFiAuthenticating = false
             note("Wi-Fi 媒体连接已验证：本次会话接收 \(requests.count) 项")
             transferDetail = "Wi-Fi · 等待本批文件"
             let expected = Set(requests.map(\.assetID))
@@ -1384,6 +1392,7 @@ final class Glasses: NSObject, ObservableObject {
         } catch {
             failure = error
         }
+        if mediaImportID == job { mediaWiFiAuthenticating = false }
         if pendingMediaHotspot?.job == job {
             pendingMediaHotspot?.deadline = ContinuousClock.now.advanced(by: .seconds(120))
         }
