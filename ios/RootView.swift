@@ -533,6 +533,20 @@ struct ModelSheet: View {
 
 // MARK: - 设备
 
+/// The build string, surfaced in the UI on purpose.
+///
+/// Twice now a pasted log turned out to come from the previous binary, and a fix that had already
+/// shipped was re-diagnosed as "the same old bug". A version you can read off the screen settles
+/// that in one glance, with no log archaeology.
+enum BuildInfo {
+    static var short: String {
+        let info = Bundle.main.infoDictionary
+        let v = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let b = info?["CFBundleVersion"] as? String ?? "?"
+        return "\(v) (\(b))"
+    }
+}
+
 struct DeviceTab: View {
     @ObservedObject var g: Glasses
 
@@ -542,6 +556,11 @@ struct DeviceTab: View {
                 .navigationTitle("设备")
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) { StatusCapsule(g: g) {} }
+                    ToolbarItem(placement: .topBarLeading) {
+                        Text(BuildInfo.short)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
                 }
         }
     }

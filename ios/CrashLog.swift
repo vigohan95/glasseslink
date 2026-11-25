@@ -44,13 +44,22 @@ enum CrashLog {
     }
 
     /// The previous crash, if any, then clears the file so it is not reported twice.
+    ///
+    /// The report is stamped with the moment it was written and the build that wrote it: without
+    /// that, a replay of an old crash looks exactly like a fresh one, and time gets spent on a
+    /// bug that a newer build already fixed.
     static func takePrevious() -> String? {
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let when = (attrs?[.modificationDate] as? Date) ?? Date()
+        let stamp = ISO8601DateFormatter().string(from: when)
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
         try? FileManager.default.removeItem(atPath: path)
         fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
-        return trimmed
+        return "recorded \(stamp) by build \(version) (\(build))\n" + trimmed
     }
 
     // MARK: - async-signal-safe-ish writing
