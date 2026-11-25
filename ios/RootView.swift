@@ -148,6 +148,10 @@ struct AlbumTab: View {
     @State private var inFlight: String?
     @State private var failed: Set<String> = []
     @State private var preview: AlbumMediaSelection?
+    @State private var isSelecting = false
+    @State private var selectedIDs: Set<String> = []
+    @State private var pendingDeletion: [Capture]?
+    @State private var isDeleting = false
 
     private enum Library: String, CaseIterable { case glasses = "眼镜", local = "本机" }
     private enum Filter: String, CaseIterable { case all = "全部", photo = "照片", video = "视频", pending = "未导入" }
@@ -162,7 +166,15 @@ struct AlbumTab: View {
     }
 
     private var displayedLibrary: Library { g.canUseGlasses ? library : .local }
-    private var canStartTransfer: Bool { g.canUseGlasses && inFlight == nil && !g.busy }
+    private var canDelete: Bool { g.canDeleteGlassesCaptures && inFlight == nil && !isDeleting }
+    private var canStartTransfer: Bool { g.canUseGlasses && inFlight == nil && !g.busy && !isSelecting && !isDeleting }
+
+    private var selectableRows: [Capture] {
+        guard displayedLibrary == .glasses else { return [] }
+        return rows.filter { !$0.handle.isEmpty && g.importedCaptures[$0.id] == nil }
+    }
+
+    private var selectedRows: [Capture] { selectableRows.filter { selectedIDs.contains($0.id) } }
 
     private var captures: [Capture] {
         var seen: Set<String> = []
@@ -194,11 +206,12 @@ struct AlbumTab: View {
     var body: some View {
         let mediaDays = days
         let eyeIDs = Set(g.captures.map(\.id))
+        let selectableIDs = Set(selectableRows.map(\.id))
         NavigationStack {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 17) {
                     galleryHeader
-                    filters
+                    filters.disabled(isSelecting)
                     transferStatus
                     if mediaDays.isEmpty {
                         emptyPanel
@@ -210,7 +223,8 @@ struct AlbumTab: View {
                                 .accessibilityAddTraits(.isHeader)
                             LazyVGrid(columns: columns, spacing: 12) {
                                 ForEach(day.captures, id: \.id) { capture in
-                                    mediaTile(capture, presentOnGlasses: eyeIDs.contains(capture.id))
+                                    mediaTile(capture, presentOnGlasses: eyeIDs.contains(capture.id),
+                                              selectable: selectableIDs.contains(capture.id))
                                 }
                             }
                         }
@@ -219,23 +233,65 @@ struct AlbumTab: View {
                 .padding(18)
             }
             .background(GlassesTheme.page.ignoresSafeArea())
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if isSelecting {
+                    selectionBar(selectableIDs: selectableIDs)
+                }
+            }
             .navigationTitle("相册")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { StatusCapsule(g: g) { openDevice() } }
+                ToolbarItem(placement: .topBarLeading) {
+                    StatusCapsule(g: g) { openDevice() }
+                        .disabled(isSelecting)
+                }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { g.loadCaptures() } label: {
-                        Image(systemName: "arrow.clockwise")
+                    if isSelecting {
+                        Button("完成") { clearSelection() }
+                            .disabled(isDeleting)
+                    } else {
+                        HStack(spacing: 14) {
+                            if !selectableIDs.isEmpty {
+                                Button("选择") { isSelecting = true }
+                                    .disabled(!canDelete)
+                            }
+                            Button { g.loadCaptures() } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .accessibilityLabel("刷新眼镜相册")
+                            .disabled(!canStartTransfer)
+                        }
                     }
-                    .accessibilityLabel("刷新眼镜相册")
-                    .disabled(!canStartTransfer)
                 }
             }
             .fullScreenCover(item: $preview) { item in
                 AlbumMediaView(g: g, media: item)
             }
+            .confirmationDialog("删除眼镜中的原件？",
+                                isPresented: Binding(
+                                    get: { pendingDeletion != nil },
+                                    set: { if !$0 { pendingDeletion = nil } }
+                                ),
+                                titleVisibility: .visible,
+                                presenting: pendingDeletion) { captures in
+                Button("从眼镜删除 \(captures.count) 项", role: .destructive) {
+                    deleteConfirmed(captures)
+                }
+                Button("取消", role: .cancel) {}
+            } message: { captures in
+                Text("将清除眼镜存储中所选的 \(captures.count) 项未导入原件。")
+            }
             .onChange(of: displayedLibrary) { _, source in
-                if source == .local && filter == .pending { filter = .all }
+                if source == .local {
+                    clearSelection()
+                    if filter == .pending { filter = .all }
+                }
+            }
+            .onChange(of: selectableIDs) { _, available in
+                selectedIDs.formIntersection(available)
+            }
+            .onDisappear {
+                if !isDeleting { clearSelection() }
             }
         }
     }
@@ -295,7 +351,7 @@ struct AlbumTab: View {
         if !g.canUseGlasses {
             Button(g.connected ? "去验证" : "连接眼镜") { openDevice() }
                 .buttonStyle(.bordered)
-        } else if displayedLibrary == .glasses && !pending.isEmpty {
+        } else if !isSelecting && displayedLibrary == .glasses && !pending.isEmpty {
             Button { transfer(pending) } label: {
                 Label("导入 \(pending.count) 项", systemImage: "arrow.down")
             }
@@ -345,10 +401,67 @@ struct AlbumTab: View {
         return g.busy ? "等待眼镜返回相册…" : "眼镜相册没有可显示的媒体。"
     }
 
-    private func mediaTile(_ capture: Capture, presentOnGlasses: Bool) -> some View {
+    private func selectionBar(selectableIDs: Set<String>) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if isDeleting {
+                ProgressView("正在从眼镜删除…")
+            } else {
+                Text("已选择 \(selectedRows.count) 项未导入的媒体")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button(selectedIDs == selectableIDs ? "取消全选" : "全选当前") {
+                        selectedIDs = selectedIDs == selectableIDs ? [] : selectableIDs
+                    }
+                    .disabled(selectableIDs.isEmpty || !canDelete)
+                    Spacer(minLength: 8)
+                    Button("删除所选", role: .destructive) { pendingDeletion = selectedRows }
+                        .buttonStyle(.bordered)
+                        .disabled(selectedRows.isEmpty || !canDelete)
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial)
+    }
+
+    private func clearSelection() {
+        isSelecting = false
+        selectedIDs.removeAll()
+        pendingDeletion = nil
+    }
+
+    private func deleteConfirmed(_ captures: [Capture]) {
+        let ids = Set(captures.map(\.id))
+        guard isSelecting, canDelete, !ids.isEmpty,
+              ids == Set(selectedRows.map(\.id)) else { return }
+        isDeleting = true
+        Task { @MainActor in
+            let removed = await g.deleteGlassesCaptures(captures)
+            failed.subtract(removed)
+            selectedIDs.subtract(removed)
+            isDeleting = false
+            if selectedIDs.isEmpty { clearSelection() }
+        }
+    }
+
+    private func mediaTile(_ capture: Capture, presentOnGlasses: Bool, selectable: Bool) -> some View {
         let item = AlbumMediaSelection(id: capture.id, isPhoto: capture.isPhoto,
                                        original: g.localMediaURL(for: capture), thumbnail: g.thumbs[capture.id])
         let saved = g.importedCaptures[capture.id] != nil
+        let selection: CaptureTile.Selection
+        if !isSelecting {
+            selection = .inactive
+        } else if selectable {
+            selection = .eligible(selected: selectedIDs.contains(capture.id), enabled: canDelete, toggle: {
+                guard canDelete else { return }
+                if selectedIDs.remove(capture.id) == nil { selectedIDs.insert(capture.id) }
+            })
+        } else {
+            selection = .unavailable
+        }
         return CaptureTile(capture: capture,
                            media: item,
                            imported: saved,
@@ -357,6 +470,7 @@ struct AlbumTab: View {
                            fraction: g.progress[capture.id] ?? 0,
                            canFetch: canStartTransfer && presentOnGlasses,
                            presentOnGlasses: g.canUseGlasses && presentOnGlasses,
+                           selection: selection,
                            onOpen: { preview = item },
                            onTransfer: { transfer([capture], originalOnly: saved) })
     }
@@ -381,6 +495,12 @@ struct AlbumTab: View {
 }
 
 private struct CaptureTile: View {
+    enum Selection {
+        case inactive
+        case unavailable
+        case eligible(selected: Bool, enabled: Bool, toggle: () -> Void)
+    }
+
     let capture: Capture
     let media: AlbumMediaSelection
     let imported: Bool
@@ -389,6 +509,7 @@ private struct CaptureTile: View {
     let fraction: Double
     let canFetch: Bool
     let presentOnGlasses: Bool
+    let selection: Selection
     let onOpen: () -> Void
     let onTransfer: () -> Void
 
@@ -404,13 +525,7 @@ private struct CaptureTile: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if canOpen {
-                Button(action: onOpen) { cover }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(Text(openTitle))
-            } else {
-                cover
-            }
+            tileCover
             VStack(alignment: .leading, spacing: 7) {
                 let time = clockText(capture.timestampNS)
                 Text(time.isEmpty ? mediaKind : time)
@@ -418,7 +533,7 @@ private struct CaptureTile: View {
                 Text(sizeText(capture.assets.reduce(0) { $0 + $1.size }))
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                primaryControl
+                if case .inactive = selection { primaryControl }
             }
             .padding(10)
         }
@@ -426,6 +541,38 @@ private struct CaptureTile: View {
         .background(GlassesTheme.surface, in: RoundedRectangle(cornerRadius: 14))
         .clipShape(RoundedRectangle(cornerRadius: 14))
         .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(GlassesTheme.edge).allowsHitTesting(false) }
+    }
+
+    @ViewBuilder
+    private var tileCover: some View {
+        switch selection {
+        case .inactive:
+            if canOpen {
+                Button(action: onOpen) { cover }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(Text(openTitle))
+            } else {
+                cover
+            }
+        case .unavailable:
+            cover.opacity(0.5)
+        case .eligible(let selected, let enabled, let toggle):
+            Button(action: toggle) {
+                cover.overlay(alignment: .topTrailing) {
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(5)
+                        .background(selected ? Color.accentColor : .black.opacity(0.7), in: Circle())
+                        .padding(7)
+                        .allowsHitTesting(false)
+                }
+            }
+            .buttonStyle(.plain)
+            .disabled(!enabled)
+            .accessibilityLabel(Text("\(selected ? "取消选择" : "选择")\(mediaKind) \(clockText(capture.timestampNS))"))
+            .accessibilityAddTraits(selected ? .isSelected : [])
+        }
     }
 
     private var cover: some View {
@@ -447,7 +594,7 @@ private struct CaptureTile: View {
                     .foregroundStyle(.white.opacity(0.8))
                     .accessibilityHidden(true)
             }
-            if !capture.isPhoto && hasOriginal {
+            if case .inactive = selection, !capture.isPhoto && hasOriginal {
                 Image(systemName: "play.fill")
                     .font(.subheadline.weight(.semibold))
                     .padding(11)

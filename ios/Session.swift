@@ -312,6 +312,9 @@ final class Session {
     static let capEnum: UInt16 = 1
     static let capRecord: UInt16 = 6
     static let capEnd: UInt16 = 2
+    static let capDelete: UInt16 = 3
+    static let capDeleteOK: UInt16 = 4
+    static let capDeleteFailed: UInt16 = 5
     static let capRequestAsset: UInt16 = 0x83
     static let capAssetQueued: UInt16 = 0x84
     static let capAssetGone: UInt16 = 0x85
@@ -362,6 +365,7 @@ final class Session {
     private let receiveLock = NSLock()
     private var send: Direction?
     private var recv: Direction?
+    private var ownerTrustCompleted = false
     /// Plausible receive-direction keys, built at handshake time and resolved by the
     /// first inbound frame (see `recvMessage`).
     private var rxOptions: [RxCandidate] = []
@@ -614,6 +618,7 @@ final class Session {
     static let missingPeerEncryptionRequest = "no RequestEncryption from the glasses"
 
     func handshake(timeout: TimeInterval = 12, trust: Bool = true, quickStart: Bool = false) throws {
+        ownerTrustCompleted = false
         let pub = owner.publicKeyXy
         let challenge = Data.random(16)
         let seed = Data.random(32)
@@ -756,7 +761,10 @@ final class Session {
         } catch LinkError.unexpected(let reason) {
             emit("EndLinkSetup 未应答（\(reason)）")
         }
-        if trust { try doTrust(timeout: timeout) }
+        if trust {
+            try doTrust(timeout: timeout)
+            ownerTrustCompleted = true
+        }
     }
 
     static func peerTrustReplyChannel(_ message: DataX.Message) -> UInt16? {
@@ -1033,6 +1041,40 @@ final class Session {
                 out.append(cap)
             }
         }
+    }
+
+    func requestCaptureDeletion(handle: String, timeout: TimeInterval = 8) throws {
+        guard ownerTrustCompleted else { throw LinkError.unexpected("删除前需要验证眼镜主人身份") }
+        let payload = Data(handle.utf8)
+        // One sealed frame allows 4,095 plaintext bytes. Reserve 12 for DataX and its tags.
+        guard !payload.isEmpty, payload.count <= 4_083, !payload.contains(0) else {
+            throw LinkError.unexpected("无法识别要删除的素材")
+        }
+        let channel = serviceChannel("captures", service: Self.svcCaptures)
+        let mirror = channel ^ 0x8000
+        try sendOnService("captures", service: Self.svcCaptures, type: Self.capDelete, payload: payload)
+
+        let failurePrefix = payload + Data([0x3A])
+        let deadline = Date().addingTimeInterval(timeout)
+        while deadline.timeIntervalSinceNow > 0 {
+            let message: DataX.Message
+            do { message = try recvMessage(timeout: deadline.timeIntervalSinceNow, tracePayload: false) }
+            catch LinkError.unexpected(_) { break }
+            guard message.channel == mirror, message.service == nil || message.service == Self.svcCaptures else { continue }
+            if let error = message.error {
+                if error != Int(AirShield.stOK), error != Int(AirShield.stSuccess) {
+                    throw LinkError.serviceError("删除素材", UInt16(truncatingIfNeeded: error))
+                }
+                continue
+            }
+            var reply = message.payload
+            while reply.last == 0 { reply.removeLast() }
+            if message.type == Int(Self.capDeleteOK), reply == payload { return }
+            if message.type == Int(Self.capDeleteFailed), reply.starts(with: failurePrefix) {
+                throw LinkError.unexpected("眼镜拒绝删除该素材")
+            }
+        }
+        throw LinkError.unexpected("眼镜未确认删除，请刷新相册核对")
     }
 
     func requestAsset(handle: String, assetID: String) throws {

@@ -830,6 +830,70 @@ final class Glasses: NSObject, ObservableObject {
         } ?? false
     }
 
+    var canDeleteGlassesCaptures: Bool {
+        canUseGlasses && !busy && !settingsLoading && live == nil && assistantRef == nil
+    }
+
+    /// Called only after the user confirms the exact selection in the glasses album.
+    func deleteGlassesCaptures(_ selection: [Capture]) async -> Set<String> {
+        let selected = Dictionary(grouping: selection, by: \.handle).mapValues { Set($0.map(\.id)) }
+        guard !selected.isEmpty, selected.values.allSatisfy({ $0.count == 1 }) else { return [] }
+        let deleted: Set<String>? = await withGlassesOperation { active in
+            var seen = Set<String>()
+            let targets = captures.filter {
+                importedCaptures[$0.id] == nil && selected[$0.handle]?.contains($0.id) == true
+                    && seen.insert($0.handle).inserted
+            }
+            guard targets.count == selected.count else {
+                mediaMessage = "眼镜相册已变化，请刷新后重新选择。"
+                return []
+            }
+            mediaMessage = "正在删除眼镜内的 \(targets.count) 项原件…"
+            let result = try await onGlassesQueue {
+                var acknowledged = Set<String>()
+                var failure: Error?
+                for target in targets {
+                    do {
+                        try active.requestCaptureDeletion(handle: target.handle)
+                        acknowledged.insert(target.handle)
+                    } catch {
+                        if failure == nil { failure = error }
+                        // A status rejection is a reply from a live link. A timeout or
+                        // transport error leaves this request uncertain, so stop the batch.
+                        if case LinkError.serviceError = error { continue }
+                        if case LinkError.badMAC = error { throw error }
+                        if case LinkError.io = error { throw error }
+                        break
+                    }
+                }
+                let updated = Result { try active.captureList(timeout: 8) }
+                return (acknowledged, failure, updated)
+            }
+            try checkActive(active)
+            switch result.2 {
+            case .success(let updated):
+                updateCaptures(updated)
+                let stillOnGlasses = Set(updated.map(\.handle))
+                let removed = Set(targets.compactMap { target in
+                    result.0.contains(target.handle) && !stillOnGlasses.contains(target.handle) ? target.id : nil
+                })
+                let outstanding = targets.count - removed.count
+                mediaMessage = outstanding == 0
+                    ? "已确认删除 \(removed.count) 项眼镜原件。"
+                    : "已确认删除 \(removed.count) 项。另有 \(outstanding) 项结果未确认。"
+                if let error = result.1 { note("删除眼镜原件的部分请求未确认：\(error)") }
+                if !removed.isEmpty { refreshStatus() }
+                return removed
+            case .failure(let error):
+                note("删除后读取眼镜清单失败：\(error)")
+                if case LinkError.badMAC = error { throw error }
+                mediaMessage = "眼镜清单暂时无法确认删除结果，请稍后刷新。"
+                return []
+            }
+        }
+        return deleted ?? []
+    }
+
     private func downloadCapture(_ capture: Capture, from active: Session, save: Bool) async throws -> Bool {
         let id = capture.id
         if save, importedCaptures[id] != nil { return true }
@@ -1943,7 +2007,7 @@ struct ContentView: View {
                         } label: {
                             HStack {
                                 if d.isGlasses { Image(systemName: "eyeglasses") }
-                                Text(d.name)
+                                Text(d.displayName)
                                 Spacer()
                                 Text("\(d.rssi) dBm")
                                     .font(.caption.monospacedDigit())

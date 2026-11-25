@@ -159,7 +159,7 @@ final class CompatibilityTests: XCTestCase {
         func nextFrame(timeout: TimeInterval) throws -> Data { try recv.open(stream.nextFrame(timeout: timeout)) }
     }
 
-    private func encryptedLoopback() throws -> (Session, EncryptedPeer) {
+    private func encryptedLoopback(trust: Bool = false) throws -> (Session, EncryptedPeer) {
         let (client, stream) = SDUStream.loopbackPair()
         let session = Session(stream: client, owner: OwnerMaterial(scalar: Data(repeating: 1, count: 32)))
         let owner = OwnerMaterial(scalar: Data(repeating: 2, count: 32))
@@ -174,7 +174,7 @@ final class CompatibilityTests: XCTestCase {
         let ready = expectation(description: "The encrypted setup link opened")
         DispatchQueue.global(qos: .userInitiated).async {
             defer { ready.fulfill() }
-            do { try session.handshake(timeout: 4, trust: false) }
+            do { try session.handshake(timeout: 4, trust: trust) }
             catch { XCTFail("Encrypted test setup failed: \(error)") }
         }
         defer { wait(for: [ready], timeout: 5) }
@@ -196,6 +196,24 @@ final class CompatibilityTests: XCTestCase {
         let endSetup = try DataX.parse(peer.nextFrame(timeout: 4))
         XCTAssertTrue(Session.isEndLinkSetupRequest(endSetup))
         try peer.write(AirShield.endLinkStatus)
+        if trust {
+            let ownerRequest = try DataX.parse(peer.nextFrame(timeout: 4))
+            XCTAssertEqual(ownerRequest.service, AirShield.svcIdentity)
+            XCTAssertEqual(ownerRequest.type, Int(AirShield.idEnableTrust))
+            let binding = AirShield.channelBinding(glassesChallenge: challenge, glassesPubkey: owner.publicKeyXy,
+                                                   seed: phoneSeed, phonePubkey: phonePublicKey)
+            let fields = try PB.parse(ownerRequest.payload)
+            let proof = try XCTUnwrap(fields[2]?.first as? Data)
+            XCTAssertTrue(P256ECDSA.verify(digest: binding, signature: proof, publicKeyXy: phonePublicKey))
+            let peerChannel: UInt16 = 0x8008
+            let peerProof = try owner.signRaw(digest: binding)
+            try peer.write(AirShield.trustMessage(channel: peerChannel, ownerPubkey: owner.publicKeyXy,
+                                                 signatureRaw: peerProof))
+            try peer.write(DataX.status(ownerRequest.channel ^ 0x8000, AirShield.stSuccess))
+            let accepted = try DataX.parse(peer.nextFrame(timeout: 4))
+            XCTAssertEqual(accepted.channel, peerChannel ^ 0x8000)
+            XCTAssertEqual(accepted.error, Int(AirShield.stSuccess))
+        }
         return (session, peer)
     }
 
@@ -229,6 +247,46 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(reply.channel, 0x0006)
         XCTAssertEqual(reply.type, Int(Session.airDrop))
         XCTAssertEqual(reply.payload, PB.bytes(1, id))
+    }
+
+    func testCaptureDeletionRequiresCompletedOwnerTrust() throws {
+        let (session, peer) = try encryptedLoopback()
+        XCTAssertThrowsError(try session.requestCaptureDeletion(handle: "test-capture", timeout: 0.1)) { error in
+            guard case LinkError.unexpected("删除前需要验证眼镜主人身份") = error else {
+                return XCTFail("Expected the owner trust check, got \(error)")
+            }
+        }
+        XCTAssertThrowsError(try peer.nextFrame(timeout: 0.1))
+    }
+
+    func testCaptureDeletionAcceptsOnlyTheMatchingMirrorAndHandle() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let capturesChannel = Session.chLocalFirst + 1
+        let mirror = capturesChannel ^ 0x8000
+        let ok = DataX.tag(2, Session.capDeleteOK, last: true)
+        let failure = DataX.tag(2, Session.capDeleteFailed, last: true)
+        let first = Data("test-capture".utf8)
+        try peer.write(DataX.message(mirror + 1, tags: [ok], payload: first))
+        try peer.write(DataX.message(mirror, tags: [ok], payload: Data("other-capture".utf8)))
+        try peer.write(DataX.message(mirror, tags: [failure], payload: first + Data(":refused".utf8)))
+        XCTAssertThrowsError(try session.requestCaptureDeletion(handle: "test-capture", timeout: 1)) { error in
+            guard case LinkError.unexpected("眼镜拒绝删除该素材") = error else {
+                return XCTFail("Expected the scoped deletion failure, got \(error)")
+            }
+        }
+        let sent = try DataX.parse(peer.nextFrame(timeout: 1))
+        XCTAssertEqual(sent.channel, capturesChannel)
+        XCTAssertEqual(sent.service, Session.svcCaptures)
+        XCTAssertEqual(sent.type, Int(Session.capDelete))
+        XCTAssertEqual(sent.payload, first)
+
+        let second = Data("next-capture".utf8)
+        try peer.write(DataX.message(mirror, tags: [ok], payload: second + Data([0])))
+        try session.requestCaptureDeletion(handle: "next-capture", timeout: 1)
+        let next = try DataX.parse(peer.nextFrame(timeout: 1))
+        XCTAssertEqual(next.channel, capturesChannel)
+        XCTAssertEqual(next.type, Int(Session.capDelete))
+        XCTAssertEqual(next.payload, second)
     }
 
     func testMediaImportAcceptsSelectedOfferBeforeTheAssetAcknowledgement() throws {
