@@ -571,7 +571,13 @@ final class Session {
         emit("passive read: \(passive) frame(s) before we spoke")
 
         // Speak regardless: the exchange needs our challenge and seed even when they went first.
+        // Visor's SecureLink.open() sends RequestEncryption *and* EnableEncryption back to back,
+        // then reads up to HANDSHAKE_READS frames. Sending ours only after their request is what
+        // left Gen 2 silent for twelve seconds and made the link look unbuildable.
         try sendPlain(try AirShield.requestEncryption(pubkey: pub, challenge: challenge, quirks: quirks))
+        try stream.write(try AirShield.enableEncryption(pubkey: pub, seed: seed, iv: iv,
+                                                        baseSeq: baseSeq, quirks: quirks))
+        emit("sent RequestEncryption + EnableEncryption (base=\(baseSeq))")
 
         // Both messages are plaintext and may arrive in either order, sometimes twice.
         let deadline = Date().addingTimeInterval(timeout)
@@ -603,9 +609,9 @@ final class Session {
         let shared = try owner.sharedSecret(peerPubkeyXy: req.pub)
         emit("ecdh ok, shared=\(shared.hexShort) quirks=\(quirks)")
 
-        try stream.write(try AirShield.enableEncryption(pubkey: pub, seed: seed, iv: iv,
-                                                    baseSeq: baseSeq, quirks: quirks))
-        emit("EnableEncryption sent (base=\(baseSeq))")
+        // Already sent above, together with the request (Visor does the same). Nothing left to do
+        // here but remember that the peer's own EnableEncryption is what the rx key needs.
+        emit("EnableEncryption was sent up front (base=\(baseSeq))")
 
         // The glasses answer our EnableEncryption with their own, carrying the seed and IV our
         // receive direction needs. Wait for it instead of deriving keys from an empty seed.
@@ -652,16 +658,16 @@ final class Session {
         // Tolerate silence here: a device that does not want a link setup answer still gets trust.
         // 2 s, not 6: on this firmware the glasses never answer it, and waiting longer only
         // makes every connect feel like the app froze.
-        if trust { try doTrust(timeout: timeout) }
-
-        // Visor sends EndLinkSetup at the very end of open() — after trust. Sending it before
-        // trust made the glasses answer trust frames we could not attribute, and cost 2 s
-        // of dead time on every attempt.
+        // Order matters, and the source says so: SecureLink.open() ends with
+        // "EndLinkSetup is NOT sent here", and finishLinkSetup() sends it as *the first encrypted
+        // DATA frame*. Trust rides svc36 after that; sending trust first is what produced
+        // "sealed (114B) … twelve seconds of nothing".
         do {
             try endLinkSetup(timeout: min(timeout, 2))
         } catch {
-            emit("EndLinkSetup 未应答（\(error)）——链路已可用，继续")
+            emit("EndLinkSetup 未应答（\(error)）——继续尝试 trust")
         }
+        if trust { try doTrust(timeout: timeout) }
     }
 
     private func doTrust(timeout: TimeInterval) throws {
