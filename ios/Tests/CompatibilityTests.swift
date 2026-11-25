@@ -54,4 +54,24 @@ final class CompatibilityTests: XCTestCase {
     func testStatusFrameMatchesTheReferenceTranscription() {
         XCTAssertEqual(hex(DataX.status(DataX.chSetupMirror, 0x1000)), "8004000103001000")
     }
+
+    func testNativeCaptureRecordReadsWrappedFields() throws {
+        // The root points to the capture table, which points to an asset vector and 64-bit metadata.
+        let payload = bytes("0c00000006000800040000000800000014000000"
+            + "0e0014000400000008000c00100000001000000010000000010c00001400000050000000"
+            + "050000006361702d310000000100000014000000"
+            + "0e00100004000800000000000c000000100000000c000000020010002aa82900"
+            + "0700000061737365742d3100"
+            + "06000c0004000000000000000c00000015cd853dfe9c9717")
+        let capture = try XCTUnwrap(Session.parseCapture(payload))
+        XCTAssertEqual(capture.handle, "cap-1")
+        XCTAssertEqual(capture.kind, 3073)
+        XCTAssertEqual(capture.timestampNS, 1_700_000_000_123_456_789)
+        XCTAssertEqual(capture.assets.count, 1)
+
+        let still = try XCTUnwrap(capture.stills.first)
+        XCTAssertEqual(still.uuid, "asset-1")
+        XCTAssertEqual(still.size, 2_730_026)
+        XCTAssertTrue(still.delivered)
+    }
 }

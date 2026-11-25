@@ -117,14 +117,17 @@ enum DataX {
     /// Parse one plaintext DataX message.
     static func parse(_ buf: Data) throws -> Message {
         guard buf.count >= 4 else { throw LinkError.shortBuffer }
-        let b0 = buf[0]
-        let payloadLen = Int(b0 & 0x3F) << 8 | Int(buf[1])
-        let channel = buf.u16be(2)
+        let start = buf.startIndex
+        let b0 = buf[start]
+        let payloadLen = Int(b0 & 0x3F) << 8 | Int(buf[start + 1])
+        guard payloadLen <= buf.count - 4 else { throw LinkError.shortBuffer }
+        let end = start + 4 + payloadLen
+        let channel = buf.u16be(start + 2)
         var service: Int?, type: Int?, error: Int?
-        var i = 4
+        var i = start + 4
         if b0 & 0x80 != 0 {
             while true {
-                guard i + 4 <= buf.count else { throw LinkError.shortBuffer }
+                guard end - i >= 4 else { throw LinkError.shortBuffer }
                 let tb = buf[i]
                 let val = Int(buf.u16be(i + 2))
                 switch tb & 0x7F {
@@ -137,10 +140,21 @@ enum DataX {
                 if tb & 0x80 == 0 { break }
             }
         }
-        let end = i + (payloadLen - (i - 4))
-        guard end >= i, buf.count >= end else { throw LinkError.shortBuffer }
         return Message(channel: channel, service: service, type: type, error: error,
-                       payload: Data(buf[i ..< end]), consumed: end)
+                       payload: Data(buf[i ..< end]), consumed: end - start)
+    }
+
+    /// Keep complete messages in order even if the frame ends with a partial header or body.
+    static func parseMessages(_ frame: Data, requireComplete: Bool = false) throws -> [Message] {
+        let first = try parse(frame)
+        var messages = [first]
+        var remainder = frame.dropFirst(first.consumed)
+        while !remainder.isEmpty, let next = try? parse(remainder) {
+            messages.append(next)
+            remainder = remainder.dropFirst(next.consumed)
+        }
+        if requireComplete && !remainder.isEmpty { throw LinkError.shortBuffer }
+        return messages
     }
 }
 

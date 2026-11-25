@@ -53,17 +53,17 @@ struct LiveView: View {
                     if g.live == nil {
                         Button("开始取景") { g.startLive() }
                             .buttonStyle(.borderedProminent)
-                            .disabled(!g.connected)
+                            .disabled(!g.canUseGlasses || g.busy)
                     } else {
                         Button("停止") { g.stopLive() }
                             .buttonStyle(.bordered)
-                        Button("拍一张") { g.live?.requestPhoto() }
+                        Button("抓取取景画面") { g.live?.requestPhoto() }
+                            .disabled(!g.canUseGlasses || g.busy)
                             .buttonStyle(.bordered)
                     }
                 }
 
-                Text("iPhone 没有 Wi-Fi Direct，取景走蓝牙：360×640、十几个 fps，够看取景和抓拍，"
-                     + "当监视器不行。取景期间其他读眼镜的操作会排队。")
+                Text("通过蓝牙验证眼镜的实时取景。开始前请连接眼镜并验证主人身份。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -74,7 +74,7 @@ struct LiveView: View {
                 Spacer()
             }
             .padding()
-            .navigationTitle("Live 取景")
+            .navigationTitle("实时取景（实验）")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) { Button("关闭") { dismiss() } }
             }

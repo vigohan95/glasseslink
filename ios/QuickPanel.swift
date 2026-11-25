@@ -1,116 +1,73 @@
 import SwiftUI
 
-/// The handful of switches worth having one tap away, keyed straight into settings.tsv.
 struct QuickPanel: View {
     @ObservedObject var g: Glasses
-
-    struct Toggle: Identifiable {
-        let key: String
-        let title: String
-        let detail: String
-        var id: String { key }
-    }
-
-    static let toggles: [Toggle] = [
-        .init(key: "assistant_enabled", title: "眼镜自带助手",
-              detail: "关掉之后眼镜不会再自己应答“Hey Meta”，助手全部交给这个 app 的模型"),
-        .init(key: "assistant_llm_enabled", title: "助手大模型能力",
-              detail: "眼镜端的大模型问答开关"),
-        .init(key: "wakeword_sound_enabled", title: "唤醒提示音",
-              detail: "被唤醒时眼镜自己发出的提示音"),
-        .init(key: "audio_playback_during_capture_enabled", title: "拍摄时播放声音",
-              detail: "录像时是否同时播音频"),
-        .init(key: "advanced_video_quality_profile", title: "高画质视频档",
-              detail: "视频用更高码率的 profile，文件更大"),
-        .init(key: "quick_clips_photo_capture_enabled", title: "快剪里拍照",
-              detail: "短视频模式允许抓取静态图"),
-    ]
+    @Environment(\.dismiss) private var dismiss
+    @State private var drafts: [String: Double] = [:]
 
     var body: some View {
         List {
-            Section {
-                ForEach(Self.toggles) { t in
-                    Button {
-                        let current = g.settings[t.key] ?? ""
-                        let next = (current == "true") ? "false" : "true"
-                        g.writeSetting(t.key, next)
-                    } label: {
-                        HStack(alignment: .top) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(t.title)
-                                Text(t.detail)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Text((g.settings[t.key] ?? "") == "true" ? "开" : "关")
-                                .font(.footnote.weight(.semibold))
-                                .foregroundStyle((g.settings[t.key] ?? "") == "true" ? Color.accentColor : .secondary)
-                        }
-                    }
-                    .buttonStyle(.plain)
+            if !g.canUseGlasses {
+                Text("连接眼镜并验证主人身份后可读取设置。")
+                    .foregroundStyle(.secondary)
+            } else {
+                Section("音量与指示灯") {
+                    settingSlider("提示音量", key: "notification_volume", range: 0 ... 100, step: 5)
+                    settingSlider("指示灯亮度", key: "notification_led_brightness", range: 0 ... 5, step: 1)
                 }
-            } header: {
-                Text("常用开关")
-            } footer: {
-                Text("点了会立刻写进眼镜并读回校验；读不到值时显示「关」。完整 370 项在「眼镜设置」里。")
-            }
-
-            Section("音量与指示灯") {
-                Slider(
-                    value: Binding(
-                        get: { Double(g.settings["notification_volume"] ?? "") ?? 90 },
-                        set: { g.settings["notification_volume"] = String(Int($0.rounded())) }
-                    ),
-                    in: 0...100,
-                    step: 5
-                ) {
-                    Text("提示音量")
-                } minimumValueLabel: {
-                    Image(systemName: "speaker")
-                } maximumValueLabel: {
-                    Image(systemName: "speaker.wave.3")
-                } onEditingChanged: { editing in
-                    if !editing {
-                        g.writeSetting("notification_volume", g.settings["notification_volume"] ?? "90")
-                    }
+                Section("声音") {
+                    settingToggle("唤醒提示音", key: "wakeword_sound_enabled")
+                    settingToggle("拍摄时播放声音", key: "audio_playback_during_capture_enabled")
                 }
-                Text("当前 \(g.settings["notification_volume"] ?? "—")（0–100，松手即写入眼镜）")
-                    .font(.caption2).foregroundStyle(.secondary)
-
-                Slider(
-                    value: Binding(
-                        get: { Double(g.settings["notification_led_brightness"] ?? "") ?? 3 },
-                        set: { g.settings["notification_led_brightness"] = String(Int($0.rounded())) }
-                    ),
-                    in: 0...5,
-                    step: 1
-                ) {
-                    Text("指示灯亮度")
-                } onEditingChanged: { editing in
-                    if !editing {
-                        g.writeSetting("notification_led_brightness", g.settings["notification_led_brightness"] ?? "3")
-                    }
-                }
-                Text("当前 \(g.settings["notification_led_brightness"] ?? "—")（0–5）")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-
-            Section("语音") {
-                ForEach(["assistant_voice_id", "live_caption_voice_id"], id: \.self) { key in
-                    HStack {
-                        Text(key == "assistant_voice_id" ? "助手音色" : "字幕音色")
-                        Spacer()
-                        Text((g.settings[key] ?? "").isEmpty ? "—" : (g.settings[key] ?? ""))
-                            .font(.footnote.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Text("音色是形如 en_US.58 的编号；要换语言得先在眼镜上装对应语言包。")
-                    .font(.caption2).foregroundStyle(.secondary)
             }
         }
-        .navigationTitle("快捷")
-        .task { if g.settings.isEmpty { g.loadSettings() } }
+        .navigationTitle("常用设置")
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button(g.settingsLoading ? "读取中…" : "读取") { g.loadSettings() }
+                    .disabled(!g.canUseGlasses || g.settingsLoading || g.busy)
+            }
+            ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } }
+        }
+        .task(id: g.canUseGlasses) {
+            if g.canUseGlasses && g.settings.isEmpty && !g.settingsLoading && !g.busy {
+                g.loadSettings()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func settingToggle(_ title: String, key: String) -> some View {
+        if let raw = g.settings[key], raw == "true" || raw == "false" {
+            Toggle(title, isOn: Binding(
+                get: { g.settings[key] == "true" },
+                set: { g.writeSetting(key, $0 ? "true" : "false") }
+            ))
+            .disabled(g.settingsLoading || g.busy)
+        } else {
+            LabeledContent(title, value: "未读取")
+        }
+    }
+
+    @ViewBuilder
+    private func settingSlider(_ title: String, key: String, range: ClosedRange<Double>, step: Double) -> some View {
+        if let raw = g.settings[key], let value = Double(raw), range.contains(value) {
+            VStack(alignment: .leading, spacing: 4) {
+                LabeledContent(title, value: "\(Int((drafts[key] ?? value).rounded()))")
+                Slider(value: Binding(
+                    get: { drafts[key] ?? value },
+                    set: { drafts[key] = $0 }
+                ), in: range, step: step, onEditingChanged: { editing in
+                    if !editing, let draft = drafts.removeValue(forKey: key),
+                       g.canUseGlasses, !g.settingsLoading, !g.busy {
+                        g.writeSetting(key, String(Int(draft.rounded())))
+                    }
+                })
+                .accessibilityLabel(Text(title))
+                .disabled(g.settingsLoading || g.busy)
+            }
+        } else {
+            LabeledContent(title, value: "未读取")
+        }
     }
 }

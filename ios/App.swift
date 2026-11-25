@@ -103,6 +103,8 @@ final class Glasses: NSObject, ObservableObject {
     private var connectionAttempt: UUID?
     private var retriedL2CAP = false
     @Published var busy = false
+    @Published private(set) var mediaMessage: String?
+    private let glassesQueue = DispatchQueue(label: "glasseslink.session.operations", qos: .userInitiated)
     @Published var ownerLine = "owner key: 未知"
     /// Human-readable result of the last ownership proof, e.g. "已通过" or a code with a fix.
     @Published var trustLine = "未验证"
@@ -386,11 +388,23 @@ final class Glasses: NSObject, ObservableObject {
             note("上次是在握手途中退出的，这次不自动重连——请手动点一次眼镜，日志里会有崩溃现场")
             return
         }
-        guard let saved = UserDefaults.standard.string(forKey: "lastPeripheral"),
-              let id = UUID(uuidString: saved) else { return }
+        guard let id = savedGlassesID else { return }
         note("自动连接上次的眼镜 …")
         connect(id)
     }
+
+    private var savedGlassesID: UUID? {
+        UserDefaults.standard.string(forKey: "lastPeripheral").flatMap(UUID.init(uuidString:))
+    }
+
+    var hasSavedGlasses: Bool { savedGlassesID != nil }
+
+    func reconnectLastGlasses() {
+        guard let id = savedGlassesID else { startScan(); return }
+        connect(id)
+    }
+
+    var canUseGlasses: Bool { connected && ownerState == .verified && session != nil }
 
     // MARK: link bring-up
 
@@ -510,6 +524,17 @@ final class Glasses: NSObject, ObservableObject {
         connectionAttempt = nil
         retriedL2CAP = false
         ownerRegistrationCompleted = false
+        busy = false
+        settingsLoading = false
+        recording = false
+        recordDeadline = nil
+        autoStopTask?.cancel()
+        autoStopTask = nil
+        liveTicker?.invalidate()
+        liveTicker = nil
+        live = nil
+        assistantRef = nil
+        assistantOn = false
     }
 
     private func failConnection(_ reason: String, peripheral p: CBPeripheral) {
@@ -550,108 +575,149 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: capture
 
+    private func onGlassesQueue<T>(_ work: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            glassesQueue.async { continuation.resume(with: Result { try work() }) }
+        }
+    }
+
+    private func reportOperationError(_ error: Error, session active: Session) {
+        guard session === active else { return }
+        mediaMessage = Glasses.explain(error)
+        note("设备操作失败：\(error)")
+        if case LinkError.badMAC = error, let p = peripheral {
+            failConnection("连接数据校验失败，请重新连接眼镜。", peripheral: p)
+        }
+    }
+
+    private func withGlassesOperation<T>(_ action: @MainActor (Session) async throws -> T) async -> T? {
+        guard canUseGlasses, let active = session else {
+            mediaMessage = "请先连接眼镜并验证主人身份。"
+            return nil
+        }
+        guard !busy, !settingsLoading, live == nil, assistantRef == nil else {
+            mediaMessage = "眼镜正在处理其他操作，请稍后再试。"
+            return nil
+        }
+        busy = true
+        mediaMessage = nil
+        defer { if session === active { busy = false } }
+        do {
+            return try await action(active)
+        } catch {
+            reportOperationError(error, session: active)
+            return nil
+        }
+    }
+
+    private func checkActive(_ active: Session) throws {
+        guard session === active else { throw LinkError.io("眼镜连接已结束") }
+    }
+
+    private func updateCaptures(_ list: [Capture]) {
+        captures = list.sorted { ($0.timestampNS ?? 0) > ($1.timestampNS ?? 0) }
+        note("相册清单 \(list.count) 条")
+    }
+
     func loadCaptures() {
-        guard let sess = session else { note("先连接"); return }
-        busy = true
         Task {
-            defer { busy = false }
-            do {
-                let caps = try sess.captureList()
-                captures = caps.sorted { ($0.timestampNS ?? 0) > ($1.timestampNS ?? 0) }
-                note("清单 \(caps.count) 条")
-            } catch {
-                note("读清单失败：\(error)")
+            _ = await withGlassesOperation { active in
+                mediaMessage = "正在读取眼镜相册…"
+                let list = try await onGlassesQueue { try active.captureList() }
+                try checkActive(active)
+                updateCaptures(list)
+                mediaMessage = list.isEmpty ? "眼镜相册为空。" : nil
             }
         }
     }
 
-    /// Pulls one capture's best asset: the still for a photo, the first video asset otherwise.
     func fetch(_ captureItem: Capture, saveToLibrary: Bool) {
-        guard let sess = session else { note("先连接"); return }
-        let asset = captureItem.isPhoto
-            ? (captureItem.stills.first ?? captureItem.assets.first)
-            : (captureItem.assets.first { $0.type == 1 } ?? captureItem.assets.first)
+        Task {
+            _ = await withGlassesOperation { active in
+                try await downloadCapture(captureItem, from: active, save: saveToLibrary || !captureItem.isPhoto)
+            }
+        }
+    }
+
+    func importCapture(_ capture: Capture) async -> Bool {
+        await withGlassesOperation { active in
+            try await downloadCapture(capture, from: active, save: true)
+        } ?? false
+    }
+
+    private func downloadCapture(_ capture: Capture, from active: Session, save: Bool) async throws -> Bool {
+        let candidates = capture.isPhoto ? capture.stills : capture.assets.filter { $0.type == 1 }
+        let asset = candidates.max { $0.size < $1.size }
         guard let asset else {
-            note("这条没有可传的资产")
-            return
+            throw LinkError.unexpected("这条记录没有可导入的原文件")
         }
-        busy = true
+        let id = capture.id
+        progress[id] = 0
+        mediaMessage = "正在从眼镜导入…"
+        defer { progress.removeValue(forKey: id) }
+        let transfer = try await onGlassesQueue { [weak self] in
+            try active.requestAsset(handle: capture.handle, assetID: asset.uuid)
+            return try active.receiveFile(timeout: 300) { got, total in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.session === active, self.progress[id] != nil, total > 0 else { return }
+                    self.progress[id] = Double(got) / Double(total)
+                }
+            }
+        }
+        try checkActive(active)
+        guard let transfer else { throw LinkError.unexpected("眼镜没有发送文件") }
+        note("收到 \(transfer.name) \(transfer.size)B")
+        if capture.isPhoto {
+            lastPhoto = transfer.data
+            rememberThumb(id, transfer.data)
+        } else {
+            lastVideo = transfer.data
+            rememberVideoThumb(id, transfer.data)
+        }
+        guard save else {
+            mediaMessage = "文件已接收。"
+            return true
+        }
+        mediaMessage = "正在存入 iPhone 相册…"
+        try await persistCapture(transfer.data, isPhoto: capture.isPhoto)
+        mediaMessage = "已存入 iPhone 相册。"
+        return true
+    }
+
+    func snap() {
         Task {
-            defer { busy = false }
-            do {
-                note("拉取 \(captureItem.handle) / \(asset.uuid)（\(asset.size)B）")
-                try sess.requestAsset(handle: captureItem.handle, assetID: asset.uuid)
-                guard let transfer = try sess.receiveFile(timeout: 300, onBytes: { got, total in
-                    let id = captureItem.id
-                    DispatchQueue.main.async {
-                        if total > 0 { self.progress[id] = Double(got) / Double(total) }
-                    }
-                }) else {
-                    note("没收到文件（对端没发起传输）")
-                    return
-                }
-                note("收到 \(transfer.name) \(transfer.size)B")
-                rememberThumb(captureItem.id, transfer.data)
-                if transfer.data.prefix(2) == Data([0xFF, 0xD8]) {
-                    lastPhoto = transfer.data
-                    if saveToLibrary { saveToPhotos(transfer.data) }
-                } else {
-                    lastVideo = transfer.data
-                    note("视频已收到 \(transfer.size)B")
-                    // A video should land in the library and show a poster frame, not a
-                    // generic film icon — otherwise the album looks empty after importing.
-                    saveVideoToPhotos(transfer.data)
-                    rememberVideoThumb(captureItem.id, transfer.data)
-                }
-            } catch {
-                note("取文件失败：\(error)")
+            _ = await withGlassesOperation { active in
+                mediaMessage = "正在等待眼镜确认拍照…"
+                let cameraState = try await onGlassesQueue { try active.shutterPhoto() }
+                try checkActive(active)
+                status.camera = cameraState.camera
+                mediaMessage = "眼镜已确认拍照。可在相册中刷新并导入。"
+                note("眼镜确认拍照")
             }
         }
     }
 
-    /// Press the glasses' shutter, then pull whatever landed. The glasses take a
-    /// second or two to write the file, so this waits before asking for the list.
-    func snap() {        guard let sess = session else { note("先连接"); return }
-        busy = true
-        Task {
-            do {
-                try sess.shutterPhoto()
-                note("已按快门，等眼镜写文件…")
-                try? await Task.sleep(nanoseconds: 2_800_000_000)
-                busy = false
-                capture()
-            } catch {
-                busy = false
-                note("快门失败：\(error)")
-            }
-        }
-    }
-
-    /// Start or stop a recording through the same SNIntent path Visor uses.
-    /// On stop it waits for the file and pulls it, like the photo path.
     func toggleRecording() {
-        guard let sess = session else { note("先连接"); return }
-        let wasRecording = recording
-        busy = true
         Task {
-            do {
-                if wasRecording {
-                    try sess.stopVideo()
-                    note("已发停止录像，等眼镜收尾…")
-                    try? await Task.sleep(nanoseconds: 3_500_000_000)
-                    recording = false
-                    busy = false
-                    loadCaptures()
-                } else {
-                    try sess.startVideo()
-                    note("已发开始录像")
-                    recording = true
-                    busy = false
-                    scheduleAutoStop()
+            _ = await withGlassesOperation { active in
+                let stopping = recording
+                mediaMessage = stopping ? "正在等待眼镜确认停止录像…" : "正在等待眼镜确认开始录像…"
+                let cameraState = try await onGlassesQueue {
+                    try (stopping ? active.stopVideo() : active.startVideo())
                 }
-            } catch {
-                busy = false
-                note("录像控制失败：\(error)")
+                try checkActive(active)
+                status.camera = cameraState.camera
+                recording = !stopping
+                if stopping {
+                    autoStopTask?.cancel()
+                    autoStopTask = nil
+                    recordDeadline = nil
+                    mediaMessage = "眼镜已确认停止录像。可在相册中导入。"
+                } else {
+                    scheduleAutoStop()
+                    mediaMessage = nil
+                }
+                note(stopping ? "眼镜确认停止录像" : "眼镜确认开始录像")
             }
         }
     }
@@ -682,7 +748,7 @@ final class Glasses: NSObject, ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 guard let self else { return }
-                if Date() >= deadline {
+                if !Task.isCancelled, Date() >= deadline, !self.busy, !self.settingsLoading {
                     self.recordDeadline = nil
                     if self.recording {
                         self.note("到时限，自动停止录像")
@@ -695,44 +761,25 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     func capture() {
-        guard let sess = session else { note("先连接"); return }
-        busy = true
         Task {
-            defer { busy = false }
-            do {
-                let caps = try sess.captureList()
-                note("清单 \(caps.count) 条")
-                captures = caps.sorted { ($0.timestampNS ?? 0) > ($1.timestampNS ?? 0) }
-                guard let newest = caps.filter({ $0.isPhoto })
-                        .max(by: { ($0.timestampNS ?? 0) < ($1.timestampNS ?? 0) }),
-                      let still = newest.stills.first else {
-                    note("清单里没有照片资产")
-                    return
+            _ = await withGlassesOperation { active in
+                let list = try await onGlassesQueue { try active.captureList() }
+                try checkActive(active)
+                updateCaptures(list)
+                guard let newest = captures.first(where: { $0.isPhoto && !$0.stills.isEmpty }) else {
+                    throw LinkError.unexpected("眼镜相册里没有照片")
                 }
-                note("拉取 \(newest.handle) / \(still.uuid) (\(still.size)B)")
-                try sess.requestAsset(handle: newest.handle, assetID: still.uuid)
-                if let t = try sess.receiveFile() {
-                    lastPhoto = t.data
-                    note("收到 \(t.name) \(t.size)B")
-                    saveToPhotos(t.data)
-                } else {
-                    note("没收到文件（对端没发起传输）")
-                }
-            } catch {
-                note("取图失败：\(error)")
+                return try await downloadCapture(newest, from: active, save: true)
             }
         }
     }
 
     func refreshStatus() {
-        guard let sess = session else { note("先连接"); return }
         Task {
-            do {
-                let s = try sess.subscribeStatus()
-                status = s
-                if s.lines.isEmpty { note("状态：眼镜没回设备状态") }
-            } catch {
-                note("状态读取失败：\(error)")
+            _ = await withGlassesOperation { active in
+                let current = try await onGlassesQueue { try active.subscribeStatus() }
+                try checkActive(active)
+                status = current
             }
         }
     }
@@ -744,8 +791,8 @@ final class Glasses: NSObject, ObservableObject {
 
     /// svc15 registration: after this the glasses' own wake word routes to this app.
     func startAssistant() {
-        guard let sess = session else { note("先连接"); return }
-        guard assistantRef == nil else { return }
+        guard canUseGlasses, let sess = session, !busy, !settingsLoading,
+              !recording, live == nil, assistantRef == nil else { return }
         let a = Assistant(session: sess)
         a.log = { [weak self] line in self?.note("asst: \(line)") }
         a.onTurn = { [weak self] interaction in
@@ -779,17 +826,19 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     func stopAssistant() {
-        assistantRef?.stop()
+        guard let assistantRef else { return }
+        assistantRef.stop()
         assistantRef = nil
         assistantOn = false
+        disconnect()
         note("助手接管已关闭")
     }
 
     // MARK: live
 
     func startLive() {
-        guard let sess = session else { note("先连接"); return }
-        guard live == nil else { return }
+        guard canUseGlasses, let sess = session, !busy, !settingsLoading,
+              !recording, live == nil, assistantRef == nil else { return }
         let l = LiveStream(session: sess)
         l.log = { [weak self] line in self?.note("live: \(line)") }
         l.onPhase = { [weak self] phase in
@@ -801,7 +850,7 @@ final class Glasses: NSObject, ObservableObject {
             if let img = UIImage(data: photo.data) {
                 self.lastPhoto = photo.data
                 self.saveToPhotos(photo.data)
-                self.note("live 快照 \(photo.data.count)B 已存相册")
+                self.note("接收取景快照 \(photo.data.count)B")
                 _ = img
             } else {
                 self.note("live 快照 \(photo.data.count)B，系统解不了（\(photo.isHeic ? "HEIC" : "未知")）")
@@ -818,11 +867,13 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     func stopLive() {
+        guard let live else { return }
         liveTicker?.invalidate()
         liveTicker = nil
-        live?.stop()
-        live = nil
+        live.stop()
+        self.live = nil
         liveLine = "—"
+        disconnect()
     }
 
     func shareVideo() {
@@ -873,43 +924,34 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     private func saveToPhotos(_ data: Data) {
-        PHPhotoLibrary.requestAuthorization { [weak self] status in
-            guard status == .authorized || status == .limited else {
-                Task { @MainActor in self?.note("没有相册权限，照片只在 app 内") }
-                return
-            }
-            PHPhotoLibrary.shared().performChanges {
-                let req = PHAssetCreationRequest.forAsset()
-                req.addResource(with: .photo, data: data, options: nil)
-            } completionHandler: { ok, err in
-                let msg = ok ? "已存到相册" : "存相册失败：\(err?.localizedDescription ?? "?")"
-                Task { @MainActor in self?.note(msg) }
+        Task {
+            do {
+                try await persistCapture(data, isPhoto: true)
+            } catch {
+                note("存相册失败：\(error)")
             }
         }
     }
 
-    /// Videos go to the library the same way photos do, so importing a clip ends with
-    /// something you can actually watch in Photos instead of a file only this app knows.
-    private func saveVideoToPhotos(_ data: Data) {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("import-\(Int(Date().timeIntervalSince1970)).mp4")
-        do { try data.write(to: url) } catch {
-            note("写临时视频失败：\(error)")
-            return
+    private func persistCapture(_ data: Data, isPhoto: Bool) async throws {
+        let authorization = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        guard authorization == .authorized || authorization == .limited else {
+            throw LinkError.io("请允许 GlassesLink 添加到 iPhone 相册。")
         }
-        PHPhotoLibrary.requestAuthorization { [weak self] status in
-            guard status == .authorized || status == .limited else {
-                Task { @MainActor in self?.note("没有相册权限，视频只在 app 内") }
-                return
+        if isPhoto {
+            try await PHPhotoLibrary.shared().performChanges {
+                PHAssetCreationRequest.forAsset().addResource(with: .photo, data: data, options: nil)
             }
-            PHPhotoLibrary.shared().performChanges {
-                let req = PHAssetCreationRequest.forAsset()
-                req.addResource(with: .video, fileURL: url, options: nil)
-            } completionHandler: { ok, err in
-                let msg = ok ? "视频已存到相册" : "视频存相册失败：\(err?.localizedDescription ?? "?")"
-                Task { @MainActor in self?.note(msg) }
+        } else {
+            let file = FileManager.default.temporaryDirectory
+                .appendingPathComponent("import-\(UUID().uuidString).mp4")
+            defer { try? FileManager.default.removeItem(at: file) }
+            try await onGlassesQueue { try data.write(to: file, options: .atomic) }
+            try await PHPhotoLibrary.shared().performChanges {
+                PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: file, options: nil)
             }
         }
+        note("已保存到 iPhone 相册")
     }
 
     /// Poster frame for a clip, using the first decodable frame.
@@ -1130,12 +1172,12 @@ final class Glasses: NSObject, ObservableObject {
 
     /// Reads the whole settings namespace once and keeps it keyed by setting name.
     func loadSettings() {
-        guard let sess = session, connected else {
-            note("先连接眼镜，再读设置")
+        guard canUseGlasses, let sess = session, !busy, !settingsLoading,
+              live == nil, assistantRef == nil else {
             return
         }
         settingsLoading = true
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        glassesQueue.async { [weak self] in
             do {
                 let objects = try sess.driveObjects()
                 var map: [String: String] = [:]
@@ -1143,16 +1185,16 @@ final class Glasses: NSObject, ObservableObject {
                     map[object.uri] = object.data
                 }
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    guard let self, self.session === sess else { return }
                     self.settings = map
                     self.settingsLoading = false
                     self.note("设置：读到 \(map.count) 项")
                 }
             } catch {
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    guard let self, self.session === sess else { return }
                     self.settingsLoading = false
-                    self.note("设置读取失败：\(error)")
+                    self.reportOperationError(error, session: sess)
                 }
             }
         }
@@ -1160,13 +1202,15 @@ final class Glasses: NSObject, ObservableObject {
 
     /// Writes one setting and only reports success if the read-back agrees.
     func writeSetting(_ key: String, _ value: String) {
-        guard let sess = session, connected else {
+        guard canUseGlasses, let sess = session, !busy, !settingsLoading,
+              live == nil, assistantRef == nil else {
             note("先连接眼镜，再改设置")
             return
         }
         note("写 \(key) = \(value)")
         let schema = SettingsSchemaTable.schema(key)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        settingsLoading = true
+        glassesQueue.async { [weak self] in
             do {
                 // Firmware-parsed settings go over svc31; the rest live in RLDrive.
                 // Either way the write is only trusted once a read comes back equal.
@@ -1183,7 +1227,8 @@ final class Glasses: NSObject, ObservableObject {
                     ok = try sess.driveWrite(key: key, value: value)
                 }
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    guard let self, self.session === sess else { return }
+                    self.settingsLoading = false
                     if ok {
                         self.settings[key] = value
                         self.note("\(key) 已生效")
@@ -1193,8 +1238,9 @@ final class Glasses: NSObject, ObservableObject {
                 }
             } catch {
                 DispatchQueue.main.async {
-                    guard let self else { return }
-                    self.note("写 \(key) 失败：\(error)")
+                    guard let self, self.session === sess else { return }
+                    self.settingsLoading = false
+                    self.reportOperationError(error, session: sess)
                 }
             }
         }

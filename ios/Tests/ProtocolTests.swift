@@ -131,6 +131,33 @@ final class ProtocolTests: XCTestCase {
 
     // MARK: - DataX
 
+    func testDataXDecodesConsecutiveMessagesFromSlice() throws {
+        let first = DataX.message(0x0007, tags: [DataX.tag(2, 6, last: true)],
+                                  payload: Data([0x20, 0x30]))
+        let second = DataX.status(0x0006, AirShield.stSuccess)
+        let prefix = Data(repeating: 0, count: 16)
+        let frame = (prefix + first + second).dropFirst(prefix.count)
+        XCTAssertGreaterThan(frame.startIndex, 0)
+
+        let messages = try DataX.parseMessages(frame, requireComplete: true)
+        XCTAssertEqual(messages.count, 2)
+        XCTAssertEqual(messages.map(\.channel), [0x0007, 0x0006])
+        XCTAssertEqual(messages.map(\.consumed), [first.count, second.count])
+        XCTAssertEqual(messages.first?.type, 6)
+        XCTAssertEqual(messages.first?.payload, Data([0x20, 0x30]))
+        XCTAssertEqual(messages.last?.error, Int(AirShield.stSuccess))
+    }
+
+    func testDataXKeepsCompleteMessageBeforePartialTail() throws {
+        let first = DataX.status(0x0007, AirShield.stSuccess)
+        let second = DataX.status(0x0006, AirShield.stSuccess)
+        let frame = first + second.dropLast()
+
+        let messages = try DataX.parseMessages(frame)
+        XCTAssertEqual(messages.map(\.channel), [0x0007])
+        XCTAssertThrowsError(try DataX.parseMessages(frame, requireComplete: true))
+    }
+
     func testDataXFrameMatchesReference() {
         // pi: dx_message(0x8002, [dx_tag(1, 31, False), dx_tag(2, 2, True)])
         let frame = DataX.message(0x8002, tags: [DataX.tag(1, 31, last: false),
@@ -234,6 +261,13 @@ final class ProtocolTests: XCTestCase {
     }
 
     // MARK: - camera shutter
+
+    func testCameraStateCodesMatchShutterConfirmations() {
+        XCTAssertEqual(Status.cameraCode(PB.uint(3, 1)), Status.photoStarted)
+        XCTAssertEqual(Status.cameraCode(PB.uint(3, 2)), Status.videoStarted)
+        XCTAssertNotEqual(Status.cameraCode(PB.uint(3, 3)), Status.videoStarted)
+        XCTAssertNil(Status.cameraCode(PB.uint(6, 1)))
+    }
 
     func testPhotoIntentStructure() throws {
         let fields = try PB.parse(Shutter.photoPayload())

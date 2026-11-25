@@ -279,6 +279,9 @@ final class Session {
     static let airCheck: UInt16 = 5
     static let airComplete: UInt16 = 6
     static let airDrop: UInt16 = 7
+    static let airRemoved: UInt16 = 8
+    static let airStopped: UInt16 = 11
+    static let airOfferMultiscope: UInt16 = 12
 
     static let svcSettings = 31
     static let mtSyncData: UInt16 = 2
@@ -306,8 +309,11 @@ final class Session {
     var multikey = true
     var log: (String) -> Void = { _ in }
 
+    private let logLock = NSLock()
     private var verboseLines = 0
 
+    private let sendLock = NSLock()
+    private let receiveLock = NSLock()
     private var send: Direction?
     private var recv: Direction?
     /// Plausible receive-direction keys, built at handshake time and resolved by the
@@ -316,6 +322,7 @@ final class Session {
     private var rxSolved = false
     private var ivSolved = false
     private var rxIVs: [Data] = []
+    private var decodedMessages: ArraySlice<DataX.Message> = []
     private var pendingSetupMessages: [DataX.Message] = []
 
     static func uniqueIVs(_ list: [Data]) -> [Data] {
@@ -327,7 +334,7 @@ final class Session {
     private var channels: [UInt16: String] = [:]
     private var idChannel: UInt16?
     private var idFirst = true
-    private var statusFirst = true
+    private var statusSubscribed = false
     private var settingsFirst = true
     private var peerPubkey = Data()
     private var binding = Data()
@@ -346,12 +353,11 @@ final class Session {
     private func emit(_ s: String, _ data: Data? = nil, inbound: Bool = false) {
         var line = "\(inbound ? "<-" : "->") \(s)"
         if let d = data {
-            if Session.verbose, verboseLines < 60 {
-                verboseLines += 1
-                line += " (\(d.count)B) \(d.hexCapped)"
-            } else {
-                line += " (\(d.count)B) \(d.hexShort)"
-            }
+            logLock.lock()
+            let verbose = Session.verbose && verboseLines < 60
+            if verbose { verboseLines += 1 }
+            logLock.unlock()
+            line += " (\(d.count)B) \(verbose ? d.hexCapped : d.hexShort)"
         }
         log(line)
     }
@@ -367,6 +373,8 @@ final class Session {
     }
 
     private func sendAny(_ data: Data) throws {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         if let s = send {
             emit("sealed", data)
             try stream.write(try s.seal(data))
@@ -444,56 +452,76 @@ final class Session {
             && message.type == 0x1000 && message.error == nil
     }
 
+    private func openFrame(_ sdu: Data) throws -> Data {
+        guard let receiver = recv else { return sdu }
+        if let plain = try? receiver.open(sdu) {
+            rxSolved = true
+            return plain
+        }
+        if !rxSolved, let hit = Self.firstWorkingCandidate(sdu, options: rxOptions) {
+            recv = hit.dir
+            rxSolved = true
+            emit("rx key = \(hit.label)", nil, inbound: true)
+            return hit.plain
+        }
+        emit("decrypt FAILED (bad MAC on \(sdu.count)B)", sdu, inbound: true)
+        throw LinkError.badMAC
+    }
+
+    private func parseFrame(_ plain: Data, requireComplete: Bool = false) throws -> [DataX.Message] {
+        let messages = try DataX.parseMessages(plain, requireComplete: requireComplete)
+        var remaining = plain
+        for msg in messages {
+            emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
+                 remaining.prefix(msg.consumed), inbound: true)
+            remaining = remaining.dropFirst(msg.consumed)
+        }
+        if !remaining.isEmpty {
+            emit("ignored \(remaining.count)B after complete DataX messages", nil, inbound: true)
+        }
+        return messages
+    }
+
+    private func decodeFrame(_ sdu: Data) throws -> [DataX.Message] {
+        let plain = try openFrame(sdu)
+        do {
+            let messages = try parseFrame(plain)
+            if recv != nil { ivSolved = true }
+            return messages
+        } catch {
+            // The first frame's MAC covers ciphertext, not the IV. Test alternate IVs
+            // against that same authenticated frame without changing the live CBC state.
+            if !ivSolved, let receiver = recv {
+                for iv in rxIVs {
+                    let keys = AirShield.Keys(aes: receiver.aes, hmac: receiver.hmac,
+                                              iv: iv, macWord: receiver.macWord)
+                    let candidate = Direction(keys, seq: receiver.seq &- 1)
+                    if let rebuilt = try? candidate.open(sdu),
+                       let messages = try? parseFrame(rebuilt, requireComplete: true) {
+                        ivSolved = true
+                        emit("rx IV solved after a garbled first frame", nil, inbound: true)
+                        return messages
+                    }
+                }
+            }
+            emit("parse FAILED (\(error)) — skipping this frame", plain, inbound: true)
+            return []
+        }
+    }
+
     private func recvMessage(timeout: TimeInterval, includePending: Bool = true) throws -> DataX.Message {
+        let deadline = Date().addingTimeInterval(timeout)
+        receiveLock.lock()
+        defer { receiveLock.unlock() }
         if includePending, !pendingSetupMessages.isEmpty {
             return pendingSetupMessages.removeFirst()
         }
         while true {
-            let sdu = try stream.nextFrame(timeout: timeout)
-            var plain: Data
-            if let r = recv {
-                if let opened = try? r.open(sdu) {
-                    plain = opened
-                } else if !rxSolved, let hit = Self.firstWorkingCandidate(sdu, options: rxOptions) {
-                    // The frame nominate its own key: its HMAC verifies under exactly one
-                    // combination, and from then on the session keeps that one.
-                    recv = hit.dir
-                    rxSolved = true
-                    plain = hit.plain
-                    emit("rx key = \(hit.label)", nil, inbound: true)
-                } else {
-                    // A decrypt failure is the single most common real-device symptom, so
-                    // keep the raw bytes: they tell us whether the keys disagree or the
-                    // framing is off by a byte.
-                    emit("decrypt FAILED (bad MAC on \(sdu.count)B)", sdu, inbound: true)
-                    throw LinkError.badMAC
-                }
-            } else {
-                plain = sdu
+            guard let msg = decodedMessages.popFirst() else {
+                let sdu = try stream.nextFrame(timeout: max(0, deadline.timeIntervalSinceNow))
+                decodedMessages = try decodeFrame(sdu)[...]
+                continue
             }
-            var msg: DataX.Message
-            do {
-                msg = try DataX.parse(plain)
-            } catch {
-                // A structurally valid MAC with garbage plaintext means the key is right and the
-                // IV is not. Try the other candidates before declaring failure — this is the
-                // difference between "silent 12 s timeout" and a working link.
-                if !ivSolved, let r = recv,
-                   let hit = r.openTryingIVs(sdu, ivs: rxIVs),
-                   let rebuilt = try? DataX.parse(AirShieldPad.unpad(hit.plain)) {
-                    ivSolved = true
-                    emit("rx IV solved (\(hit.iv.hexShort)) after a garbled first frame", nil, inbound: true)
-                    msg = rebuilt
-                } else {
-                    // A short or garbled frame is not fatal: the glasses split long replies across
-                    // frames, so a 16-byte piece can be the tail of something bigger. Log it and
-                    // keep reading instead of tearing the handshake down.
-                    emit("parse FAILED (\(error)) — skipping this frame", plain, inbound: true)
-                    continue
-                }
-            }
-            emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
-                 plain, inbound: true)
 
             // The glasses start EndLinkSetup; the answer is a bare 0x1000 status on the
             // mirror channel. Callers never see this message.
@@ -921,50 +949,69 @@ final class Session {
 
     // MARK: svc18 captures
 
+    private var requestedCaptureAsset: UUID?
+
     func captureList(timeout: TimeInterval = 15) throws -> [Capture] {
-        let ch = allocChannel("captures")
-        try sendAny(DataX.message(ch, tags: [DataX.tag(1, UInt16(Self.svcCaptures), last: false),
-                                             DataX.tag(2, Self.capEnum, last: true)]))
+        let ch = serviceChannel("captures", service: Self.svcCaptures)
+        let mirror = ch ^ 0x8000
+        try sendOnService("captures", service: Self.svcCaptures, type: Self.capEnum)
         var out: [Capture] = []
+        var lastType: Int?
         let deadline = Date().addingTimeInterval(timeout)
         while true {
             let left = deadline.timeIntervalSinceNow
             if left <= 0 { throw LinkError.unexpected("capture enumeration did not finish") }
             let m = try recvMessage(timeout: left)
-            if m.channel != ch { continue }
-            guard let t = m.type else { continue }
-            if UInt16(t) == Self.capEnd { return out }
-            if UInt16(t) == Self.capRecord, let cap = Self.parseCapture(m.payload) {
+            guard m.channel == mirror else { continue }
+            if let code = m.error {
+                guard code == Int(AirShield.stSuccess) || code == Int(AirShield.stOK) else {
+                    throw LinkError.serviceError("capture enumeration", UInt16(truncatingIfNeeded: code))
+                }
+                continue
+            }
+            if let type = m.type { lastType = type }
+            if lastType == Int(Self.capEnd) { return out }
+            if lastType == Int(Self.capRecord), let cap = Self.parseCapture(m.payload) {
                 out.append(cap)
             }
         }
     }
 
     func requestAsset(handle: String, assetID: String) throws {
-        guard let ch = channel(named: "captures") else { throw LinkError.unexpected("no capture channel") }
         let payload = Data("\(handle):\(assetID)".utf8)
-        try sendAny(DataX.message(ch, tags: [DataX.tag(1, UInt16(Self.svcCaptures), last: false),
-                                             DataX.tag(2, Self.capRequestAsset, last: true)],
-                                  payload: payload))
+        try sendOnService("captures", service: Self.svcCaptures, type: Self.capRequestAsset, payload: payload)
+        requestedCaptureAsset = UUID(uuidString: assetID)
     }
 
     static func parseCapture(_ body: Data) -> Capture? {
         let b = [UInt8](body)
         do {
             let root = try FB.root(b)
-            let handle = try FB.string(b, root, 4) ?? ""
-            let kind = try FB.scalar(b, root, 8)
+            let wrapped = try FB.table(b, root, 0)
+            let info = wrapped ?? root
+            // Wire vtable slots are byte offsets. Older direct records use field indices.
+            let slot: (Int) -> Int = wrapped == nil ? { $0 } : { ($0 - 4) / 2 }
+            guard let handle = try FB.string(b, info, slot(4)), !handle.isEmpty else { return nil }
+            let kind = try FB.scalar(b, info, slot(8))
             var ts: Int?
-            if let meta = try FB.table(b, root, 12) { ts = try FB.scalar(b, meta, 4) }
+            if let meta = try FB.table(b, info, slot(12)) {
+                let offset = try FB.fieldOffset(b, meta, slot(4))
+                if offset != 0 {
+                    let time = meta + offset
+                    let low = UInt64(try FB.u32(b, time))
+                    let high = wrapped == nil ? 0 : UInt64((try? FB.u32(b, time + 4)) ?? 0)
+                    ts = Int(exactly: high << 32 | low)
+                }
+            }
             var assets: [CaptureAsset] = []
-            for a in try FB.tableVector(b, root, 10) {
-                let word = try FB.scalar(b, a, 6)
-                assets.append(CaptureAsset(uuid: try FB.string(b, a, 4) ?? "",
+            for a in try FB.tableVector(b, info, slot(10)) {
+                guard let uuid = try FB.string(b, a, slot(4)), !uuid.isEmpty else { continue }
+                let word = try FB.scalar(b, a, slot(6))
+                assets.append(CaptureAsset(uuid: uuid,
                                            type: word & 0xFF,
                                            delivered: word & 0x100000 != 0,
-                                           size: try FB.scalar(b, a, 12)))
+                                            size: try FB.scalar(b, a, slot(12))))
             }
-            guard !handle.isEmpty else { return nil }
             return Capture(handle: handle, kind: kind, timestampNS: ts, assets: assets)
         } catch {
             return nil
@@ -975,42 +1022,70 @@ final class Session {
 
     struct Transfer { let name: String; let size: Int; let data: Data }
 
-    /// Serves exactly one incoming file. Every offer must be answered with type 7
-    /// (drop), even when we keep the bytes — skipping it stalls the glasses' queue.
+    /// The glasses open the transfer channel. Cursor and Drop use its mirror.
     func receiveFile(timeout: TimeInterval = 120, onBytes: ((Int, Int) -> Void)? = nil) throws -> Transfer? {
-        let ch = allocChannel("airship")
-        var name = "capture.bin"
+        let wantedID = requestedCaptureAsset.map { asset in withUnsafeBytes(of: asset.uuid) { Data($0) } }
+        requestedCaptureAsset = nil
+        var offer: (channel: UInt16, id: Data, name: String, size: Int)?
+        var lastType: Int?
         var buf = Data()
-        var total = 0
+        var checksum: UInt32 = 1
         let deadline = Date().addingTimeInterval(timeout)
         while true {
             let left = deadline.timeIntervalSinceNow
             if left <= 0 { throw LinkError.unexpected("file transfer did not complete") }
             let m = try recvMessage(timeout: left)
-            if m.channel != ch { continue }
-            guard let t = m.type else { continue }
-            switch UInt16(t) {
-            case Self.airOffer:
+            guard m.channel & 0x8000 != 0, m.error == nil else { continue }
+            let mirror = m.channel ^ 0x8000
+            if m.service == Self.svcAirship,
+               m.type == Int(Self.airOffer) || m.type == Int(Self.airOfferMultiscope) {
                 let f = try PB.parse(m.payload)
-                if let n = f[4]?.first as? Data { name = String(decoding: n, as: UTF8.self) }
-                if let s = f[2]?.first as? UInt64 { total = Int(s) }
-                // cursor {1: offset, 2: adler32} — zeros for the start of a file
-                try sendAny(DataX.message(ch, tags: [DataX.tag(1, UInt16(Self.svcAirship), last: false),
-                                                     DataX.tag(2, Self.airCursor, last: true)],
-                                          payload: PB.uint(1, 0) + PB.uint(2, 0)))
+                let id = f[1]?.first as? Data ?? Data()
+                let size = f[2]?.first as? Int ?? 0
+                let namespace = String(decoding: f[3]?.first as? Data ?? Data(), as: UTF8.self)
+                guard offer == nil || (offer?.channel == m.channel && offer?.id == id),
+                      id.count == 16, size >= 0, namespace == "namespace_media",
+                      wantedID == nil || wantedID == id else {
+                    try sendAirshipReply(Self.airDrop, on: mirror, payload: PB.bytes(1, id))
+                    continue
+                }
+                let name = f[4]?.first as? Data
+                offer = (m.channel, id, name.map { String(decoding: $0, as: UTF8.self) } ?? "capture.bin", size)
+                lastType = m.type
+                buf.removeAll(keepingCapacity: true)
+                checksum = 1
+                try sendAirshipReply(Self.airCursor, on: mirror, payload: PB.uint(2, 1))
+                continue
+            }
+            guard let offer, m.channel == offer.channel else { continue }
+            if let type = m.type { lastType = type }
+            guard let t = lastType else { continue }
+            switch UInt16(t) {
             case Self.airData:
+                guard m.payload.count <= offer.size - buf.count else {
+                    try sendAirshipReply(Self.airDrop, on: mirror, payload: PB.bytes(1, offer.id))
+                    throw LinkError.unexpected("file data exceeds the offered size")
+                }
                 buf.append(m.payload)
-                onBytes?(buf.count, max(total, buf.count))
+                checksum = Self.updateAdler32(checksum, with: m.payload)
+                onBytes?(buf.count, offer.size)
             case Self.airCheck:
-                try sendAny(DataX.message(ch, tags: [DataX.tag(1, UInt16(Self.svcAirship), last: false),
-                                                     DataX.tag(2, Self.airCursor, last: true)],
-                                          payload: PB.uint(1, UInt64(buf.count)) +
-                                                   PB.uint(2, UInt64(Self.adler32(buf)))))
+                let offset = buf.isEmpty ? Data() : PB.uint(1, UInt64(buf.count))
+                try sendAirshipReply(Self.airCursor, on: mirror, payload: offset + PB.uint(2, UInt64(checksum)))
             case Self.airComplete:
-                try sendAny(DataX.message(ch, tags: [DataX.tag(1, UInt16(Self.svcAirship), last: false),
-                                                     DataX.tag(2, Self.airDrop, last: true)]))
-                return Transfer(name: name, size: buf.count, data: buf)
-            case Self.airReset, Self.airDrop:
+                let fields = try? PB.parse(m.payload)
+                let size = fields?[1]?.first as? Int ?? 0
+                let adler = fields?[2]?.first as? Int
+                try sendAirshipReply(Self.airDrop, on: mirror, payload: PB.bytes(1, offer.id))
+                guard fields != nil, size == offer.size, size == buf.count, adler == Int(checksum) else {
+                    throw LinkError.unexpected("file size or checksum did not match")
+                }
+                return Transfer(name: offer.name, size: size, data: buf)
+            case Self.airReset:
+                buf.removeAll(keepingCapacity: true)
+                checksum = 1
+                onBytes?(0, offer.size)
+            case Self.airDrop, Self.airRemoved, Self.airStopped:
                 throw LinkError.unexpected("transfer aborted by the glasses (\(t))")
             default:
                 continue
@@ -1018,8 +1093,17 @@ final class Session {
         }
     }
 
+    private func sendAirshipReply(_ type: UInt16, on channel: UInt16, payload: Data) throws {
+        try sendAny(DataX.message(channel, tags: [DataX.tag(2, type, last: true)], payload: payload))
+    }
+
     static func adler32(_ data: Data) -> UInt32 {
-        var a: UInt32 = 1, b: UInt32 = 0
+        updateAdler32(1, with: data)
+    }
+
+    private static func updateAdler32(_ checksum: UInt32, with data: Data) -> UInt32 {
+        var a = checksum & 0xFFFF
+        var b = checksum >> 16
         for byte in data {
             a = (a + UInt32(byte)) % 65521
             b = (b + a) % 65521
@@ -1090,31 +1174,56 @@ final class Session {
 
     private func statusChannel() -> UInt16 { channel(named: "status") ?? allocChannel("status") }
 
+    private func isDeviceStatus(_ message: DataX.Message, channel: UInt16) -> Bool {
+        guard let type = message.type, Status.isStateType(type), message.error == nil else { return false }
+        if let service = message.service { return service == Status.service }
+        return message.channel == (channel ^ 0x8000)
+    }
+
     /// Subscribes (or re-asks on the existing channel) and merges pushes until the snapshot has
     /// battery and storage, or the timeout runs out.
     func subscribeStatus(timeout: TimeInterval = 4) throws -> GlassesState {
         let ch = statusChannel()
-        var tags: [Data] = []
-        if statusFirst {
-            tags.append(DataX.tag(1, UInt16(Status.service), last: false))
-            statusFirst = false
-        }
-        tags.append(DataX.tag(2, Status.mtInit, last: true))
-        try sendAny(DataX.message(ch, tags: tags, payload: Status.subscribePayload()))
+        try sendOnService("status", service: Status.service, type: Status.mtInit, payload: Status.subscribePayload())
+        statusSubscribed = true
 
         var state = GlassesState()
         let deadline = Date().addingTimeInterval(timeout)
         while true {
             let left = deadline.timeIntervalSinceNow
             if left <= 0 { break }
-            let m = try recvMessage(timeout: left)
-            if m.channel != ch { continue }
-            guard let type = m.type, Status.isStateType(type) else { continue }
+            let m: DataX.Message
+            do { m = try recvMessage(timeout: left) } catch LinkError.unexpected(_) { break }
+            guard isDeviceStatus(m, channel: ch) else { continue }
             Status.merge(m.payload, into: &state)
             if state.batteryPercent != nil && state.storageFreeMb != nil { break }
         }
         emit("status: \(state.lines.joined(separator: " / "))")
         return state
+    }
+
+    func confirmedShutter(_ payload: Data, matching confirmed: (Int) -> Bool) throws -> GlassesState {
+        if !statusSubscribed { _ = try subscribeStatus(timeout: 2) }
+        let ch = statusChannel()
+        try sendOnService("status", service: Shutter.service, type: Shutter.mtSnIntent, payload: payload)
+
+        let deadline = Date().addingTimeInterval(5)
+        var state = GlassesState()
+        while deadline.timeIntervalSinceNow > 0 {
+            let message: DataX.Message
+            do { message = try recvMessage(timeout: deadline.timeIntervalSinceNow) }
+            catch LinkError.unexpected(_) { break }
+            if message.channel == (ch ^ 0x8000), let code = message.error,
+               code != Int(AirShield.stOK), code != Int(AirShield.stSuccess) {
+                throw LinkError.serviceError("拍摄请求", UInt16(truncatingIfNeeded: code))
+            }
+            guard isDeviceStatus(message, channel: ch) else { continue }
+            Status.merge(message.payload, into: &state)
+            guard let camera = Status.cameraCode(message.payload) else { continue }
+            if camera == 4 || camera == 6 { throw LinkError.unexpected("眼镜报告拍摄失败") }
+            if confirmed(camera) { return state }
+        }
+        throw LinkError.unexpected("眼镜没有确认拍摄状态")
     }
 
     // MARK: svc31 settings (write-only)

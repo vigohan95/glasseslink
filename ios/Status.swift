@@ -7,9 +7,16 @@ enum Status {
     static let mtInit: UInt16 = 1000
     static let mtDeviceStateStart = 2005
     static let subscriptionDeviceState: UInt64 = 1
+    static let photoStarted = 1
+    static let videoStarted = 2
 
     /// Types that carry a DeviceState (the snapshot 2005 and the per-field pushes after it).
-    static func isStateType(_ type: Int) -> Bool { (2005 ... 2044).contains(type) }
+    static func isStateType(_ type: Int) -> Bool { (2005 ... 2044).contains(type) && type != 2038 }
+
+    static func cameraCode(_ payload: Data) -> Int? {
+        guard let fields = try? PB.parse(payload) else { return nil }
+        return fields[3]?.first as? Int
+    }
 
     static func subscribePayload() -> Data {
         // Field 1 is written as a length-delimited blob holding the varint, which is what the glasses accept.
@@ -51,11 +58,13 @@ enum Status {
 
     static func cameraName(_ value: Int) -> String {
         switch value {
-        case 0: return "IDLE"
-        case 1: return "OPEN"
-        case 2: return "CLOSED"
-        case 3: return "RECORDING"
-        case 4: return "STREAMING"
+        case 0: return "空闲"
+        case photoStarted: return "拍照中"
+        case videoStarted: return "录像中"
+        case 3: return "拍摄完成"
+        case 4, 6: return "拍摄失败"
+        case 5, 10: return "就绪"
+        case 7 ... 9: return "取景中"
         default: return "STATE \(value)"
         }
     }

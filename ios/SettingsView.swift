@@ -1,44 +1,48 @@
 import SwiftUI
 
-/// The glasses' own settings, read straight out of svc33 and written back the way another
-/// replica would: present a newer version, then read it back.
 struct SettingsView: View {
     @ObservedObject var g: Glasses
     @Environment(\.dismiss) private var dismiss
     @State private var filter = ""
     @State private var editing: SettingInfo?
     @State private var draft = ""
+    @State private var rangeDrafts: [String: Double] = [:]
 
-    private var groups: [String] {
-        guard !filter.isEmpty else { return SettingsCatalog.groups }
-        let needle = filter.lowercased()
-        return SettingsCatalog.groups.filter { group in
-            group.lowercased().contains(needle) || SettingsCatalog.inGroup(group).contains {
-                $0.key.contains(needle) || $0.name.lowercased().contains(needle)
-            }
-        }
+    private func settings(in group: String) -> [SettingInfo] {
+        let options = SettingsCatalog.inGroup(group)
+        let query = filter.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty || group.localizedCaseInsensitiveContains(query) { return options }
+        return options.filter { $0.key.localizedCaseInsensitiveContains(query) || $0.name.localizedCaseInsensitiveContains(query) }
     }
 
     var body: some View {
         NavigationStack {
             List {
-                if SettingsCatalog.all.isEmpty {
-                    Text("settings_ui.json 没有打进 app 包里").foregroundStyle(.secondary)
-                }
-                ForEach(groups, id: \.self) { group in
-                    Section(group) {
-                        ForEach(SettingsCatalog.inGroup(group)) { info in
-                            row(info)
+                if !g.canUseGlasses {
+                    Text("连接眼镜并验证主人身份后可修改设置。")
+                        .foregroundStyle(.secondary)
+                } else if SettingsCatalog.all.isEmpty {
+                    Text("当前没有可用的设置目录。").foregroundStyle(.secondary)
+                } else {
+                    ForEach(SettingsCatalog.groups, id: \.self) { group in
+                        let options = settings(in: group)
+                        if !options.isEmpty {
+                            Section(group) {
+                                ForEach(options) { info in
+                                    row(info)
+                                }
+                            }
+                            .disabled(g.settingsLoading || g.busy)
                         }
                     }
                 }
             }
             .searchable(text: $filter, prompt: "搜索设置")
-            .navigationTitle("眼镜设置")
+            .navigationTitle("高级眼镜设置")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button(g.settingsLoading ? "读取中…" : "读取") { g.loadSettings() }
-                        .disabled(g.settingsLoading || !g.connected)
+                        .disabled(!g.canUseGlasses || g.settingsLoading || g.busy)
                 }
                 ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } }
             }
@@ -48,7 +52,7 @@ struct SettingsView: View {
             )) {
                 TextField("值", text: $draft)
                 Button("写入") {
-                    if let info = editing { g.writeSetting(info.key, draft) }
+                    if g.canUseGlasses, let info = editing { g.writeSetting(info.key, draft) }
                     editing = nil
                 }
                 Button("取消", role: .cancel) { editing = nil }
@@ -63,13 +67,20 @@ struct SettingsView: View {
         let raw = g.settings[info.key]
         switch info.control.type {
         case "toggle":
-            // A value the glasses never reported must not look like "off" — that is how Visor
-            // left people staring at locked-looking switches. Say we don't know, still allow a write.
-            Toggle(isOn: Binding(
-                get: { raw == "true" },
-                set: { g.writeSetting(info.key, $0 ? "true" : "false") }
-            )) {
-                label(info, value: raw == nil ? "未读取" : nil)
+            if let raw, raw == "true" || raw == "false" {
+                Toggle(isOn: Binding(
+                    get: { g.settings[info.key] == "true" },
+                    set: { g.writeSetting(info.key, $0 ? "true" : "false") }
+                )) {
+                    label(info, value: nil)
+                }
+            } else {
+                Menu {
+                    Button("设为开启") { g.writeSetting(info.key, "true") }
+                    Button("设为关闭") { g.writeSetting(info.key, "false") }
+                } label: {
+                    label(info, value: "未读取")
+                }
             }
         case "choice":
             Menu {
@@ -84,13 +95,23 @@ struct SettingsView: View {
                 }
             }
         case "range":
+            let minimum = info.control.min ?? 0
+            let maximum = info.control.max ?? 1
+            let step = info.control.step ?? 0.1
             VStack(alignment: .leading, spacing: 4) {
-                label(info, value: SettingsCatalog.shown(info, raw))
-                Slider(value: Binding(
-                    get: { Double(raw ?? "") ?? info.control.min ?? 0 },
-                    set: { g.writeSetting(info.key, String(format: "%g", $0)) }
-                ), in: (info.control.min ?? 0) ... (info.control.max ?? 1),
-                   step: info.control.step ?? 0.1)
+                label(info, value: rangeDrafts[info.key].map { String(format: "%g", $0) } ?? SettingsCatalog.shown(info, raw))
+                if let raw, let value = Double(raw), minimum < maximum, step > 0,
+                   (minimum ... maximum).contains(value) {
+                    Slider(value: Binding(
+                        get: { rangeDrafts[info.key] ?? value },
+                        set: { rangeDrafts[info.key] = $0 }
+                    ), in: minimum ... maximum, step: step, onEditingChanged: { isEditing in
+                        if !isEditing, let value = rangeDrafts.removeValue(forKey: info.key), g.canUseGlasses {
+                            g.writeSetting(info.key, String(format: "%g", value))
+                        }
+                    })
+                    .accessibilityLabel(Text(info.name))
+                }
             }
         case "text":
             Button {

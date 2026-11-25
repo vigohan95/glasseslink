@@ -41,8 +41,7 @@ enum Shutter {
         items.reduce(PB.string(1, action)) { $0 + PB.bytes(2, $1) }
     }
 
-    /// Press the shutter. True once the intent is on the wire — the glasses answer
-    /// through the status stream (camera state), which `Glasses.refreshStatus` shows.
+    /// The glasses confirm this intent with a camera-state update.
     static func photoPayload() -> Data {
         intent(actionPhoto, [
             data(keyLaunchType, launchTypePhoto),
@@ -62,21 +61,15 @@ enum Shutter {
 }
 
 extension Session {
-    /// Send one SNIntent on svc28. The service tag rides on the first frame of the
-    /// channel, so this is safe to call repeatedly.
-    func shutter(_ payload: Data) throws {
-        try sendOnService("status", service: Shutter.service, type: Shutter.mtSnIntent, payload: payload)
+    func shutterPhoto() throws -> GlassesState {
+        try confirmedShutter(Shutter.photoPayload()) { $0 == Status.photoStarted }
     }
 
-    func shutterPhoto() throws {
-        try shutter(Shutter.photoPayload())
+    func startVideo() throws -> GlassesState {
+        try confirmedShutter(Shutter.startVideoPayload()) { $0 == Status.videoStarted }
     }
 
-    func startVideo(kind: String = "video") throws {
-        try shutter(Shutter.startVideoPayload(kind: kind))
-    }
-
-    func stopVideo() throws {
-        try shutter(Shutter.stopVideoPayload())
+    func stopVideo() throws -> GlassesState {
+        try confirmedShutter(Shutter.stopVideoPayload()) { [0, 3, 5, 7, 10].contains($0) }
     }
 }
