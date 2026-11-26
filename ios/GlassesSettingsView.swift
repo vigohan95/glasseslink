@@ -176,7 +176,7 @@ struct GlassesSettingsView: View {
     @State private var percentDrafts: [String: Double] = [:]
     @AppStorage(PhotoLeveling.enabledKey) private var levelPhotos = true
     @AppStorage(VideoLeveling.enabledKey) private var levelVideos = true
-    @AppStorage(HeyMetaLanguage.key) private var heyMetaLanguage = "zh-CN"
+    @AppStorage(HeyMetaLanguage.key) private var heyMetaLanguage = HeyMetaLanguage.defaultTag
 
     private var ready: Bool { g.canUseGlasses && g.settingsReadAt != nil }
 
@@ -193,12 +193,12 @@ struct GlassesSettingsView: View {
                     }
                 }
                 if heyMetaLanguage != HeyMetaLanguage.glasses {
-                    AnswerVoiceRows(g: g, title: "中文声音", tag: heyMetaLanguage)
+                    AnswerVoiceRows(g: g, title: "回答的声音", tag: heyMetaLanguage)
                 }
             } header: {
                 Label("Hey Meta 用什么语言问", systemImage: "character.bubble")
             } footer: {
-                Text("眼镜自己只听得懂英文、也只会读英文。英文问题照旧由眼镜自己识别，回答用眼镜自带的声音。选中文时，你的话会传到 iPhone 上识别；中文回答眼镜读不了，由 iPhone 的声音读出来，从眼镜里播放。首次使用会请求「语音识别」权限，iPhone 的「听写」也要开着（设置 › 通用 › 键盘）。\n\n自带的「标准音质」中文声音比较机械。想要好听的女声不用花钱：到 iPhone「设置 › 辅助功能 › 朗读内容 › 声音 › 中文」，点一个女声旁边的下载，选「高音质」（没有就选「优化音质」）。下载完回到这里，它会出现在列表里，「自动」也会改用它。")
+                Text("眼镜只听得懂、也只会读它自己设置的语言（多数是英文）。这种语言的问题照旧由眼镜自己识别，回答用眼镜自带的声音。选了别的语言（比如普通话）时，你的话会传到 iPhone 上识别；回答眼镜读不了，由 iPhone 的声音读出来，从眼镜里播放。首次使用会请求「语音识别」权限，iPhone 的「听写」也要开着（设置 › 通用 › 键盘）。\n\niPhone 自带的「标准音质」声音比较机械。想要好听的女声不用花钱：到 iPhone「设置 › 辅助功能 › 朗读内容 › 声音」，进你选的语言，点一个女声旁边的下载，选「高音质」（没有就选「优化音质」）。下载完回到这里，它会出现在列表里，「自动」也会改用它。")
             }
             ForEach(CuratedSettings.sections) { section in
                 Section {

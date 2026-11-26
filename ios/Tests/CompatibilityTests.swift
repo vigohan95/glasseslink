@@ -1336,11 +1336,26 @@ final class CompatibilityTests: XCTestCase {
 
     /// Chinese is the phone's to hear and English the glasses': which of the two transcripts is the question.
     func testChineseComesFromThePhoneAndEnglishFromTheGlasses() {
-        XCTAssertEqual(Assistant.question(phone: "今天天气怎么样", glasses: "can you tell me"), "今天天气怎么样")
-        XCTAssertEqual(Assistant.question(phone: "what time is eat", glasses: "What time is it?"), "What time is it?")
-        XCTAssertEqual(Assistant.question(phone: "", glasses: "What time is it?"), "What time is it?")
-        XCTAssertEqual(Assistant.question(phone: "现在几点", glasses: ""), "现在几点")
-        XCTAssertEqual(Assistant.question(phone: "", glasses: ""), "")
+        func asked(_ phone: String, _ glasses: String, _ tag: String = "zh-CN") -> String {
+            Assistant.question(phone: phone, glasses: glasses, phoneTag: tag)
+        }
+        XCTAssertEqual(asked("今天天气怎么样", "can you tell me"), "今天天气怎么样")
+        XCTAssertEqual(asked("what time is it now please", "What time is it?"), "What time is it?")
+        XCTAssertEqual(asked("", "What time is it?"), "What time is it?")
+        XCTAssertEqual(asked("现在几点", ""), "现在几点")
+        XCTAssertEqual(asked("", ""), "")
+        // Any language the phone listens for, not Chinese alone.
+        XCTAssertEqual(asked("今日の天気はどうですか", "kyoto tenki", "ja-JP"), "今日の天気はどうですか")
+        XCTAssertEqual(asked("Quel temps fait-il aujourd'hui à Paris ?", "kel tom fay til", "fr-FR"),
+                       "Quel temps fait-il aujourd'hui à Paris ?")
+
+        // A new user's iPhone language picks the starting point; one not offered leaves it to the glasses.
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "zh-Hans-CN"), "zh-CN")
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "zh-Hant-HK"), "zh-HK")
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "zh-Hant-TW"), "zh-TW")
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "ja-JP"), "ja-JP")
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "en-GB"), HeyMetaLanguage.glasses)
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "sv-SE"), HeyMetaLanguage.glasses)
     }
 
     /// Chinese to glasses that recognise English: they hear nothing, ask nothing and close the turn, and

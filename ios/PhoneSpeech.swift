@@ -12,8 +12,21 @@ enum HeyMetaLanguage {
 
     /// A BCP-47 tag for the phone's recogniser and voice, or nil to leave both to the glasses.
     static var phoneLocale: String? {
-        let value = UserDefaults.standard.string(forKey: key) ?? "zh-CN"
+        let value = UserDefaults.standard.string(forKey: key) ?? defaultTag
         return value == glasses ? nil : value
+    }
+
+    /// What a new user starts with: the iPhone's own language when it is offered here, else the glasses'
+    /// own recognition. Nobody should have to find a setting before their language works.
+    static var defaultTag: String { tag(forPreferred: Locale.preferredLanguages.first ?? "en") }
+
+    static func tag(forPreferred language: String) -> String {
+        if language.hasPrefix("yue") || language.hasPrefix("zh-HK") || language.hasPrefix("zh-Hant-HK")
+            || language.hasPrefix("zh-Hant-MO") { return "zh-HK" }
+        if language.hasPrefix("zh-Hant") || language.hasPrefix("zh-TW") { return "zh-TW" }
+        if language.hasPrefix("zh") { return "zh-CN" }
+        let code = String(language.prefix(2))
+        return choices.first { $0.tag.hasPrefix(code + "-") }?.tag ?? glasses
     }
 
     struct Choice: Identifiable {
@@ -24,7 +37,11 @@ enum HeyMetaLanguage {
 
     static let choices = [
         Choice(tag: "zh-CN", name: "普通话"), Choice(tag: "zh-HK", name: "粤语"),
-        Choice(tag: "zh-TW", name: "国语（台湾）"), Choice(tag: glasses, name: "English（眼镜自带识别）"),
+        Choice(tag: "zh-TW", name: "国语（台湾）"), Choice(tag: "ja-JP", name: "日本語"),
+        Choice(tag: "ko-KR", name: "한국어"), Choice(tag: "es-ES", name: "Español"),
+        Choice(tag: "fr-FR", name: "Français"), Choice(tag: "de-DE", name: "Deutsch"),
+        Choice(tag: "it-IT", name: "Italiano"), Choice(tag: "pt-BR", name: "Português"),
+        Choice(tag: glasses, name: "眼镜自带识别（English 等）"),
     ]
 }
 
@@ -376,7 +393,8 @@ enum PhoneVoice {
         }
         if kana > 0 { return "ja-JP" }
         if hangul > 0 { return "ko-KR" }
-        if han > 0 { return preferred.hasPrefix("zh") ? preferred : "zh-CN" }
+        // Chinese characters alone are Chinese, or Japanese when that is what the wearer speaks.
+        if han > 0 { return preferred.hasPrefix("zh") || preferred.hasPrefix("ja") ? preferred : "zh-CN" }
         guard let language = NLLanguageRecognizer.dominantLanguage(for: text) else { return preferred }
         let code = String(language.rawValue.prefix { $0 != "-" })
         guard !code.isEmpty, code != "und" else { return preferred }

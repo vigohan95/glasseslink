@@ -954,14 +954,15 @@ final class Assistant: @unchecked Sendable {
         }
     }
 
-    /// The phone listens in the language chosen in the app, the glasses in English. Chinese comes back
-    /// from the phone in Chinese characters. Anything else it wrote was English heard by a recogniser of
-    /// Chinese, and then the glasses' own words are the better ones.
-    static func question(phone: String, glasses: String) -> String {
+    /// The phone listens in the language chosen in the app, the glasses in their own. What the phone
+    /// wrote in the language it listens for is the wearer's question. Anything else it wrote was another
+    /// language heard through the wrong recogniser, and then the glasses' own words are the better ones.
+    static func question(phone: String, glasses: String,
+                         phoneTag: String = HeyMetaLanguage.phoneLocale ?? "zh-CN") -> String {
         if phone.isEmpty { return glasses }
         if glasses.isEmpty { return phone }
-        let chinese = phone.unicodeScalars.contains { (0x3400 ... 0x9FFF).contains($0.value) }
-        return chinese ? phone : glasses
+        let written = PhoneVoice.languageTag(of: phone, preferred: phoneTag)
+        return written.prefix(2) == phoneTag.prefix(2) ? phone : glasses
     }
 
     /// What the phone recognised in the microphone stream of the turn `wakeID` woke.

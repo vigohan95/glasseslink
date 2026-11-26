@@ -2631,7 +2631,7 @@ final class Glasses: NSObject, ObservableObject {
         assistantTranscriptMissing = false
         assistantAnswer = ""
         let client = configuredModel
-        let tag = HeyMetaLanguage.phoneLocale ?? "zh-CN"
+        let tag = HeyMetaLanguage.phoneLocale ?? "en-US"
         let visual = albumPicture || VisualQuestion.sounds(question)
         assistantMessage = "听到：「\(question)」，正在问 \(client.model)…"
         note("眼镜语音：这一句由 iPhone 回答，声音从 iPhone 的音频播出")
