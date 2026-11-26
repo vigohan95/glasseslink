@@ -158,7 +158,7 @@ private struct ManualMediaWiFiSheet: View {
                             copied = true
                             g.showToast("密码已复制", .success)
                         } label: {
-                            Label(copied ? "已复制，去设置里粘贴" : "复制密码",
+                            Label(copied ? "已复制，加入时粘贴" : "复制密码",
                                   systemImage: copied ? "checkmark.circle.fill" : "doc.on.doc")
                         }
                     }
@@ -170,24 +170,22 @@ private struct ManualMediaWiFiSheet: View {
                 Section {
                     HStack(spacing: 10) {
                         ProgressView()
-                        Text("正在等 iPhone 连上这个网络，连上后自动开始导入。")
+                        Text("正在等 iPhone 连上这个网络，连上后自动开始导入，不用回来点。")
                             .font(.subheadline)
                     }
-                    Button {
-                        openWiFiSettings()
-                    } label: {
-                        Label("打开「设置」去加入", systemImage: "gear")
-                    }
-                    .fontWeight(.semibold)
                 } footer: {
-                    Text("免费签名的 App 不能替你切换 Wi-Fi，每次都要你在「设置 › 无线局域网」或控制中心里点一下这个眼镜网络。iPhone 在家里的 Wi-Fi 上时不会自己切过去。")
+                    Text("iOS 不允许 App 替你切换 Wi-Fi，也不能直接打开「无线局域网」页面，所以要你自己点一下这个眼镜网络。")
                 }
-                Section("第一次怎么加入") {
-                    Text("1. 点上面的「复制密码」。")
-                    Text("2. 打开 iPhone「设置 › 无线局域网」，点这个眼镜网络，在密码框长按选「粘贴」。")
+                Section("最快的办法：控制中心") {
+                    Label("从屏幕右上角往下滑，打开控制中心。", systemImage: "1.circle")
+                    Label("长按左上角放 Wi-Fi 图标的那一块，再长按 Wi-Fi 图标，在列表里点这个眼镜网络。", systemImage: "2.circle")
+                    Label("第一次要输密码：先点上面的「复制密码」，到密码框长按选「粘贴」。以后就不用再输了。",
+                          systemImage: "3.circle")
                 }
-                Section("以后") {
-                    Text("在控制中心长按 Wi-Fi 图标，选这个眼镜网络即可，不用再输密码。导入完 iPhone 会自己回到原来的网络。")
+                Section("也可以在「设置」里加入") {
+                    Text("回到桌面打开「设置」App › 无线局域网，点这个眼镜网络。")
+                    Text("导入完成后 iPhone 会自己回到原来的网络。")
+                        .foregroundStyle(.secondary)
                 }
                 Section {
                     Button("改用蓝牙（较慢）") { resolve(false) }
@@ -197,15 +195,6 @@ private struct ManualMediaWiFiSheet: View {
             .navigationBarTitleDisplayMode(.inline)
         }
         .overlay(alignment: .top) { ToastOverlay(g: g, announces: false) }
-    }
-
-    /// The Wi-Fi page of Settings when iOS opens it for us, else this app's own page there.
-    private func openWiFiSettings() {
-        let fallback = URL(string: UIApplication.openSettingsURLString)
-        guard let wifi = URL(string: "App-Prefs:root=WIFI") else { return }
-        UIApplication.shared.open(wifi, options: [:]) { opened in
-            if !opened, let fallback { UIApplication.shared.open(fallback) }
-        }
     }
 }
 

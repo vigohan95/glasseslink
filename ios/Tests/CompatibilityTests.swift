@@ -1344,8 +1344,9 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(NeuralVoice.speakers.count, 103)
         XCTAssertEqual(NeuralVoice.speakers[NeuralVoice.defaultSpeaker], "zf_001")
         XCTAssertEqual(NeuralVoice.offered.count, 12)
-        let made = try XCTUnwrap(await NeuralVoice.shared.speak("你好，今天是 11 月 26 日，我是你的 AI 助手。",
-                                                               speaker: NeuralVoice.defaultSpeaker))
+        let spoken = await NeuralVoice.shared.speak("你好，今天是 11 月 26 日，我是你的 AI 助手。",
+                                                    speaker: NeuralVoice.defaultSpeaker)
+        let made = try XCTUnwrap(spoken)
         XCTAssertEqual(made.rate, 24_000)
         let seconds = Double(made.samples.count) / made.rate
         XCTAssertGreaterThan(seconds, 1.5)
