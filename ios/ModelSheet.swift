@@ -16,7 +16,7 @@ struct ModelSheet: View {
             case .openAI: return "https://api.openai.com/v1"
             case .claude: return "https://api.anthropic.com/v1"
             case .openRouter: return "https://openrouter.ai/api/v1"
-            case .deepSeek: return "https://api.deepseek.com/v1"
+            case .deepSeek: return "https://api.deepseek.com"
             case .ollama: return "http://192.168.3.90:11434/v1"
             case .custom: return ""
             }
@@ -27,7 +27,7 @@ struct ModelSheet: View {
             case .openAI: return ["gpt-4o-mini"]
             case .claude: return ["claude-sonnet-4-6"]
             case .openRouter: return ["anthropic/claude-sonnet-4.6", "google/gemini-2.5-flash"]
-            case .deepSeek: return ["deepseek-chat"]
+            case .deepSeek: return ["deepseek-flash", "deepseek-v4-pro"]
             case .ollama: return ["gemma3:4b"]
             case .custom: return []
             }
@@ -213,13 +213,17 @@ struct ModelSheet: View {
         Task {
             defer { requestInFlight = false }
             let start = Date()
+            let host = ModelClient.baseComponents(draft.baseURL)?.host ?? "?"
             do {
                 _ = try await draft.ping()
                 responseOK = true
-                response = "模型已返回回复 · \(Int(Date().timeIntervalSince(start) * 1000)) ms。点「保存」用于助手。"
+                let ms = Int(Date().timeIntervalSince(start) * 1000)
+                response = "模型已返回回复 · \(ms) ms。点「保存」用于助手。"
+                g.note("模型连接测试：\(host) · \(draft.model) · 通了 \(ms) ms")
             } catch {
                 responseOK = false
                 response = Glasses.explain(error)
+                g.note("模型连接测试：\(host) · \(draft.model) · 失败：\(Glasses.explain(error))")
             }
         }
     }

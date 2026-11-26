@@ -71,8 +71,35 @@ struct ModelClient {
         return UIImage(cgImage: image).jpegData(compressionQuality: 0.8)
     }
 
-    func ask(question: String, image: Data? = nil) async throws -> String {
-        try await complete(question: question, image: image, maxTokens: 800)
+    /// `withoutImage`: the question to ask instead when this model takes no pictures (DeepSeek's do not);
+    /// nil asks the same question without the picture.
+    func ask(question: String, image: Data? = nil, withoutImage: String? = nil) async throws -> String {
+        guard let image else { return try await complete(question: question, image: nil, maxTokens: 800) }
+        do {
+            return try await complete(question: question, image: image, maxTokens: 800)
+        } catch LinkError.io(let message) where Self.refusedPicture(message) {
+            return try await complete(question: withoutImage ?? question, image: nil, maxTokens: 800)
+        }
+    }
+
+    /// A refusal of the request as made (400, 415, 422): a model that takes no pictures says so this way.
+    static func refusedPicture(_ message: String) -> Bool {
+        ["HTTP 400", "HTTP 415", "HTTP 422"].contains { message.hasPrefix($0) }
+    }
+
+    /// Services whose models think before answering unless told not to. A spoken answer wants the answer
+    /// at once, and the thinking would use up the tokens the answer has (DeepSeek's API docs: thinking
+    /// is on by default, `thinking: {type: disabled}` turns it off).
+    private var thinksByDefault: Bool { Self.baseComponents(baseURL)?.host == "api.deepseek.com" }
+
+    /// Model names a service has retired, to the names it takes now.
+    static func current(model: String, baseURL: String) -> String {
+        guard baseComponents(baseURL)?.host == "api.deepseek.com" else { return model }
+        switch model {
+        case "deepseek-chat", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp": return "deepseek-flash"
+        case "deepseek-reasoner": return "deepseek-v4-pro"
+        default: return model
+        }
     }
 
     func completionRequest(question: String, image: Data?, maxTokens: Int) throws -> URLRequest {
@@ -93,8 +120,9 @@ struct ModelClient {
         }
         let tokenField = Self.baseComponents(baseURL)?.host == "api.openai.com"
             ? "max_completion_tokens" : "max_tokens"
-        let body: [String: Any] = ["model": model, tokenField: maxTokens,
+        var body: [String: Any] = ["model": Self.current(model: model, baseURL: baseURL), tokenField: maxTokens,
                                    "messages": [["role": "user", "content": content]]]
+        if thinksByDefault { body["thinking"] = ["type": "disabled"] }
         return try request(path: isClaude ? "messages" : "chat/completions", body: body)
     }
 
@@ -111,6 +139,11 @@ struct ModelClient {
             text = message?["content"] as? String
         }
         guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let choices = response["choices"] as? [[String: Any]]
+            let message = choices?.first?["message"] as? [String: Any]
+            if let thought = message?["reasoning_content"] as? String, !thought.isEmpty {
+                throw LinkError.io("模型只返回了思考过程，没有给出回答。换一个不带思考的模型试试。")
+            }
             throw LinkError.io("模型没有返回文本。")
         }
         return text
@@ -128,7 +161,8 @@ struct ModelClient {
             }
             return json
         case 300 ..< 400: throw LinkError.io("服务要求跳转，请填写它的最终 API 地址。")
-        case 401: throw LinkError.io("HTTP 401 · 请检查此服务的 API Key。")
+        case 401: throw LinkError.io("HTTP 401 · API Key 不对，或不属于这个服务。")
+        case 402: throw LinkError.io("HTTP 402 · 这个服务的账户余额不足，需要充值。")
         case 403: throw LinkError.io("HTTP 403 · 当前账号没有访问权限。")
         case 404: throw LinkError.io("HTTP 404 · 请检查服务地址和模型 ID。")
         case 429: throw LinkError.io("HTTP 429 · 请检查服务额度或稍后重试。")
@@ -137,7 +171,16 @@ struct ModelClient {
             let error = json?["error"] as? [String: Any]
             var detail = error?["message"] as? String ?? "服务拒绝了请求。"
             if !apiKey.isEmpty { detail = detail.replacingOccurrences(of: apiKey, with: "[API Key]") }
-            throw LinkError.io("HTTP \(code) · \(detail.prefix(200))")
+            var hint = ""
+            let lower = detail.lowercased()
+            if lower.contains("model") && (lower.contains("not exist") || lower.contains("not found")
+                                           || lower.contains("invalid") || lower.contains("does not")) {
+                hint = " · 模型 ID 不对，点「从服务读取模型列表」选一个"
+            } else if lower.contains("balance") || lower.contains("credit") || lower.contains("quota")
+                        || lower.contains("insufficient") {
+                hint = " · 这个服务的账户余额不足，需要充值"
+            }
+            throw LinkError.io("HTTP \(code) · \(detail.prefix(200))\(hint)")
         }
     }
 }

@@ -101,7 +101,7 @@ struct AssistantTab: View {
                     .foregroundStyle(.secondary)
             }
             if g.assistantOn {
-                Text("拍照、录像、调音量这类指令仍由眼镜自己处理。提问语言在「眼镜设置」里选。")
+                Text("英文由眼镜识别，\(HeyMetaLanguage.phoneLocale.map { HeyMetaLanguage.name(of: $0) + "由 iPhone 识别" } ?? "只听英文")，可以混着问。拍照、录像、调音量这类指令仍由眼镜自己处理。语言在「眼镜设置」里改。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

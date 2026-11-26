@@ -264,7 +264,8 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     @Published var modelBaseURL = UserDefaults.standard.string(forKey: "modelBaseURL") ?? "http://192.168.3.90:11434/v1"
-    @Published var modelName = UserDefaults.standard.string(forKey: "modelName") ?? "gemma3:4b"
+    @Published var modelName = ModelClient.current(model: UserDefaults.standard.string(forKey: "modelName") ?? "gemma3:4b",
+                                                   baseURL: UserDefaults.standard.string(forKey: "modelBaseURL") ?? "")
     @Published private(set) var askingModel = false
     @Published var testingModel = false
     @Published var modelTestLine = ""
@@ -2410,6 +2411,10 @@ final class Glasses: NSObject, ObservableObject {
         assistantRegistering = true
         a.log = { [weak self] line in self?.note("asst: \(line)") }
         a.useGlassesVoice(settings["assistant_voice_id"])
+        let stored = UserDefaults.standard.string(forKey: HeyMetaLanguage.key)
+        note("眼镜语音：英文由眼镜识别；" + (HeyMetaLanguage.phoneLocale.map {
+            "\(HeyMetaLanguage.name(of: $0))由 iPhone 识别（\($0)，\(stored == nil ? "默认" : "手动选择")）"
+        } ?? "第二种语言已关闭（手动选择了只用 English）"))
         if let tag = HeyMetaLanguage.phoneLocale, PhoneVoice.neuralSpeaker(for: tag) != nil {
             // Loading the voice takes a second or two; not while a question waits.
             NeuralVoice.shared.warmUp()
@@ -2619,7 +2624,8 @@ final class Glasses: NSObject, ObservableObject {
             let text: String
             do {
                 text = try await client.ask(question: Self.spokenAnswerPrompt(question, picture: image == nil ? nil : true),
-                                            image: image)
+                                            image: image,
+                                            withoutImage: Self.spokenAnswerPrompt(question, picture: false))
             } catch {
                 guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
                 self.assistantMessage = "模型请求失败 · \(Glasses.explain(error))"
@@ -2684,7 +2690,8 @@ final class Glasses: NSObject, ObservableObject {
             let text: String
             do {
                 text = try await client.ask(question: Glasses.spokenAnswerPrompt(question, picture: visual ? image != nil : nil),
-                                            image: image)
+                                            image: image,
+                                            withoutImage: Glasses.spokenAnswerPrompt(question, picture: false))
             } catch {
                 guard let self, !Task.isCancelled else { return }
                 self.assistantMessage = "模型请求失败 · \(Glasses.explain(error))"

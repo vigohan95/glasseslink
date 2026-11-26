@@ -16,17 +16,32 @@ enum HeyMetaLanguage {
         return value == glasses ? nil : value
     }
 
-    /// What a new user starts with: the iPhone's own language when it is offered here, else the glasses'
-    /// own recognition. Nobody should have to find a setting before their language works.
-    static var defaultTag: String { tag(forPreferred: Locale.preferredLanguages.first ?? "en") }
+    /// What a new user starts with. English is the glasses' own and works whatever is chosen here, so
+    /// the choice is only which second language the phone hears: a Chinese one in the iPhone's language
+    /// list, else another offered language that comes before English there, else Mandarin. An iPhone
+    /// set to English must not switch Chinese off (glasses log 36: 1.05 did, and Chinese went unheard).
+    static var defaultTag: String { tag(forPreferred: Locale.preferredLanguages) }
 
-    static func tag(forPreferred language: String) -> String {
-        if language.hasPrefix("yue") || language.hasPrefix("zh-HK") || language.hasPrefix("zh-Hant-HK")
-            || language.hasPrefix("zh-Hant-MO") { return "zh-HK" }
-        if language.hasPrefix("zh-Hant") || language.hasPrefix("zh-TW") { return "zh-TW" }
-        if language.hasPrefix("zh") { return "zh-CN" }
-        let code = String(language.prefix(2))
-        return choices.first { $0.tag.hasPrefix(code + "-") }?.tag ?? glasses
+    static func tag(forPreferred languages: [String]) -> String {
+        for language in languages {
+            if language.hasPrefix("yue") || language.hasPrefix("zh-HK") || language.hasPrefix("zh-Hant-HK")
+                || language.hasPrefix("zh-Hant-MO") { return "zh-HK" }
+            if language.hasPrefix("zh-Hant") || language.hasPrefix("zh-TW") { return "zh-TW" }
+            if language.hasPrefix("zh") { return "zh-CN" }
+        }
+        for language in languages {
+            let code = String(language.prefix(2))
+            if code == "en" { break }
+            if let offered = choices.first(where: { $0.tag.hasPrefix(code + "-") }) { return offered.tag }
+        }
+        return "zh-CN"
+    }
+
+    /// "普通话", for what the app says it listens for.
+    static func name(of tag: String?) -> String {
+        guard let tag else { return "English" }
+        let name = choices.first { $0.tag == tag }?.name ?? tag
+        return name.components(separatedBy: "+").first?.trimmingCharacters(in: .whitespaces) ?? name
     }
 
     struct Choice: Identifiable {
@@ -36,12 +51,12 @@ enum HeyMetaLanguage {
     }
 
     static let choices = [
-        Choice(tag: "zh-CN", name: "普通话"), Choice(tag: "zh-HK", name: "粤语"),
-        Choice(tag: "zh-TW", name: "国语（台湾）"), Choice(tag: "ja-JP", name: "日本語"),
-        Choice(tag: "ko-KR", name: "한국어"), Choice(tag: "es-ES", name: "Español"),
-        Choice(tag: "fr-FR", name: "Français"), Choice(tag: "de-DE", name: "Deutsch"),
-        Choice(tag: "it-IT", name: "Italiano"), Choice(tag: "pt-BR", name: "Português"),
-        Choice(tag: glasses, name: "眼镜自带识别（English 等）"),
+        Choice(tag: "zh-CN", name: "普通话 + English"), Choice(tag: "zh-HK", name: "粤语 + English"),
+        Choice(tag: "zh-TW", name: "国语（台湾）+ English"), Choice(tag: "ja-JP", name: "日本語 + English"),
+        Choice(tag: "ko-KR", name: "한국어 + English"), Choice(tag: "es-ES", name: "Español + English"),
+        Choice(tag: "fr-FR", name: "Français + English"), Choice(tag: "de-DE", name: "Deutsch + English"),
+        Choice(tag: "it-IT", name: "Italiano + English"), Choice(tag: "pt-BR", name: "Português + English"),
+        Choice(tag: glasses, name: "只用 English（眼镜自带识别）"),
     ]
 }
 

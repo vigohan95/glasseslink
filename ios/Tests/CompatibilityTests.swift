@@ -1432,7 +1432,7 @@ final class CompatibilityTests: XCTestCase {
     }
 
     /// Chinese is the phone's to hear and English the glasses': which of the two transcripts is the question.
-    func testChineseComesFromThePhoneAndEnglishFromTheGlasses() {
+    func testChineseComesFromThePhoneAndEnglishFromTheGlasses() throws {
         func asked(_ phone: String, _ glasses: String, _ tag: String = "zh-CN") -> String {
             Assistant.question(phone: phone, glasses: glasses, phoneTag: tag)
         }
@@ -1446,13 +1446,36 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(asked("Quel temps fait-il aujourd'hui à Paris ?", "kel tom fay til", "fr-FR"),
                        "Quel temps fait-il aujourd'hui à Paris ?")
 
-        // A new user's iPhone language picks the starting point; one not offered leaves it to the glasses.
-        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "zh-Hans-CN"), "zh-CN")
-        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "zh-Hant-HK"), "zh-HK")
-        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "zh-Hant-TW"), "zh-TW")
-        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "ja-JP"), "ja-JP")
-        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "en-GB"), HeyMetaLanguage.glasses)
-        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: "sv-SE"), HeyMetaLanguage.glasses)
+        // A new user's iPhone languages pick the phone's language; English is the glasses' and an iPhone
+        // set to English keeps Chinese on (glasses log 36).
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: ["zh-Hans-CN"]), "zh-CN")
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: ["en-CN", "zh-Hant-HK"]), "zh-HK")
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: ["zh-Hant-TW"]), "zh-TW")
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: ["ja-JP", "en-US"]), "ja-JP")
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: ["en-US", "ja-JP"]), "zh-CN")
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: ["en-GB"]), "zh-CN")
+        XCTAssertEqual(HeyMetaLanguage.tag(forPreferred: []), "zh-CN")
+        XCTAssertEqual(HeyMetaLanguage.name(of: "zh-CN"), "普通话")
+        XCTAssertEqual(HeyMetaLanguage.name(of: nil), "English")
+        XCTAssertEqual(HeyMetaLanguage.name(of: "zh-TW"), "国语（台湾）")
+
+        // DeepSeek retired its old model names, thinks before answering unless told not to, and takes no
+        // pictures.
+        XCTAssertEqual(ModelClient.current(model: "deepseek-chat", baseURL: "https://api.deepseek.com/v1"), "deepseek-flash")
+        XCTAssertEqual(ModelClient.current(model: "deepseek-reasoner", baseURL: "https://api.deepseek.com"), "deepseek-v4-pro")
+        XCTAssertEqual(ModelClient.current(model: "deepseek-chat", baseURL: "https://example.com/v1"), "deepseek-chat")
+        let deepSeek = ModelClient(baseURL: "https://api.deepseek.com", model: "deepseek-chat", apiKey: "k")
+        let made = try deepSeek.completionRequest(question: "你好", image: nil, maxTokens: 64)
+        XCTAssertEqual(made.url?.absoluteString, "https://api.deepseek.com/chat/completions")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: made.httpBody ?? Data()) as? [String: Any])
+        XCTAssertEqual(body["model"] as? String, "deepseek-flash")
+        XCTAssertEqual((body["thinking"] as? [String: String])?["type"], "disabled")
+        let other = try ModelClient(baseURL: "https://api.openai.com/v1", model: "gpt-4o-mini", apiKey: "k")
+            .completionRequest(question: "hi", image: nil, maxTokens: 64)
+        let otherBody = try XCTUnwrap(JSONSerialization.jsonObject(with: other.httpBody ?? Data()) as? [String: Any])
+        XCTAssertNil(otherBody["thinking"])
+        XCTAssertTrue(ModelClient.refusedPicture("HTTP 400 · unknown variant `image_url`"))
+        XCTAssertFalse(ModelClient.refusedPicture("HTTP 401 · API Key 不对"))
     }
 
     /// Chinese to glasses that recognise English: they hear nothing, ask nothing and close the turn, and
