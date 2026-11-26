@@ -165,7 +165,11 @@ final class Glasses: NSObject, ObservableObject {
     @Published private(set) var transferDetail: String?
     @Published var importRoute: MediaImportRoute = .automatic
     @Published private(set) var manualMediaWiFi: ManualMediaWiFiJoin?
-    @Published private(set) var mediaImportInProgress = false
+    /// A Bluetooth import takes minutes; auto-lock would suspend the app and the glasses drop the stalled
+    /// link (glasses log 32: four drops, each while an import ran in the background). Keep the screen on.
+    @Published private(set) var mediaImportInProgress = false {
+        didSet { UIApplication.shared.isIdleTimerDisabled = mediaImportInProgress }
+    }
     private var mediaWiFiAuthenticating = false
     @Published private(set) var mediaImportCancelling = false
     @Published private(set) var mediaImportCurrentID: String?
@@ -705,7 +709,13 @@ final class Glasses: NSObject, ObservableObject {
     func enterBackground() {
         note("App 进入后台")
         wentToBackground = true
-        guard mediaImportID == nil else { return }
+        guard mediaImportID == nil else {
+            // iOS suspends the app within seconds and does not wake it for the transfer; ask for the
+            // little time it grants, and say why the link will drop if the user stays away.
+            holdBackgroundTime("media-import", seconds: 28)
+            note("导入中切到后台：iOS 会暂停 App，传输停下后眼镜会断开连接；回到 App 会重连并继续")
+            return
+        }
         if scanning { stopScanning() }
         guard !connected, channel == nil, !openingL2CAP, phase != .handshaking,
               let id = savedGlassesID, canRetryConnection(id) else { return }

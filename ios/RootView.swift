@@ -472,6 +472,7 @@ struct AlbumTab: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("已完成 \(g.mediaImportCompleteCount)/\(g.mediaImportTotal) 项")
                         if let detail = g.transferDetail { Text(detail) }
+                        Text("导入时请停在 GlassesLink，屏幕会保持常亮。切到别的 App 或锁屏，iOS 会暂停传输；回来后会自动接着导。")
                     }
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
