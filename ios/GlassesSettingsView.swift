@@ -70,8 +70,8 @@ enum CuratedSettings {
                            note: "拍摄键单按和长按分别做什么。",
                            control: .options(["0": "单按拍照，长按录像", "1": "单按录像，长按拍照"])),
             CuratedSetting(key: "resolution_and_framerate", title: "视频画质",
-                           note: "日常用「标准」。高帧率（60 帧）这一档眼镜不做画面校正：画面更广、边缘弯曲（像鱼眼），每帧曝光更短，室内明显更暗、噪点更多。画质越高越耗电、越占空间。",
-                           control: .options(["0": "标准 · 1080p 30 帧", "2": "高帧率 · 1080p 60 帧（画面不校正）",
+                           note: "日常用「标准」。高帧率（60 帧）和 3K 这两档眼镜不防抖，存的是整幅超广角画面，看起来更广、边缘拉伸；导入时 App 会在手机上补做防抖并裁掉外圈（见下面「导入到 iPhone 相册时」）。60 帧每帧曝光更短，室内明显更暗、噪点更多。画质越高越耗电、越占空间。",
+                           control: .options(["0": "标准 · 1080p 30 帧", "2": "高帧率 · 1080p 60 帧",
                                              "1": "高分辨率 · 3K 30 帧"])),
             CuratedSetting(key: "video_duration_ms", title: "单段视频最长",
                            note: "录到这个时长自动停止。这是官方给的几档；过热和电量由眼镜另外的保护机制管。",
@@ -183,6 +183,7 @@ struct GlassesSettingsView: View {
     @State private var percentDrafts: [String: Double] = [:]
     @AppStorage(PhotoLeveling.enabledKey) private var levelPhotos = true
     @AppStorage(VideoLeveling.enabledKey) private var levelVideos = true
+    @AppStorage(VideoSteady.enabledKey) private var steadyWideVideos = true
     @AppStorage(HeyMetaLanguage.key) private var heyMetaLanguage = HeyMetaLanguage.defaultTag
 
     private var ready: Bool { g.canUseGlasses && g.settingsReadAt != nil }
@@ -228,6 +229,14 @@ struct GlassesSettingsView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("视频自动摆正")
                         Text("眼镜的防抖只管抖，不管歪。导入时会一并取回眼镜随视频记录的陀螺仪数据，算出每一刻头歪了多少，把存进 iPhone 相册的那份逐帧转正；最多修正 8°，明显是故意歪头的不修。导入会因此多花一点时间。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Toggle(isOn: $steadyWideVideos) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("高帧率、3K 视频在手机上防抖")
+                        Text("这两档眼镜不防抖，存的是整幅超广角画面，看起来比标准画质更广、边缘拉伸。打开后用眼镜随视频记录的陀螺仪数据在手机上防抖，并裁掉外圈约 15%，视角接近标准画质。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

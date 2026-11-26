@@ -201,7 +201,8 @@ enum VideoLeveling {
     // MARK: the clip
 
     enum Outcome {
-        case leveled(URL, Plan)
+        /// A copy that is levelled (`Plan`), steadied on the phone (`Warps`), or both.
+        case leveled(URL, Plan?, VideoSteady.Warps?)
         /// Nothing to do, or nothing to go by; the string says which, for the log.
         case unchanged(String)
     }
@@ -219,7 +220,10 @@ enum VideoLeveling {
     }
 
     /// A levelled HEVC copy in the temporary folder, or why there is none.
-    static func leveledCopy(of url: URL, imu imuFile: URL?, frames framesFile: URL?) async -> Outcome {
+    /// `steadiedSizes`: the glasses' stabilizer's output sizes; a clip of another size is steadied here
+    /// (`steadiness` is their eis_mode) when the motion log covers it.
+    static func leveledCopy(of url: URL, imu imuFile: URL?, frames framesFile: URL?,
+                            steadiedSizes: [(Int, Int)] = [(1512, 2016)], steadiness: Int = 2) async -> Outcome {
         let asset = AVURLAsset(url: url)
         let imu = imuFile.flatMap { try? Data(contentsOf: $0) }
         let frames = framesFile.flatMap { try? Data(contentsOf: $0) }
@@ -245,14 +249,24 @@ enum VideoLeveling {
                 frameTimes = stride(from: 0, to: seconds, by: 1 / fps).map { $0 }
                 rolls = nil
             }
-            let vision = await horizonSamples(asset: asset, seconds: seconds)
-            guard let plan = Self.plan(frameTimes: frameTimes, imuRolls: rolls, vision: vision, fps: fps,
-                                       width: Double(size.width), height: Double(size.height)) else {
-                return .unchanged(rolls == nil && vision.count < 4 ? "没有传感器记录，画面里也找不到水平线" : "已经是平的")
+            var warps: VideoSteady.Warps?
+            let width = Int(size.width), height = Int(size.height)
+            if VideoSteady.isEnabled, !VideoSteady.steadiedOnGlasses(width: width, height: height, outputs: steadiedSizes),
+               let records, let samples {
+                warps = VideoSteady.plan(width: width, height: height, imu: samples, frames: records, steadiness: steadiness)
             }
+            var plan: Plan?
+            var why = "未开启摆正"
+            if isEnabled {
+                let vision = await horizonSamples(asset: asset, seconds: seconds)
+                plan = Self.plan(frameTimes: frameTimes, imuRolls: rolls, vision: vision, fps: fps,
+                                 width: Double(size.width), height: Double(size.height))
+                why = rolls == nil && vision.count < 4 ? "没有传感器记录，画面里也找不到水平线" : "已经是平的"
+            }
+            guard plan != nil || warps != nil else { return .unchanged(why) }
             let output = FileManager.default.temporaryDirectory.appendingPathComponent("level-\(UUID().uuidString).mp4")
-            try await export(asset: asset, plan: plan, to: output)
-            return .leveled(output, plan)
+            try await export(asset: asset, plan: plan, warps: warps, to: output)
+            return .leveled(output, plan, warps)
         } catch {
             return .unchanged("处理失败：\(error.localizedDescription)")
         }
@@ -278,11 +292,20 @@ enum VideoLeveling {
         return out
     }
 
-    private static func export(asset: AVAsset, plan: Plan, to output: URL) async throws {
+    private static func export(asset: AVAsset, plan: Plan?, warps: VideoSteady.Warps?, to output: URL) async throws {
         let composition = try await AVMutableVideoComposition.videoComposition(with: asset) { request in
-            let angle = plan.angle(at: request.compositionTime.seconds)
-            request.finish(with: PhotoLeveling.straightened(request.sourceImage, by: angle, zoom: plan.zoom), context: nil)
+            let time = request.compositionTime.seconds
+            var image = request.sourceImage
+            if let warps {
+                image = VideoSteady.warped(image, by: warps.matrix(at: time), outWidth: warps.outWidth,
+                                           outHeight: warps.outHeight)
+            }
+            if let plan {
+                image = PhotoLeveling.straightened(image, by: plan.angle(at: time), zoom: plan.zoom)
+            }
+            request.finish(with: image, context: nil)
         }
+        if let warps { composition.renderSize = CGSize(width: warps.outWidth, height: warps.outHeight) }
         guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHEVCHighestQuality) else {
             throw LinkError.io("这台 iPhone 不能导出 HEVC 视频。")
         }

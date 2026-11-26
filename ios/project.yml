@@ -54,6 +54,7 @@ targets:
       - GlassesSettingsView.swift
       - PhotoLeveling.swift
       - VideoLeveling.swift
+      - VideoSteady.swift
       - MotionLog.swift
       - OpusCodec.swift
       - PhoneSpeech.swift

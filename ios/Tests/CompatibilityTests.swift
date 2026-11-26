@@ -9,6 +9,7 @@
 import AVFoundation
 import CoreImage
 import CryptoKit
+import simd
 import XCTest
 @testable import GlassesLink
 
@@ -1335,6 +1336,75 @@ final class CompatibilityTests: XCTestCase {
         let replies = sent.filter { $0.channel == offerChannel ^ 0x8000 }
         XCTAssertEqual(replies.map { $0.type ?? -1 }, [Int(Session.airCursor), Int(Session.airDrop)])
         XCTAssertEqual(replies.first?.payload, PB.uint(2, 1))
+    }
+
+    private func steadyLog(seconds: Double, fps: Double, gyro: (Double) -> SIMD3<Float>) -> ([IMUSample], [FrameRecord]) {
+        var imu: [IMUSample] = []
+        let rate = 960.0
+        for k in 0 ..< Int(seconds * rate) {
+            let t = Double(k) / rate
+            let g = gyro(t)
+            imu.append(IMUSample(timeNs: Int64(t * 1e9), ax: 0, ay: 9.81, az: 0, gx: g.x, gy: g.y, gz: g.z))
+        }
+        let frames = (0 ..< Int((seconds - 0.1) * fps)).map {
+            FrameRecord(frame: $0, timeNs: Int64(Double($0) / fps * 1e9), exposureNs: 8_000_000)
+        }
+        return (imu, frames)
+    }
+
+    /// The glasses' own stabilized size is left alone; 3K and 60-frame clips are not.
+    func testOnlyClipsTheGlassesDidNotSteadyAreSteadiedOnThePhone() {
+        XCTAssertTrue(VideoSteady.steadiedOnGlasses(width: 1512, height: 2016))
+        XCTAssertTrue(VideoSteady.steadiedOnGlasses(width: 2016, height: 1512))
+        XCTAssertFalse(VideoSteady.steadiedOnGlasses(width: 2160, height: 2880))
+        XCTAssertFalse(VideoSteady.steadiedOnGlasses(width: 1440, height: 1920))
+        XCTAssertEqual(VideoSteady.cropAndSmoothing(2).keep, 0.85)
+        XCTAssertEqual(VideoSteady.cropAndSmoothing(1).keep, 0.8)
+    }
+
+    /// A still head: every frame is the centred crop, unturned.
+    func testASteadyHeadGetsTheCentredCrop() throws {
+        let (imu, frames) = steadyLog(seconds: 2, fps: 60) { _ in SIMD3(0, 0, 0) }
+        let warps = try XCTUnwrap(VideoSteady.plan(width: 1440, height: 1920, imu: imu, frames: frames, steadiness: 2))
+        XCTAssertEqual(warps.outWidth, 1224)
+        XCTAssertEqual(warps.outHeight, 1632)
+        XCTAssertEqual(warps.largestTurnDegrees, 0, accuracy: 1e-6)
+        let m = warps.matrix(at: 1.0)
+        // The output's centre shows the input's centre; its corner shows the corner of the centred crop.
+        func map(_ x: Double, _ y: Double) -> (Double, Double) {
+            let z = m[2] * x + m[5] * y + m[8]
+            return ((m[0] * x + m[3] * y + m[6]) / z, (m[1] * x + m[4] * y + m[7]) / z)
+        }
+        let centre = map(612, 816)
+        XCTAssertEqual(centre.0, 720, accuracy: 1e-6)
+        XCTAssertEqual(centre.1, 960, accuracy: 1e-6)
+        let corner = map(0, 0)
+        XCTAssertEqual(corner.0, 108, accuracy: 1e-6)
+        XCTAssertEqual(corner.1, 144, accuracy: 1e-6)
+        let inverse = try XCTUnwrap(VideoSteady.inverse(m))
+        let back = VideoSteady.inverse(inverse) ?? []
+        for (a, b) in zip(back, m) { XCTAssertEqual(a, b, accuracy: 1e-9) }
+    }
+
+    /// A shaking head: the turned frames follow a far smoother path than the head did, and never leave
+    /// the picture.
+    func testAShakeIsTurnedAwayWithinThePicture() throws {
+        // 6 Hz nodding of about ±1.3°, on top of a slow turn.
+        let (imu, frames) = steadyLog(seconds: 3, fps: 30) { t in
+            SIMD3(Float(0.5 * cos(2 * .pi * 6 * t)), 0.05, 0)
+        }
+        let path = VideoSteady.Path(imu: imu, frames: frames)
+        let geometry = VideoSteady.Geometry(w: 1440, h: 1920, ow: 1224, oh: 1632, f: 0.78125 * 1440)
+        let turns = path.corrections(sigmaSeconds: 0.2, geometry: geometry)
+        XCTAssertEqual(turns.count, frames.count)
+        for turn in turns { XCTAssertTrue(geometry.covered(turn)) }
+        let steadied = zip(path.at, turns).map { VideoSteady.multiply($0, VideoSteady.quaternion($1)) }
+        func jitter(_ qs: [SIMD4<Double>]) -> Double {
+            zip(qs, qs.dropFirst()).map { a, b in
+                simd_length(VideoSteady.vector(VideoSteady.multiply(VideoSteady.conjugate(a), b)))
+            }.reduce(0, +)
+        }
+        XCTAssertLessThan(jitter(steadied), jitter(path.at) * 0.35)
     }
 
     /// The bundled voice reads Chinese with numbers and English words in it, and the result goes to the

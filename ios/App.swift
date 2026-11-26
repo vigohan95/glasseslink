@@ -1952,6 +1952,17 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
+    /// The sizes the glasses' own stabilizer writes (two_stage_eis_output_*), so a clip of any other size
+    /// is known to be unsteadied.
+    private var steadiedVideoSizes: [(Int, Int)] {
+        var sizes = [(1512, 2016)]
+        if let w = Int(settingValue("two_stage_eis_output_width").value ?? ""),
+           let h = Int(settingValue("two_stage_eis_output_height").value ?? ""), w > 0, h > 0 {
+            sizes.append((w, h))
+        }
+        return sizes
+    }
+
     private func saveImportedCapture(_ capture: Capture, file: URL) async throws {
         var source = file
         var leveled: URL?
@@ -1968,15 +1979,23 @@ final class Glasses: NSObject, ObservableObject {
             }
         }
         if !capture.isPhoto, let made = await VideoLeveling.describe(file) { note("视频规格：\(made)") }
-        if !capture.isPhoto, VideoLeveling.isEnabled {
-            if mediaImportID != nil { transferDetail = "正在摆正视频…" }
+        if !capture.isPhoto, VideoLeveling.isEnabled || VideoSteady.isEnabled {
+            if mediaImportID != nil { transferDetail = "正在处理视频…" }
             switch await VideoLeveling.leveledCopy(of: file, imu: LocalMediaLibrary.sidecarURL(for: capture, .imu),
-                                                   frames: LocalMediaLibrary.sidecarURL(for: capture, .frames)) {
-            case .leveled(let url, let plan):
+                                                   frames: LocalMediaLibrary.sidecarURL(for: capture, .frames),
+                                                   steadiedSizes: steadiedVideoSizes,
+                                                   steadiness: Int(settingValue("eis_mode").value ?? "") ?? 2) {
+            case .leveled(let url, let plan, let warps):
                 source = url
                 leveled = url
-                note(String(format: "视频已摆正：最大 %.1f°，放大 %.0f%%，依据 ", plan.maximumDegrees, (plan.zoom - 1) * 100)
-                     + plan.source + "；iPhone 相册存摆正后的版本，App 里保留原片")
+                if let warps {
+                    note(String(format: "视频已在手机上防抖：眼镜没有处理这段（%d×%d），裁到 %d×%d，最大转回 %.1f°",
+                                warps.inWidth, warps.inHeight, warps.outWidth, warps.outHeight, warps.largestTurnDegrees))
+                }
+                if let plan {
+                    note(String(format: "视频已摆正：最大 %.1f°，放大 %.0f%%，依据 ", plan.maximumDegrees, (plan.zoom - 1) * 100)
+                         + plan.source + "；iPhone 相册存处理后的版本，App 里保留原片")
+                }
             case .unchanged(let why):
                 note("视频未摆正：\(why)")
             }
