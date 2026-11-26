@@ -1352,6 +1352,40 @@ final class Glasses: NSObject, ObservableObject {
         localMediaIndex[capture.id].flatMap(LocalMediaLibrary.url(for:))
     }
 
+    /// Steadies and levels a clip already in the app's album, from its kept motion log, and keeps the
+    /// result beside the original. The URL of the processed copy, or nil when there was nothing to do.
+    func processStoredVideo(_ id: String) async -> URL? {
+        guard let item = localMediaIndex[id], !item.capture.isPhoto, let file = LocalMediaLibrary.url(for: item) else {
+            return nil
+        }
+        let capture = item.capture
+        let outcome = await VideoLeveling.leveledCopy(of: file, imu: LocalMediaLibrary.sidecarURL(for: capture, .imu),
+                                                      frames: LocalMediaLibrary.sidecarURL(for: capture, .frames),
+                                                      steadiedSizes: steadiedVideoSizes,
+                                                      steadiness: Int(settingValue("eis_mode").value ?? "") ?? 2)
+        switch outcome {
+        case .leveled(let url, _, let warps):
+            defer { try? FileManager.default.removeItem(at: url) }
+            do {
+                try LocalMediaLibrary.storeProcessed(url, capture: capture)
+            } catch {
+                note("处理后的视频没能保存：\(error.localizedDescription)")
+                return nil
+            }
+            if let warps {
+                note(String(format: "补处理视频：%d×%d 裁到 %d×%d，最大转回 %.1f°", warps.inWidth, warps.inHeight,
+                            warps.outWidth, warps.outHeight, warps.largestTurnDegrees))
+            } else {
+                note("补处理视频：已摆正")
+            }
+            showToast("已处理，App 相册里显示处理后的版本", .success)
+            return LocalMediaLibrary.processedURL(for: capture)
+        case .unchanged(let why):
+            note("补处理视频：没有处理（\(why)）")
+            return nil
+        }
+    }
+
     func startMediaImport(_ selection: [Capture], saveToPhotos: Bool = true) {
         guard canStartMediaImport, let active = session else { return }
         var seen = Set<String>()
@@ -1989,6 +2023,10 @@ final class Glasses: NSObject, ObservableObject {
             case .leveled(let url, let plan, let warps):
                 source = url
                 leveled = url
+                // The app's own album shows this copy too; the original stays beside it.
+                do { try LocalMediaLibrary.storeProcessed(url, capture: capture) } catch {
+                    note("处理后的视频没能存进 App 相册：\(error.localizedDescription)")
+                }
                 if let warps {
                     note(String(format: "视频已在手机上防抖：眼镜没有处理这段（%d×%d），裁到 %d×%d，最大转回 %.1f°",
                                 warps.inWidth, warps.inHeight, warps.outWidth, warps.outHeight, warps.largestTurnDegrees))

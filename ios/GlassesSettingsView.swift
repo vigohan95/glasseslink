@@ -184,6 +184,7 @@ struct GlassesSettingsView: View {
     @AppStorage(PhotoLeveling.enabledKey) private var levelPhotos = true
     @AppStorage(VideoLeveling.enabledKey) private var levelVideos = true
     @AppStorage(VideoSteady.enabledKey) private var steadyWideVideos = true
+    @AppStorage(VideoSteady.View.key) private var wideVideoView = VideoSteady.View.standard.rawValue
     @AppStorage(HeyMetaLanguage.key) private var heyMetaLanguage = HeyMetaLanguage.defaultTag
 
     private var ready: Bool { g.canUseGlasses && g.settingsReadAt != nil }
@@ -236,15 +237,22 @@ struct GlassesSettingsView: View {
                 Toggle(isOn: $steadyWideVideos) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("高帧率、3K 视频在手机上防抖")
-                        Text("这两档眼镜不防抖，存的是整幅超广角画面，看起来比标准画质更广、边缘拉伸。打开后用眼镜随视频记录的陀螺仪数据在手机上防抖，并裁掉外圈约 15%，视角接近标准画质。")
+                        Text("这两档眼镜不防抖，存的是整幅超广角画面：3K 比标准画质宽约 1.6 倍，60 帧宽约 1.45 倍，所以看起来像鱼眼。打开后用眼镜随视频记录的陀螺仪数据在手机上防抖，再按下面选的视角裁切。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+                }
+                if steadyWideVideos {
+                    Picker("裁切后的视角", selection: $wideVideoView) {
+                        ForEach(VideoSteady.View.allCases, id: \.rawValue) { view in
+                            Text(view.title).tag(view.rawValue)
+                        }
                     }
                 }
             } header: {
                 Label("导入到 iPhone 相册时", systemImage: "level")
             } footer: {
-                Text("App 里保留的始终是原件；关掉开关后重新存到相册，得到的就是未处理的原样。")
+                Text("App 相册里默认显示处理后的版本，点开视频可以切回原片，原件一直保留。关掉开关后再导入，得到的就是未处理的原样。")
             }
             Section {
                 ForEach(Self.longerVideoMinutes, id: \.self) { minutes in

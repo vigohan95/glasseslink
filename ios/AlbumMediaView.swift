@@ -10,6 +10,8 @@ struct AlbumMediaSelection: Identifiable {
     let original: URL?
     let thumbnail: UIImage?
     var timestampNS: Int?
+    /// The levelled or steadied copy, shown first when there is one.
+    var processed: URL?
 
     var title: String { MediaNaming.title(isPhoto: isPhoto, timestampNS: timestampNS) }
 }
@@ -23,10 +25,18 @@ struct AlbumMediaView: View {
     @State private var loadError: String?
     @State private var audioActive = false
     @State private var share: ShareBox?
+    @State private var showOriginal = false
+    @State private var processedNow: URL?
+    @State private var processing = false
 
-    /// Shares a copy named like "眼镜照片_2026-11-26_15-57-02.heic" instead of the stored hash name.
+    private var processedCopy: URL? { processedNow ?? media.processed }
+    /// What is on screen: the processed copy unless the original was asked for.
+    private var shown: URL? { showOriginal ? media.original : (processedCopy ?? media.original) }
+
+    /// Shares a copy named like "眼镜照片_2026-11-26_15-57-02.heic" instead of the stored hash name: the
+    /// version on screen.
     private func shareOriginal() {
-        guard let original = media.original else { return }
+        guard let original = shown else { return }
         do {
             share = ShareBox(url: try MediaNaming.shareableCopy(of: original, isPhoto: media.isPhoto,
                                                                 timestampNS: media.timestampNS))
@@ -60,7 +70,28 @@ struct AlbumMediaView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     if media.original != nil {
                         Button { shareOriginal() } label: { Image(systemName: "square.and.arrow.up") }
-                            .accessibilityLabel("分享原件")
+                            .accessibilityLabel(processedCopy != nil && !showOriginal ? "分享处理后的版本" : "分享原件")
+                    }
+                }
+                ToolbarItem(placement: .bottomBar) {
+                    if processedCopy != nil {
+                        Picker("显示", selection: $showOriginal) {
+                            Text("处理后").tag(false)
+                            Text("原片").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 220)
+                    } else if !media.isPhoto, media.original != nil {
+                        Button {
+                            processAgain()
+                        } label: {
+                            if processing {
+                                ProgressView()
+                            } else {
+                                Label("防抖并摆正", systemImage: "wand.and.stars")
+                            }
+                        }
+                        .disabled(processing)
                     }
                 }
             }
@@ -91,7 +122,7 @@ struct AlbumMediaView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .task(id: media.original) { await loadOriginal() }
+        .task(id: shown) { await loadOriginal() }
         .onDisappear { stopPlayback() }
         .onReceive(NotificationCenter.default.publisher(for: AVPlayerItem.failedToPlayToEndTimeNotification)
             .receive(on: RunLoop.main)) { notice in
@@ -138,7 +169,10 @@ struct AlbumMediaView: View {
 
     @MainActor
     private func loadOriginal() async {
-        guard let url = media.original else { return }
+        stopPlayback()
+        photo = nil
+        loadError = nil
+        guard let url = shown else { return }
         if media.isPhoto {
             let image = await Task.detached(priority: .userInitiated) { UIImage(contentsOfFile: url.path) }.value
             guard !Task.isCancelled else { return }
@@ -164,6 +198,21 @@ struct AlbumMediaView: View {
         } catch {
             guard !Task.isCancelled else { return }
             loadError = "无法打开视频或启用播放音频。"
+        }
+    }
+
+    /// A clip imported before the album kept processed copies: steadied and levelled now, from the motion
+    /// log kept beside it.
+    private func processAgain() {
+        processing = true
+        Task { @MainActor in
+            defer { processing = false }
+            if let made = await g.processStoredVideo(media.id) {
+                processedNow = made
+                showOriginal = false
+            } else {
+                loadError = "这段视频不需要处理，或没有可用的陀螺仪记录。"
+            }
         }
     }
 

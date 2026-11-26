@@ -16,7 +16,7 @@ struct ModelSheet: View {
             case .openAI: return "https://api.openai.com/v1"
             case .claude: return "https://api.anthropic.com/v1"
             case .openRouter: return "https://openrouter.ai/api/v1"
-            case .deepSeek: return "https://api.deepseek.com"
+            case .deepSeek: return "https://api.deepseek.com/v1"
             case .ollama: return "http://192.168.3.90:11434/v1"
             case .custom: return ""
             }

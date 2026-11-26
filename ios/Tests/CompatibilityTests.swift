@@ -1362,6 +1362,21 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(VideoSteady.cropAndSmoothing(1).keep, 0.8)
     }
 
+    /// A wide clip is cut to the standard clip's view by default; 60-frame clips are less wide than 3K.
+    func testWideClipsAreCutToTheStandardView() throws {
+        XCTAssertEqual(VideoSteady.keep(fps: 30, view: .standard, steadiness: 2), 1 / 1.62, accuracy: 1e-9)
+        XCTAssertEqual(VideoSteady.keep(fps: 60, view: .standard, steadiness: 2), 1 / 1.45, accuracy: 1e-9)
+        XCTAssertEqual(VideoSteady.keep(fps: 30, view: .wide, steadiness: 2), 0.85, accuracy: 1e-9)
+        let medium = VideoSteady.keep(fps: 30, view: .medium, steadiness: 2)
+        XCTAssertGreaterThan(medium, 1 / 1.62)
+        XCTAssertLessThan(medium, 0.85)
+        let (imu, frames) = steadyLog(seconds: 2, fps: 30) { t in SIMD3(Float(0.3 * sin(2 * .pi * 3 * t)), 0, 0) }
+        let warps = try XCTUnwrap(VideoSteady.plan(width: 2160, height: 2880, imu: imu, frames: frames,
+                                                   steadiness: 2, keep: 1 / 1.62))
+        XCTAssertEqual(warps.outWidth, VideoSteady.even(2160 / 1.62))
+        XCTAssertEqual(warps.outHeight, VideoSteady.even(2880 / 1.62))
+    }
+
     /// A still head: every frame is the centred crop, unturned.
     func testASteadyHeadGetsTheCentredCrop() throws {
         let (imu, frames) = steadyLog(seconds: 2, fps: 60) { _ in SIMD3(0, 0, 0) }
@@ -1467,6 +1482,11 @@ final class CompatibilityTests: XCTestCase {
         let deepSeek = ModelClient(baseURL: "https://api.deepseek.com", model: "deepseek-chat", apiKey: "k")
         let made = try deepSeek.completionRequest(question: "你好", image: nil, maxTokens: 64)
         XCTAssertEqual(made.url?.absoluteString, "https://api.deepseek.com/chat/completions")
+        let v1 = try ModelClient(baseURL: "https://api.deepseek.com/v1", model: "deepseek-flash", apiKey: "k")
+            .completionRequest(question: "你好", image: nil, maxTokens: 64)
+        XCTAssertEqual(v1.url?.absoluteString, "https://api.deepseek.com/v1/chat/completions")
+        let v1Body = try XCTUnwrap(JSONSerialization.jsonObject(with: v1.httpBody ?? Data()) as? [String: Any])
+        XCTAssertEqual((v1Body["thinking"] as? [String: String])?["type"], "disabled")
         let body = try XCTUnwrap(JSONSerialization.jsonObject(with: made.httpBody ?? Data()) as? [String: Any])
         XCTAssertEqual(body["model"] as? String, "deepseek-flash")
         XCTAssertEqual((body["thinking"] as? [String: String])?["type"], "disabled")

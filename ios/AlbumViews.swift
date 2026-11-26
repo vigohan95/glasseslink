@@ -357,7 +357,8 @@ struct AlbumTab: View {
         let item = AlbumMediaSelection(id: capture.id, isPhoto: capture.isPhoto,
                                        original: g.localMediaURL(for: capture),
                                        thumbnail: g.thumbs[capture.id],
-                                       timestampNS: capture.timestampNS)
+                                       timestampNS: capture.timestampNS,
+                                       processed: LocalMediaLibrary.processedURL(for: capture))
         let imported = g.importedCaptures[capture.id] != nil
         let onGlasses = canBrowseGlasses && snapshot.glassesIDs.contains(capture.id)
         let selectable = snapshot.selectableIDs.contains(capture.id)

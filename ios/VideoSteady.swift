@@ -18,6 +18,43 @@ enum VideoSteady {
         UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
     }
 
+    /// How much of a wide clip is kept: the standard clip's view, halfway, or all of it but the
+    /// stabilizer's margin.
+    enum View: String, CaseIterable {
+        case standard, medium, wide
+
+        static let key = "wideVideoView"
+
+        static var chosen: View {
+            View(rawValue: UserDefaults.standard.string(forKey: key) ?? "") ?? .standard
+        }
+
+        var title: String {
+            switch self {
+            case .standard: return "和标准画质一样"
+            case .medium: return "稍广一些"
+            case .wide: return "最广（只防抖）"
+            }
+        }
+    }
+
+    /// How many times wider a wide clip's picture is than the standard 30-frame clip's, measured on the
+    /// user's samples (glasses log 35 and the clips of 2026-11-26: a far and a near patch of the standard
+    /// frame match the 3K frame at 1.58-1.66 times, the 60-frame frame at 1.12).
+    static let wideToStandard3K = 1.62
+    static let wideToStandard60 = 1.45
+
+    /// The share of each side kept for a clip at `fps`, for `view` and the stabilizer's `steadiness`.
+    static func keep(fps: Double, view: View, steadiness: Int) -> Double {
+        let stabilizer = cropAndSmoothing(steadiness).keep
+        let wider = fps >= 45 ? wideToStandard60 : wideToStandard3K
+        switch view {
+        case .standard: return min(stabilizer, 1 / wider)
+        case .medium: return min(stabilizer, 1 / wider.squareRoot())
+        case .wide: return stabilizer
+        }
+    }
+
     /// Focal length as a share of the video's width.
     static let focalShare = 0.78125
     /// A frame's moment is its mid-exposure plus this.
@@ -68,10 +105,13 @@ enum VideoSteady {
     }
 
     /// The warps for a `width`×`height` clip whose frames the motion log covers. Nil without a log.
-    static func plan(width: Int, height: Int, imu: [IMUSample], frames: [FrameRecord], steadiness: Int) -> Warps? {
+    /// `keep` is the share of each side the output shows; nil keeps the stabilizer's own margin.
+    static func plan(width: Int, height: Int, imu: [IMUSample], frames: [FrameRecord], steadiness: Int,
+                     keep chosen: Double? = nil) -> Warps? {
         guard width > 0, height > 0, imu.count > 1, frames.count > 2,
               let first = frames.first, let last = frames.last, last.timeNs > first.timeNs else { return nil }
-        let (keep, sigma) = cropAndSmoothing(steadiness)
+        let (margin, sigma) = cropAndSmoothing(steadiness)
+        let keep = min(max(chosen ?? margin, 0.3), margin)
         let geometry = Geometry(w: Double(width), h: Double(height), ow: Double(even(Double(width) * keep)),
                                 oh: Double(even(Double(height) * keep)), f: focalShare * Double(width))
         let path = Path(imu: imu, frames: frames)

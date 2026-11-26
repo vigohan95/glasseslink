@@ -253,7 +253,9 @@ enum VideoLeveling {
             let width = Int(size.width), height = Int(size.height)
             if VideoSteady.isEnabled, !VideoSteady.steadiedOnGlasses(width: width, height: height, outputs: steadiedSizes),
                let records, let samples {
-                warps = VideoSteady.plan(width: width, height: height, imu: samples, frames: records, steadiness: steadiness)
+                let keep = VideoSteady.keep(fps: fps, view: VideoSteady.View.chosen, steadiness: steadiness)
+                warps = VideoSteady.plan(width: width, height: height, imu: samples, frames: records,
+                                         steadiness: steadiness, keep: keep)
             }
             var plan: Plan?
             var why = "未开启摆正"

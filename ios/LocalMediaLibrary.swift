@@ -142,6 +142,31 @@ enum LocalMediaLibrary {
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
+    // MARK: the processed copy
+
+    private static let processedExtensions = ["mp4", "mov", "heic", "jpg"]
+
+    /// The levelled or steadied copy kept beside the original, which the app's own album shows.
+    static func processedURL(for capture: Capture) -> URL? {
+        guard let root = originals else { return nil }
+        for ext in processedExtensions {
+            let url = root.appendingPathComponent(identity(capture) + ".processed." + ext)
+            if FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        return nil
+    }
+
+    static func storeProcessed(_ source: URL, capture: Capture) throws {
+        let root = try prepareRoot()
+        let files = FileManager.default
+        for ext in processedExtensions {
+            let old = root.appendingPathComponent(identity(capture) + ".processed." + ext)
+            if files.fileExists(atPath: old.path) { try files.removeItem(at: old) }
+        }
+        let ext = source.pathExtension.isEmpty ? (capture.isPhoto ? "heic" : "mp4") : source.pathExtension.lowercased()
+        try files.copyItem(at: source, to: root.appendingPathComponent(identity(capture) + ".processed." + ext))
+    }
+
     static func storeSidecar(_ source: URL, capture: Capture, _ kind: Sidecar) throws {
         let destination = try prepareRoot().appendingPathComponent(identity(capture) + "." + kind.rawValue)
         let files = FileManager.default
