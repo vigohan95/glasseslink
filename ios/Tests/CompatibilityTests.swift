@@ -647,4 +647,11 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertFalse(Glasses.isSilentTransfer(LinkError.unexpected("眼镜上已找不到这项素材。")))
         XCTAssertFalse(Glasses.isSilentTransfer(CancellationError()))
     }
+
+    func testSpokenAnswerFollowsTheQuestionLanguage() {
+        let prompt = Glasses.spokenAnswerPrompt("what is your name")
+        XCTAssertTrue(prompt.hasPrefix("Answer in the same language as the question"))
+        XCTAssertTrue(prompt.hasSuffix("Question: what is your name"))
+        XCTAssertFalse(prompt.contains("请用"))
+    }
 }

@@ -1639,6 +1639,14 @@ final class Glasses: NSObject, ObservableObject {
         glassesLine = "导入切换到眼镜 Wi-Fi，蓝牙控制暂时让出"
     }
 
+    /// The glasses read the answer in their own voice, so it has to come back in the language of the
+    /// question; the old Chinese instruction could turn an English question into a Chinese answer.
+    nonisolated static func spokenAnswerPrompt(_ question: String) -> String {
+        "Answer in the same language as the question, in one to three short spoken sentences that the "
+            + "glasses will read aloud. No lists, markdown or emoji. Only text was received, no image.\n\n"
+            + "Question: \(question)"
+    }
+
     nonisolated static func isSilentTransfer(_ error: Error) -> Bool {
         if case LinkError.unexpected(let reason) = error { return reason.contains("暂停过久") }
         return false
@@ -2188,7 +2196,7 @@ final class Glasses: NSObject, ObservableObject {
             guard let self, let assistant else { return }
             let text: String
             do {
-                text = try await client.ask(question: "请用简洁的口语回答下面的问题，方便眼镜朗读。当前只收到文字，没有图片。\n\n\(question)")
+                text = try await client.ask(question: Self.spokenAnswerPrompt(question))
             } catch {
                 guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
                 self.assistantMessage = "模型请求失败 · \(Glasses.explain(error))"
