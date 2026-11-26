@@ -2,7 +2,8 @@ import Compression
 import Foundation
 
 /// The authenticated text assistant session on service 15.
-final class Assistant {
+/// Its mutable state is guarded by stateLock, eventWriteLock and pauseCondition; other threads only pause it.
+final class Assistant: @unchecked Sendable {
     static let service: UInt16 = 15
 
     // Message types on the channel.

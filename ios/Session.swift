@@ -1344,7 +1344,7 @@ final class Session {
     /// the capture channel was open, was skipped, and 6 requested files never came). Answer each offer as
     /// soon as the owner link is trusted; a later request queues the asset again.
     private func rejectUnrequestedAirshipOffer(_ message: DataX.Message) throws -> Bool {
-        guard ownerTrustCompleted, let offer = try Self.airshipOffer(message) else { return false }
+        guard ownerTrustCompleted || serviceChannels["captures"] != nil, let offer = try Self.airshipOffer(message) else { return false }
         // Drop answers this queue entry. Deleting a capture is a separate svc18 command.
         try sendAirshipReply(Self.airDrop, on: offer.mirror, payload: PB.bytes(1, offer.id))
         emit("media: declined an unrequested Airship offer")
