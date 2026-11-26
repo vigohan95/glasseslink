@@ -94,13 +94,48 @@ enum MediaWiFiProtocol {
     }
 }
 
+/// One network name and password for every transfer, so iOS remembers the glasses' hotspot after the
+/// first manual join. Free signing cannot join it for the user (NEHotspotConfiguration error 8), and
+/// until 1.00 both were random per transfer: a new 32-character password to type every single time.
+/// The hotspot only gates the radio link; the media session on it still proves the owner key and
+/// pins the glasses' key, so a readable password does not open the files to anyone who learns it.
+enum MediaHotspotCredentials {
+    static let ssidKey = "mediaHotspotSSID"
+    static let passwordKey = "mediaHotspotPassword"
+    /// No 0/o, 1/l/i: the password must survive being read off the screen once.
+    private static let alphabet = Array("abcdefghjkmnpqrstuvwxyz23456789")
+
+    static func current(_ defaults: UserDefaults = .standard) -> (ssid: String, password: String) {
+        if let ssid = defaults.string(forKey: ssidKey), let password = defaults.string(forKey: passwordKey),
+           isValid(ssid: ssid, password: password) {
+            return (ssid, password)
+        }
+        let fresh = make()
+        defaults.set(fresh.ssid, forKey: ssidKey)
+        defaults.set(fresh.password, forKey: passwordKey)
+        return fresh
+    }
+
+    static func make() -> (ssid: String, password: String) {
+        var generator = SystemRandomNumberGenerator()
+        func word(_ count: Int) -> String {
+            String((0..<count).map { _ in alphabet[Int(generator.next(upperBound: UInt64(alphabet.count)))] })
+        }
+        return ("GlassesLink-\(word(4).uppercased())", "\(word(4))-\(word(4))-\(word(4))")
+    }
+
+    static func isValid(ssid: String, password: String) -> Bool {
+        (1...32).contains(ssid.utf8.count) && !ssid.utf8.contains(0)
+            && (8...63).contains(password.utf8.count) && password.utf8.allSatisfy { (0x20...0x7E).contains($0) }
+    }
+}
+
 extension Session {
     /// The caller owns the Bluetooth link while negotiating and until the TCP session takes over.
     func createMediaSoftAP(countryCode: String, timeout: TimeInterval = 30) throws -> MediaWiFiEndpoint {
         guard hasVerifiedOwner else { throw LinkError.unexpected("开启眼镜热点前需要验证眼镜主人身份") }
         let id = UUID()
-        let ssid = "GlassesLink-\(id.uuidString.prefix(8))"
-        let password = SymmetricKey(size: .bits128).withUnsafeBytes { Data($0).hex }
+        let (ssid, password) = MediaHotspotCredentials.current()
         let payload = try MediaWiFiProtocol.makeRequest(countryCode: countryCode, id: id, ssid: ssid, password: password)
         let service = MediaWiFiProtocol.service
         let name = MediaWiFiProtocol.channelName

@@ -39,9 +39,9 @@ struct RootView: View {
         .onChange(of: scenePhase, initial: true) { _, phase in
             if phase == .active {
                 g.readAudioOutput()
-                g.autoReconnect()
+                g.enterForeground()
             } else if phase == .background {
-                g.suspendReconnectForBackground()
+                g.enterBackground()
                 LogStore.shared.flushToDisk()
             }
         }
@@ -94,27 +94,43 @@ struct RootView: View {
 private struct ManualMediaWiFiSheet: View {
     let request: ManualMediaWiFiJoin
     let resolve: (Bool) -> Void
+    @State private var copied = false
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("眼镜 Wi-Fi") {
+                Section {
                     LabeledContent("网络名称") {
                         Text(request.ssid).monospaced().textSelection(.enabled)
                     }
                     if !request.password.isEmpty {
                         LabeledContent("密码") {
-                            Text(request.password).monospaced().textSelection(.enabled).privacySensitive()
+                            Text(request.password).monospaced().textSelection(.enabled)
+                        }
+                        Button {
+                            UIPasteboard.general.string = request.password
+                            copied = true
+                        } label: {
+                            Label(copied ? "已复制，去设置里粘贴" : "复制密码",
+                                  systemImage: copied ? "checkmark.circle.fill" : "doc.on.doc")
                         }
                     }
+                } header: {
+                    Text("眼镜 Wi-Fi")
+                } footer: {
+                    Text("这组名称和密码以后不会再变。只要输一次，iPhone 就会记住这个网络。")
                 }
-                Section {
-                    Text("1. 打开 iPhone「设置 → Wi-Fi」，选择上方的眼镜网络，按提示输入密码。")
-                    Text("2. 确认眼镜网络旁出现勾选标记，返回 GlassesLink，点「已加入」。")
+                Section("第一次怎么加入") {
+                    Text("1. 点上面的「复制密码」。")
+                    Text("2. 打开 iPhone「设置 › 无线局域网」，点这个眼镜网络，在密码框长按选「粘贴」。")
+                    Text("加入后 GlassesLink 会自己继续，不用回来点按钮。")
+                }
+                Section("以后") {
+                    Text("在控制中心长按 Wi-Fi 图标，选这个眼镜网络即可，不用再输密码。")
                 }
                 Section {
                     Button("已加入") { resolve(true) }
-                    Button("改用蓝牙") { resolve(false) }
+                    Button("改用蓝牙（较慢）") { resolve(false) }
                 }
             }
             .navigationTitle("手动加入眼镜 Wi-Fi")
@@ -763,7 +779,7 @@ struct ShootTab: View {
     }
 
     private var cameraActionBlocked: Bool {
-        if g.assistantOn || g.assistantRegistering || g.queuedGlassesActionText != nil { return true }
+        if g.assistantRegistering || g.queuedGlassesActionText != nil { return true }
         return g.mediaImportInProgress ? g.recording : g.busy
     }
 
@@ -940,7 +956,7 @@ struct ShootTab: View {
                     .frame(maxWidth: .infinity, minHeight: 48)
                 }
                 .buttonStyle(.plain)
-                .disabled(g.busy || g.mediaImportInProgress || g.recording || g.assistantOn || g.assistantRegistering)
+                .disabled(g.busy || g.mediaImportInProgress || g.recording || g.assistantRegistering)
             }
         }
         .glassesPanel(padding: 12)
@@ -1048,12 +1064,12 @@ struct AssistantTab: View {
 
     private var voiceCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("眼镜语音", systemImage: "mic")
+            Label("Hey Meta 交给 GlassesLink", systemImage: "mic")
                 .font(.headline)
             if g.assistantRegistering {
                 ProgressView("等眼镜确认注册…").font(.subheadline)
             } else if g.canUseGlasses {
-                Button(g.assistantOn ? "结束眼镜语音" : "启用眼镜语音") {
+                Button(g.assistantOn ? "关闭 Hey Meta 接管" : "开启 Hey Meta 接管") {
                     if g.assistantOn { g.stopAssistant() } else { g.startAssistant() }
                 }
                 .buttonStyle(.bordered)
@@ -1064,10 +1080,13 @@ struct AssistantTab: View {
             if let message = g.assistantMessage {
                 Text(message).font(.subheadline).foregroundStyle(.secondary)
             } else if g.canUseGlasses && !g.assistantOn && !g.assistantRegistering {
-                Text("先启用眼镜语音，再说「Hey Meta」。")
+                Text(g.assistantAutoStart ? "连上眼镜后会自动开启。" : "已关闭；点上面的按钮重新开启。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
+            Text("开启后直接对眼镜说「Hey Meta，what is your name?」，回答会在眼镜里播出。拍照、录像、音量这些指令由眼镜自己处理，不经过 App。目前先用英文提问。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             Button {
                 typing = false
                 showSpokenQuestion = true

@@ -602,4 +602,49 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertFalse(MetaAdvertisement.isGlassesCandidate(manufacturerData: Data([0x4C, 0x00, 0x10]), hasMetaService: false))
         XCTAssertTrue(MetaAdvertisement.isGlassesCandidate(manufacturerData: nil, hasMetaService: true))
     }
+
+    /// 1.00 log 13:43:22: an offer that came before the capture channel was opened went unanswered and
+    /// every later Bluetooth file waited behind it. A trusted link answers it whoever is reading.
+    func testUnrequestedOfferIsAnsweredBeforeTheCaptureChannelOpens() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let id = Data(repeating: 7, count: 16)
+        try peer.write(mediaOffer(channel: 0x8179, id: id, size: 10))
+        try peer.write(DataX.message(0x8003, tags: [DataX.tag(2, 2005, last: true)], payload: Data([1])))
+        XCTAssertEqual(try session.nextMessage(timeout: 1).channel, 0x8003)
+        let reply = try DataX.parse(peer.nextFrame(timeout: 1))
+        XCTAssertEqual(reply.channel, 0x0179)
+        XCTAssertEqual(reply.type, Int(Session.airDrop))
+        XCTAssertEqual(try PB.parse(reply.payload)[1]?.first as? Data, id)
+    }
+
+    func testOfferOnAnUnverifiedLinkIsLeftToTheCaller() throws {
+        let (session, peer) = try encryptedLoopback()
+        try peer.write(mediaOffer(channel: 0x8179, id: Data(repeating: 7, count: 16), size: 10))
+        let message = try session.nextMessage(timeout: 1)
+        XCTAssertEqual(message.channel, 0x8179)
+        XCTAssertEqual(message.type, Int(Session.airOffer))
+    }
+
+    func testAssistantChannelsWaitForTheAssistantReader() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let tags = [DataX.tag(2, 1001, last: true)]
+        session.routeToAssistant([0x0005, 0x8005])
+        try peer.write(DataX.message(0x8005, tags: tags, payload: Data([1])))
+        try peer.write(DataX.message(0x8003, tags: tags, payload: Data([2])))
+        let other = try session.nextMessage(timeout: 1)
+        XCTAssertEqual(other.channel, 0x8003)
+        let parked = try session.nextMessage(timeout: 1, forAssistant: true)
+        XCTAssertEqual(parked.channel, 0x8005)
+        XCTAssertEqual(parked.payload, Data([1]))
+
+        session.routeToAssistant([])
+        try peer.write(DataX.message(0x8005, tags: tags, payload: Data([3])))
+        XCTAssertEqual(try session.nextMessage(timeout: 1).channel, 0x8005)
+    }
+
+    func testOnlyAnIdleBluetoothTransferEarnsAFreshSession() {
+        XCTAssertTrue(Glasses.isSilentTransfer(LinkError.unexpected("眼镜文件传输暂停过久，请重试。")))
+        XCTAssertFalse(Glasses.isSilentTransfer(LinkError.unexpected("眼镜上已找不到这项素材。")))
+        XCTAssertFalse(Glasses.isSilentTransfer(CancellationError()))
+    }
 }

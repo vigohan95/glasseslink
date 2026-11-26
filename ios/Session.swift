@@ -393,6 +393,14 @@ final class Session {
     private var dataXCarry = Data()
     private var decodedMessages: ArraySlice<DataX.Message> = []
     private var pendingSetupMessages: [DataX.Message] = []
+    /// Channels the registered assistant reads. Other readers park these messages here instead of
+    /// dropping them, so a photo or an import no longer has to end the Hey Meta registration.
+    private var assistantChannels: Set<UInt16> = []
+    private var assistantBacklog: [DataX.Message] = []
+    private static let assistantBacklogLimit = 512
+    /// Separate from receiveLock, which a reader holds while it waits for a frame: stopping the
+    /// assistant from the main thread must never wait out someone else's read.
+    private let assistantRouteLock = NSLock()
 
     static func uniqueIVs(_ list: [Data]) -> [Data] {
         var out: [Data] = []
@@ -580,15 +588,41 @@ final class Session {
         return messages
     }
 
+    /// Routes the assistant's channels (both directions) to its own reader; an empty set ends the routing.
+    func routeToAssistant(_ channels: Set<UInt16>) {
+        assistantRouteLock.lock()
+        defer { assistantRouteLock.unlock() }
+        assistantChannels = channels
+        if channels.isEmpty { assistantBacklog.removeAll() }
+    }
+
+    private func takeAssistantBacklog() -> DataX.Message? {
+        assistantRouteLock.lock()
+        defer { assistantRouteLock.unlock() }
+        return assistantBacklog.isEmpty ? nil : assistantBacklog.removeFirst()
+    }
+
+    /// True when the message belongs to the assistant and was kept for its reader.
+    private func parkForAssistant(_ msg: DataX.Message) -> Bool {
+        assistantRouteLock.lock()
+        defer { assistantRouteLock.unlock() }
+        guard assistantChannels.contains(msg.channel) else { return false }
+        if assistantBacklog.count >= Self.assistantBacklogLimit { assistantBacklog.removeFirst() }
+        assistantBacklog.append(msg)
+        return true
+    }
+
     private func recvMessage(timeout: TimeInterval, includePending: Bool = true,
                              handlesAirshipOffers: Bool = false, bulkChannels: Set<UInt16> = [],
-                             tracePayload: Bool = true) throws -> DataX.Message {
+                             tracePayload: Bool = true, forAssistant: Bool = false) throws -> DataX.Message {
         let deadline = Date().addingTimeInterval(timeout)
         receiveLock.lock()
         defer { receiveLock.unlock() }
         while true {
             let msg: DataX.Message
-            if includePending, !pendingSetupMessages.isEmpty {
+            if forAssistant, let parked = takeAssistantBacklog() {
+                return parked
+            } else if includePending, !pendingSetupMessages.isEmpty {
                 msg = pendingSetupMessages.removeFirst()
             } else if let decoded = decodedMessages.popFirst() {
                 msg = decoded
@@ -615,6 +649,7 @@ final class Session {
                 try? sendStatus(msg.channel, 0xC001)
                 continue
             }
+            if !forAssistant, parkForAssistant(msg) { continue }
             if !handlesAirshipOffers, try rejectUnrequestedAirshipOffer(msg) { continue }
             return msg
         }
@@ -896,8 +931,8 @@ final class Session {
     private var servicesNamed: Set<UInt16> = []
 
     /// The next message from any channel, for a reader loop that owns the link.
-    func nextMessage(timeout: TimeInterval, tracePayload: Bool = true) throws -> DataX.Message {
-        try recvMessage(timeout: timeout, tracePayload: tracePayload)
+    func nextMessage(timeout: TimeInterval, tracePayload: Bool = true, forAssistant: Bool = false) throws -> DataX.Message {
+        try recvMessage(timeout: timeout, tracePayload: tracePayload, forAssistant: forAssistant)
     }
 
     /// Sends and waits for the answer of one type on the same channel.
@@ -1304,8 +1339,12 @@ final class Session {
                             namespace: String(decoding: namespace, as: UTF8.self), size: size)
     }
 
+    /// Airship sends one file at a time. An offer nobody answers holds back every later one, which is how
+    /// the 1.00 log's Bluetooth import got only acknowledgements (offer ch 0x8179 at 13:43:22 arrived before
+    /// the capture channel was open, was skipped, and 6 requested files never came). Answer each offer as
+    /// soon as the owner link is trusted; a later request queues the asset again.
     private func rejectUnrequestedAirshipOffer(_ message: DataX.Message) throws -> Bool {
-        guard serviceChannels["captures"] != nil, let offer = try Self.airshipOffer(message) else { return false }
+        guard ownerTrustCompleted, let offer = try Self.airshipOffer(message) else { return false }
         // Drop answers this queue entry. Deleting a capture is a separate svc18 command.
         try sendAirshipReply(Self.airDrop, on: offer.mirror, payload: PB.bytes(1, offer.id))
         emit("media: declined an unrequested Airship offer")

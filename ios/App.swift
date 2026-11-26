@@ -428,6 +428,7 @@ final class Glasses: NSObject, ObservableObject {
         scanTimer = nil
         scanStartedAt = nil
         recoveryScanID = nil
+        rotationWatchID = nil
         if central.state == .poweredOn { central.stopScan() }
         if scanning, !ignoredAdvertisers.isEmpty {
             note("附近还有 \(ignoredAdvertisers.count) 个未列出的蓝牙信号")
@@ -490,7 +491,8 @@ final class Glasses: NSObject, ObservableObject {
         phase = .reconnecting(max(1, recoveryAttempts))
         glassesLine = "正在附近寻找上次连接的眼镜"
         note("短时搜索上次连接的眼镜")
-        central.scanForPeripherals(withServices: nil, options: nil)
+        let inBackground = UIApplication.shared.applicationState == .background
+        central.scanForPeripherals(withServices: inBackground ? [CBUUID(string: Self.metaService)] : nil, options: nil)
         scanTimer = Timer.scheduledTimer(withTimeInterval: 7, repeats: false) { [weak self] timer in
             Task { @MainActor in
                 guard let self, self.scanTimer === timer, self.recoveryScanID == id else { return }
@@ -510,14 +512,64 @@ final class Glasses: NSObject, ObservableObject {
     /// the saved one was never found, while the same glasses advertised under a new one). When the saved
     /// identifier is gone, connect to a Meta glasses candidate instead; the owner check in the handshake
     /// decides whether it is ours, and a successful one re-saves the new identifier.
+    ///
+    /// It may also replace a pending connect to the saved identifier that iOS can no longer complete.
+    /// Recovery stays aimed at the saved identifier, so a candidate that fails sends it back there.
     private func adoptRecoveryCandidate(_ p: CBPeripheral, why: String) {
-        guard !rejectedCandidates.contains(p.identifier), channel == nil, !connecting else { return }
+        guard !rejectedCandidates.contains(p.identifier), channel == nil, !openingL2CAP,
+              disconnectingPeripheral == nil, reconnectAfterDisconnect == nil else { return }
+        if connecting {
+            guard let stale = peripheral, stale.identifier != p.identifier, stale.state != .connected else { return }
+            connectionTimeoutTask?.cancel()
+            connectionTimeoutTask = nil
+            connectionAttempt = nil
+            connecting = false
+            connectingID = nil
+            central.cancelPeripheralConnection(stale)
+        }
         stopScanning()
-        resetRecovery()
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        if recoveringID == nil, let saved = savedGlassesID, saved != p.identifier { recoveringID = saved }
         discoveredPeripherals[p.identifier] = p
         adoptingID = p.identifier
         note("上次的蓝牙标识已失效，改连\(why)的眼镜 · \(p.identifier.uuidString.suffix(4))，握手时核对主人身份")
         beginConnection(p.identifier)
+    }
+
+    /// While iOS keeps trying the saved identifier, a scan shows whether the glasses now advertise under
+    /// another one. 1.00 log 13:42:26–13:43:13: three 9-second timeouts on the old identifier, while the
+    /// same glasses advertised as a new "未命名设备" that only a manual tap connected.
+    private var rotationWatchID: UUID?
+    /// Non-owner failures of adopted candidates; two in a row and recovery stops picking that one.
+    private var candidateFailures: [UUID: Int] = [:]
+
+    private func startRotationWatch(_ id: UUID) {
+        guard central.state == .poweredOn, !scanning, recoveryScanID == nil else { return }
+        rotationWatchID = id
+        // A background scan must name a service; the glasses list FD5F in their advertisement.
+        if UIApplication.shared.applicationState == .background {
+            central.scanForPeripherals(withServices: [CBUUID(string: Self.metaService)], options: nil)
+        } else {
+            central.scanForPeripherals(withServices: nil,
+                                       options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        }
+    }
+
+    private func stopRotationWatch() {
+        guard rotationWatchID != nil else { return }
+        rotationWatchID = nil
+        if !scanning, recoveryScanID == nil, central.state == .poweredOn { central.stopScan() }
+    }
+
+    private func armConnectionTimeout(_ p: CBPeripheral, attempt: UUID, seconds: UInt64) {
+        connectionTimeoutTask?.cancel()
+        connectionTimeoutTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: seconds * 1_000_000_000) } catch { return }
+            guard let self, self.connectionAttempt == attempt, self.peripheral === p else { return }
+            let reason = p.state == .connected ? "打开眼镜蓝牙通道超时" : "蓝牙连接眼镜超时"
+            self.failConnection(reason, peripheral: p)
+        }
     }
 
     private func systemConnectedCandidate() -> CBPeripheral? {
@@ -611,16 +663,17 @@ final class Glasses: NSObject, ObservableObject {
         connectionStartedAt = Date()
         let automatic = recoveringID == id
         connectionTimeoutTask?.cancel()
-        connectionTimeoutTask = Task { [weak self] in
-            do { try await Task.sleep(nanoseconds: automatic ? 9_000_000_000 : 15_000_000_000) } catch { return }
-            guard let self, self.connectionAttempt == attempt, self.peripheral === p else { return }
-            let reason = p.state == .connected ? "打开眼镜蓝牙通道超时" : "蓝牙连接眼镜超时"
-            self.failConnection(reason, peripheral: p)
+        connectionTimeoutTask = nil
+        // In the background a pending connect simply waits: iOS completes it whenever the glasses come
+        // back and wakes the app. The foreground timeout is armed again when the app returns.
+        if !(automatic && UIApplication.shared.applicationState == .background) {
+            armConnectionTimeout(p, attempt: attempt, seconds: automatic ? 9 : 15)
         }
         if p.state == .connected {
             openLink(p)
-        } else if p.state == .disconnected {
-            central.connect(p, options: nil)
+        } else {
+            if p.state == .disconnected { central.connect(p, options: nil) }
+            if !forRegistration, id == savedGlassesID { startRotationWatch(id) }
         }
     }
 
@@ -641,16 +694,64 @@ final class Glasses: NSObject, ObservableObject {
         beginConnection(id)
     }
 
-    func suspendReconnectForBackground() {
+    /// Until 1.00 going to the background cancelled every reconnect, so glasses that dropped while the
+    /// phone was in a pocket stayed gone until the app was opened. Now one pending connect stays (plus a
+    /// service-filtered scan for a rotated identifier); the Bluetooth background mode wakes the app for it.
+    func enterBackground() {
+        note("App 进入后台")
+        wentToBackground = true
         guard mediaImportID == nil else { return }
-        stopScanning()
-        guard !connected, recoveringID != nil else { return }
+        if scanning { stopScanning() }
+        guard !connected, channel == nil, !openingL2CAP, phase != .handshaking,
+              let id = savedGlassesID, canRetryConnection(id) else { return }
+        if connecting, let p = peripheral, p.state != .connected {
+            if p.identifier == id {
+                connectionTimeoutTask?.cancel()
+                connectionTimeoutTask = nil
+                stopRotationWatch()
+                startRotationWatch(id)
+                glassesLine = "后台等待眼镜回来"
+            }
+            return
+        }
+        _ = waitInBackground(for: id)
+    }
+
+    func enterForeground() {
+        if wentToBackground { note("App 回到前台") }
+        wentToBackground = false
+        if connecting, connectionTimeoutTask == nil, let p = peripheral, p.state != .connected,
+           let attempt = connectionAttempt {
+            // A background wait: give it the foreground timeout and the full scan for a rotated identifier.
+            stopRotationWatch()
+            armConnectionTimeout(p, attempt: attempt, seconds: 9)
+            if p.identifier == savedGlassesID { startRotationWatch(p.identifier) }
+            return
+        }
+        backgroundWaits.removeAll()
+        autoReconnect()
+    }
+
+    private var backgroundWaits: [Date] = []
+    private var wentToBackground = false
+
+    /// In the background nobody can tap "connect", so leave one pending connect for the saved glasses.
+    /// Capped so a link that fails right after connecting cannot spin while the phone is in a pocket.
+    private func waitInBackground(for id: UUID) -> Bool {
+        guard UIApplication.shared.applicationState == .background, savedGlassesID == id, canRetryConnection(id),
+              !connecting, channel == nil else { return false }
+        let now = Date()
+        backgroundWaits = backgroundWaits.filter { now.timeIntervalSince($0) < 120 } + [now]
+        guard backgroundWaits.count <= 5 else {
+            note("后台重连连续失败，回到前台后再试")
+            return false
+        }
         resetRecovery()
-        reconnectAfterDisconnect = nil
-        clearLink()
-        if let peripheral { requestDisconnect(peripheral) }
-        phase = .idle
-        glassesLine = "回到前台后会继续寻找眼镜"
+        recoveringID = id
+        glassesLine = "后台等待眼镜回来"
+        note("后台等待眼镜回来（iOS 会在眼镜出现时完成连接）")
+        beginConnection(id)
+        return true
     }
 
     private var savedGlassesID: UUID? {
@@ -712,6 +813,8 @@ final class Glasses: NSObject, ObservableObject {
             connected = true
             connectingID = nil
             phase = .connected
+            assistantAutoTries = 0
+            if UIApplication.shared.applicationState == .background { note("后台重新连上了眼镜") }
             if trust {
                 verifiedAt = ContinuousClock.now
                 UserDefaults.standard.set(true, forKey: "isOwner")
@@ -828,6 +931,7 @@ final class Glasses: NSObject, ObservableObject {
         retriedL2CAP = false
         openingL2CAP = false
         ownerRegistrationCompleted = false
+        assistantAutoTries = 0
         busy = mediaImportID != nil
         settingsLoading = false
         loadCatalogAfterStatus = false
@@ -855,7 +959,9 @@ final class Glasses: NSObject, ObservableObject {
 
     private func failConnection(_ reason: String, peripheral p: CBPeripheral, underlying: Error? = nil) {
         guard peripheral === p else { return }
-        if adoptingID == p.identifier { adoptingID = nil }
+        let wasAdopted = adoptingID == p.identifier
+        if wasAdopted { adoptingID = nil }
+        stopRotationWatch()
         if mediaWiFiSwitching, mediaImportID != nil {
             releaseBluetoothForMediaWiFi()
             note("切换到眼镜 Wi-Fi 期间蓝牙控制通道关闭")
@@ -866,6 +972,16 @@ final class Glasses: NSObject, ObservableObject {
         clearLink()
         requestDisconnect(p)
         if let underlying { note("蓝牙通道错误：\(underlying)") }
+        if wasAdopted, let saved = savedGlassesID, saved != p.identifier {
+            let failures = (candidateFailures[p.identifier] ?? 0) + 1
+            candidateFailures[p.identifier] = failures
+            if failures >= 2 { rejectedCandidates.insert(p.identifier) }
+            // Back to the saved identifier; its watch can pick the next candidate.
+            if recoveringID == saved {
+                finishRecoveryOrShowFailure(saved, reason: reason)
+                return
+            }
+        }
         finishRecoveryOrShowFailure(p.identifier, reason: reason)
     }
 
@@ -882,7 +998,7 @@ final class Glasses: NSObject, ObservableObject {
     private func canRetryConnection(_ id: UUID) -> Bool {
         guard savedGlassesID == id, owner != nil, !autoReconnectSuppressed,
               !mediaWiFiSwitching, mediaImportID == nil || recoveringMediaJob == mediaImportID,
-              central.state == .poweredOn, UIApplication.shared.applicationState != .background else { return false }
+              central.state == .poweredOn else { return false }
         if case .rejected = ownerState { return false }
         return true
     }
@@ -890,6 +1006,7 @@ final class Glasses: NSObject, ObservableObject {
     private func finishRecoveryOrShowFailure(_ id: UUID, reason: String) {
         note(reason)
         guard let attempt = scheduleRecovery(id) else {
+            if waitInBackground(for: id) { return }
             connectingID = nil
             phase = .failed(reason)
             glassesLine = reason
@@ -1027,9 +1144,25 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: capture
 
+    /// Every link operation runs here. A registered assistant parks its reader for the duration, so
+    /// Hey Meta can stay on while photos, imports and settings use the same link.
     private func onGlassesQueue<T>(_ work: @escaping () throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { continuation in
-            glassesQueue.async { continuation.resume(with: Result { try work() }) }
+        let reader = assistantRef
+        return try await withCheckedThrowingContinuation { continuation in
+            glassesQueue.async {
+                reader?.pauseReading()
+                defer { reader?.resumeReading() }
+                continuation.resume(with: Result { try work() })
+            }
+        }
+    }
+
+    private func onGlassesQueueAsync(_ work: @escaping () -> Void) {
+        let reader = assistantRef
+        glassesQueue.async {
+            reader?.pauseReading()
+            defer { reader?.resumeReading() }
+            work()
         }
     }
 
@@ -1047,7 +1180,7 @@ final class Glasses: NSObject, ObservableObject {
             mediaMessage = "请先连接眼镜并验证主人身份。"
             return nil
         }
-        guard !busy, !settingsLoading, live == nil, assistantRef == nil else {
+        guard !busy, !settingsLoading, live == nil else {
             mediaMessage = "眼镜正在处理其他操作，请稍后再试。"
             return nil
         }
@@ -1095,7 +1228,7 @@ final class Glasses: NSObject, ObservableObject {
 
     var canStartMediaImport: Bool {
         canUseGlasses && !busy && !settingsLoading && !recording && !mediaImportInProgress
-            && live == nil && assistantRef == nil
+            && live == nil
     }
 
     func localMediaURL(for capture: Capture) -> URL? {
@@ -1175,7 +1308,7 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     var canDeleteGlassesCaptures: Bool {
-        canUseGlasses && !busy && !settingsLoading && live == nil && assistantRef == nil
+        canUseGlasses && !busy && !settingsLoading && live == nil
     }
 
     /// Called only after the user confirms the exact selection in the glasses album.
@@ -1292,46 +1425,64 @@ final class Glasses: NSObject, ObservableObject {
             }
         }
 
-        for (index, request) in requests.enumerated() {
+        // Once per batch: a request the glasses only acknowledge gets one more try on a fresh session.
+        var refreshedSilentLink = false
+        requestLoop: for (index, request) in requests.enumerated() {
             guard mediaImportID == job, !cancellation.isCancelled else { break }
-            var active = bluetooth
-            if active == nil || session !== active || stream == nil {
-                active = await restoreMediaBluetooth(control: control, job: job)
-            }
-            guard let active, mediaImportID == job, !cancellation.isCancelled else {
-                if mediaImportID == job, !cancellation.isCancelled {
-                    mediaImportFailedIDs.formUnion(requests[index...].map(\.capture.id))
-                    failure = failure ?? LinkError.io("蓝牙控制连接尚未恢复。")
+            var triesLeft = 2
+            while triesLeft > 0 {
+                triesLeft -= 1
+                var active = bluetooth
+                if active == nil || session !== active || stream == nil {
+                    active = await restoreMediaBluetooth(control: control, job: job)
                 }
-                break
-            }
-            bluetooth = active
-            let capture = request.capture
-            let assetID = request.assetID
-            let progressUpdate = mediaProgress([request], job: job, route: "蓝牙")
-            transferDetail = "蓝牙 · 等待文件"
-            mediaImportCurrentID = capture.id
-            progress[capture.id] = 0
-            do {
-                let batch = try await onGlassesQueue {
-                    guard !cancellation.isCancelled else { throw CancellationError() }
-                    try active.requestAsset(handle: capture.handle, assetID: request.asset.uuid)
-                    return try active.receiveMediaFilesToDisk(expectedAssetIDs: [assetID],
-                        timeout: 45, maximumDuration: max(300, Double(request.asset.size) / 8_192),
-                        onBytes: progressUpdate, isCancelled: { cancellation.isCancelled })
+                guard let active, mediaImportID == job, !cancellation.isCancelled else {
+                    if mediaImportID == job, !cancellation.isCancelled {
+                        mediaImportFailedIDs.formUnion(requests[index...].map(\.capture.id))
+                        failure = failure ?? LinkError.io("蓝牙控制连接尚未恢复。")
+                    }
+                    break requestLoop
                 }
-                guard mediaImportID == job else { return }
-                guard let staged = batch.files[assetID] else {
-                    throw batch.error ?? batch.failures[assetID] ?? LinkError.unexpected("眼镜没有发送文件。")
+                bluetooth = active
+                let capture = request.capture
+                let assetID = request.assetID
+                let progressUpdate = mediaProgress([request], job: job, route: "蓝牙")
+                let offered = OfferSeen()
+                transferDetail = "蓝牙 · 等待文件"
+                mediaImportCurrentID = capture.id
+                progress[capture.id] = 0
+                do {
+                    let batch = try await onGlassesQueue {
+                        guard !cancellation.isCancelled else { throw CancellationError() }
+                        try active.requestAsset(handle: capture.handle, assetID: request.asset.uuid)
+                        return try active.receiveMediaFilesToDisk(expectedAssetIDs: [assetID],
+                            timeout: 45, maximumDuration: max(300, Double(request.asset.size) / 8_192),
+                            onBytes: { id, got, total in
+                                offered.seen = true
+                                progressUpdate(id, got, total)
+                            }, isCancelled: { cancellation.isCancelled })
+                    }
+                    guard mediaImportID == job else { return }
+                    guard let staged = batch.files[assetID] else {
+                        throw batch.error ?? batch.failures[assetID] ?? LinkError.unexpected("眼镜没有发送文件。")
+                    }
+                    let error = await finishMediaFile(staged, capture: capture, job: job,
+                                                      saveToPhotos: saveToPhotos, cancellation: cancellation)
+                    failure = failure ?? error
+                    break
+                } catch {
+                    guard mediaImportID == job, !cancellation.isCancelled else { break requestLoop }
+                    if triesLeft > 0, !refreshedSilentLink, !offered.seen, Self.isSilentTransfer(error) {
+                        refreshedSilentLink = true
+                        note("眼镜只确认了请求、没有发送文件：重建蓝牙会话后再请求一次")
+                        bluetooth = await restartMediaBluetooth(control: control, job: job)
+                        continue
+                    }
+                    mediaImportFailedIDs.insert(capture.id)
+                    failure = failure ?? error
+                    if case LinkError.badMAC = error { reportOperationError(error, session: active) }
+                    break
                 }
-                let error = await finishMediaFile(staged, capture: capture, job: job,
-                                                  saveToPhotos: saveToPhotos, cancellation: cancellation)
-                failure = failure ?? error
-            } catch {
-                guard mediaImportID == job, !cancellation.isCancelled else { break }
-                mediaImportFailedIDs.insert(capture.id)
-                failure = failure ?? error
-                if case LinkError.badMAC = error { reportOperationError(error, session: active) }
             }
         }
 
@@ -1392,8 +1543,33 @@ final class Glasses: NSObject, ObservableObject {
                         self.transferDetail = "Wi-Fi · 等待手动加入同一热点"
                     }
                 }
-                guard await self.askToJoinMediaWiFi(endpoint, id: job) else { throw MediaWiFiError.hotspotUserDenied }
+                // Once iOS knows the network it can join by itself, or the user picks it in Control Center;
+                // either way the glasses answer on TCP, and the sheet closes without a tap on "已加入".
+                let watcher = Task { @MainActor [weak self] () -> MediaWiFiTransport? in
+                    while !Task.isCancelled {
+                        if let transport = try? await MediaWiFiTransport.connectManuallyJoined(
+                            host: endpoint.address, port: endpoint.port, connectTimeout: 3) {
+                            guard !Task.isCancelled, let self, self.mediaImportID == job else {
+                                transport.close()
+                                return nil
+                            }
+                            self.note("已检测到 iPhone 加入了眼镜 Wi-Fi")
+                            self.resolveManualMediaWiFi(true)
+                            return transport
+                        }
+                        try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    }
+                    return nil
+                }
+                let joined = await self.askToJoinMediaWiFi(endpoint, id: job)
+                watcher.cancel()
+                let early = await watcher.value
+                guard joined else {
+                    early?.close()
+                    throw MediaWiFiError.hotspotUserDenied
+                }
                 try Task.checkCancellation()
+                if let early { return early }
                 return try await MediaWiFiTransport.connectManuallyJoined(host: endpoint.address, port: endpoint.port)
             }
             mediaWiFiConnectTask = connectTask
@@ -1461,6 +1637,20 @@ final class Glasses: NSObject, ObservableObject {
         channel = nil
         oldStream?.close()
         glassesLine = "导入切换到眼镜 Wi-Fi，蓝牙控制暂时让出"
+    }
+
+    nonisolated static func isSilentTransfer(_ error: Error) -> Bool {
+        if case LinkError.unexpected(let reason) = error { return reason.contains("暂停过久") }
+        return false
+    }
+
+    /// A new L2CAP session on the same radio link, as the Wi-Fi switch does. 0.99 log 10:31:53: after a
+    /// session that only acknowledged requests, the next one had the glasses offering files at once.
+    private func restartMediaBluetooth(control: Session, job: UUID) async -> Session? {
+        guard mediaImportID == job else { return nil }
+        if stream != nil { releaseBluetoothForMediaWiFi() }
+        glassesLine = "正在重建蓝牙会话"
+        return await restoreMediaBluetooth(control: control, job: job)
     }
 
     private func restoreMediaBluetooth(control: Session, job: UUID) async -> Session? {
@@ -1634,7 +1824,7 @@ final class Glasses: NSObject, ObservableObject {
         if phaseBusy, peripheral?.identifier == queued.peripheralID { return false }
         cancelQueuedGlassesAction()
         guard UIApplication.shared.applicationState == .active, canUseGlasses,
-              peripheral?.identifier == queued.peripheralID, assistantRef == nil, live == nil else {
+              peripheral?.identifier == queued.peripheralID, live == nil else {
             mediaMessage = "排队的拍摄已取消，请重新操作。"
             return false
         }
@@ -1759,13 +1949,17 @@ final class Glasses: NSObject, ObservableObject {
 
     func refreshVisibleDeviceStatus() {
         guard UIApplication.shared.applicationState == .active, canUseGlasses,
-              !busy, !settingsLoading, live == nil, assistantRef == nil else { return }
+              !busy, !settingsLoading, live == nil else { return }
         refreshStatus()
     }
 
     private func startPendingStatusRefresh() {
         guard statusRefreshPending, canUseGlasses, let active = session, !busy, !settingsLoading, !mediaImportInProgress,
-              live == nil, assistantRef == nil else { return }
+              live == nil else {
+            // Every operation ends here; once nothing else is waiting, put Hey Meta back on the link.
+            if !statusRefreshPending, !loadCatalogAfterStatus, queuedCamera == nil { autoStartAssistantIfWanted() }
+            return
+        }
         statusRefreshPending = false
         statusRefreshing = true
         statusMessage = nil
@@ -1825,6 +2019,31 @@ final class Glasses: NSObject, ObservableObject {
         canUseGlasses && !busy && !settingsLoading && !recording && live == nil && assistantRef == nil
     }
 
+    /// Hey Meta questions only reach the app while it is registered with the glasses; built-in commands
+    /// ("take a video") work without it, which is why the 1.00 test got videos but no answers.
+    /// Registering after every connection is the default; turning it off in the assistant tab sticks.
+    var assistantAutoStart: Bool {
+        get { UserDefaults.standard.object(forKey: "assistantAutoStart") as? Bool ?? true }
+        set {
+            objectWillChange.send()
+            UserDefaults.standard.set(newValue, forKey: "assistantAutoStart")
+        }
+    }
+    /// Automatic registrations tried on the current link, so a failing one cannot loop.
+    private var assistantAutoTries = 0
+
+    var assistantModelConfigured: Bool {
+        ModelClient.baseComponents(modelBaseURL) != nil
+            && !modelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func autoStartAssistantIfWanted() {
+        guard assistantAutoStart, assistantModelConfigured, ownerState == .verified, mediaImportID == nil,
+              assistantAutoTries < 2, canStartAssistant else { return }
+        assistantAutoTries += 1
+        startAssistant(automatic: true)
+    }
+
     private func resetVoiceTurn() {
         voiceWait?.cancel()
         voiceWait = nil
@@ -1836,14 +2055,15 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     /// svc15 registration: after this the glasses' own wake word routes to this app.
-    func startAssistant() {
+    func startAssistant(automatic: Bool = false) {
         guard canStartAssistant, let sess = session else { return }
-        guard ModelClient.baseComponents(modelBaseURL) != nil, !modelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard assistantModelConfigured else {
             assistantMessage = "请先选择并保存助手模型。"
             return
         }
+        if !automatic { assistantAutoStart = true }
         let a = Assistant(session: sess)
-        note("眼镜语音：用户请求启用，开始注册眼镜语音")
+        note(automatic ? "眼镜语音：连接后自动注册（可在助手页关闭）" : "眼镜语音：用户请求启用，开始注册眼镜语音")
         assistantMessage = "正在等眼镜确认语音注册…"
         assistantAnswer = ""
         assistantRegistering = true
@@ -1921,12 +2141,33 @@ final class Glasses: NSObject, ObservableObject {
         assistantOn = false
         assistantRegistering = false
         resetVoiceTurn()
-        assistantMessage = "眼镜语音未就绪 · \(Glasses.explain(error))"
-        note("眼镜语音故障：\(error)")
+        let linkChanged = session !== active || stream == nil || mediaWiFiSwitching
+        if linkChanged {
+            // The link was handed to Wi-Fi or dropped; the next connection registers again by itself.
+            assistantMessage = assistantAutoStart ? "眼镜语音暂停：连接恢复后会自动重新注册。" : nil
+            note("眼镜语音随连接结束：\(error)")
+        } else {
+            assistantMessage = "眼镜语音未就绪 · \(Glasses.explain(error))"
+            note("眼镜语音故障：\(error)")
+        }
         if case LinkError.badMAC = error, let p = peripheral, session === active {
             failConnection("眼镜语音连接校验失败。", peripheral: p)
         } else {
             startPendingStatusRefresh()
+        }
+    }
+
+    /// Asks iOS for running time when Bluetooth wakes the app in the background, so a handshake, the
+    /// assistant registration or a model answer can finish before the app is suspended again.
+    private func holdBackgroundTime(_ name: String, seconds: TimeInterval = 25) {
+        guard UIApplication.shared.applicationState == .background else { return }
+        let box = BackgroundTaskBox()
+        box.id = UIApplication.shared.beginBackgroundTask(withName: name) {
+            MainActor.assumeIsolated { box.end() }
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            box.end()
         }
     }
 
@@ -1942,6 +2183,7 @@ final class Glasses: NSObject, ObservableObject {
         let client = configuredModel
         assistantMessage = "已收到问题，正在调用 \(client.model)…"
         note("眼镜语音：已收到转写，开始调用用户配置的模型")
+        holdBackgroundTime("hey-meta-answer", seconds: 28)
         voiceAnswer = Task { [weak self, weak assistant] in
             guard let self, let assistant else { return }
             let text: String
@@ -1970,6 +2212,7 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     func stopAssistant() {
+        assistantAutoStart = false
         guard let assistantRef else { return }
         assistantRef.stop()
         self.assistantRef = nil
@@ -1983,7 +2226,16 @@ final class Glasses: NSObject, ObservableObject {
 
     func startLive() {
         guard canUseGlasses, let sess = session, !busy, !settingsLoading,
-              !recording, live == nil, assistantRef == nil else { return }
+              !recording, live == nil else { return }
+        if let assistant = assistantRef {
+            // Live reads the link on its own threads. Hey Meta steps aside until the reconnect that
+            // ends a live view registers it again; the user's on/off choice stays as it is.
+            assistant.stop()
+            assistantRef = nil
+            assistantOn = false
+            resetVoiceTurn()
+            note("实验取景期间暂停 Hey Meta 接管")
+        }
         let l = LiveStream(session: sess)
         l.log = { [weak self] line in self?.note("live: \(line)") }
         l.onPhase = { [weak self] phase in
@@ -2413,11 +2665,11 @@ final class Glasses: NSObject, ObservableObject {
     /// Reads the whole settings namespace once and keeps it keyed by setting name.
     func loadSettings() {
         guard canUseGlasses, let sess = session, !busy, !settingsLoading,
-              live == nil, assistantRef == nil else {
+              live == nil else {
             return
         }
         settingsLoading = true
-        glassesQueue.async { [weak self] in
+        onGlassesQueueAsync { [weak self] in
             do {
                 let objects = try sess.driveObjects()
                 var map: [String: String] = [:]
@@ -2445,14 +2697,14 @@ final class Glasses: NSObject, ObservableObject {
     /// Writes one setting and only reports success if the read-back agrees.
     func writeSetting(_ key: String, _ value: String) {
         guard canUseGlasses, let sess = session, !busy, !settingsLoading,
-              live == nil, assistantRef == nil else {
+              live == nil else {
             note("先连接眼镜，再改设置")
             return
         }
         note("写 \(key) = \(value)")
         let schema = SettingsSchemaTable.schema(key)
         settingsLoading = true
-        glassesQueue.async { [weak self] in
+        onGlassesQueueAsync { [weak self] in
             do {
                 // Firmware-parsed settings go over svc31; the rest live in RLDrive.
                 // Either way the write is only trusted once a read comes back equal.
@@ -2557,7 +2809,17 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
         let rssi = RSSI.intValue
         let observedAt = ContinuousClock.now
         Task { @MainActor in
-            guard c === self.central, self.scanning, let startedAt = self.scanStartedAt, observedAt >= startedAt else { return }
+            guard c === self.central else { return }
+            if let watched = self.rotationWatchID {
+                // The saved identifier advertising itself means the pending connect will take it.
+                guard id != watched, metaCandidate, isConnectable, (-90 ... -1).contains(rssi),
+                      !self.rejectedCandidates.contains(id),
+                      let started = self.connectionStartedAt, Date().timeIntervalSince(started) >= 2 else { return }
+                self.discoveredPeripherals[id] = p
+                self.adoptRecoveryCandidate(p, why: "附近")
+                return
+            }
+            guard self.scanning, let startedAt = self.scanStartedAt, observedAt >= startedAt else { return }
             let target = self.recoveryScanID == id && self.canRetryConnection(id)
             let index = self.devices.firstIndex { $0.id == id }
             let previous = index.map { self.devices[$0] }
@@ -2601,6 +2863,14 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
         Task { @MainActor in
             guard c === self.central else { return }
+            if self.peripheral === p {
+                self.stopRotationWatch()
+                self.holdBackgroundTime("glasses-reconnect", seconds: 28)
+                if let attempt = self.connectionAttempt, self.connectionTimeoutTask == nil {
+                    // Connected from a background wait: the L2CAP open and handshake still get a deadline.
+                    self.armConnectionTimeout(p, attempt: attempt, seconds: 15)
+                }
+            }
             self.openLink(p)
         }
     }
@@ -2682,6 +2952,21 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             guard let channel, self.channel === channel else { return }
             self.failConnection("眼镜蓝牙数据通道已关闭。", peripheral: p, underlying: error)
         }
+    }
+}
+
+/// Set from the link queue when the glasses start a file, read after the transfer returns.
+private final class OfferSeen: @unchecked Sendable {
+    var seen = false
+}
+
+@MainActor private final class BackgroundTaskBox {
+    var id: UIBackgroundTaskIdentifier = .invalid
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
     }
 }
 

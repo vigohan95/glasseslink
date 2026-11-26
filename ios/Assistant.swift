@@ -61,6 +61,12 @@ final class Assistant {
     private var incomingTypes = IncomingTypes()
     private var m0: UInt16 = 0
     private var s0: UInt16 = 0
+    /// Other link work (a photo, an import, a status read) parks the reader instead of ending the
+    /// registration; the session keeps this assistant's messages for it meanwhile.
+    private let pauseCondition = NSCondition()
+    private var pauseRequests = 0
+    private var readerParked = false
+    private var readerActive = false
 
     private enum Endpoint: String {
         case messages = "assistant-m0"
@@ -255,7 +261,7 @@ final class Assistant {
 
     private func nextIfAvailable(timeout: TimeInterval) throws -> DataX.Message? {
         do {
-            return try session.nextMessage(timeout: timeout, tracePayload: false)
+            return try session.nextMessage(timeout: timeout, tracePayload: false, forAssistant: true)
         } catch LinkError.unexpected(let message) where message.hasPrefix("timeout waiting for a frame") {
             return nil
         }
@@ -293,6 +299,10 @@ final class Assistant {
         }
         running = true
         stateLock.unlock()
+        session.routeToAssistant([m0, m0 ^ 0x8000, s0, s0 ^ 0x8000])
+        pauseCondition.lock()
+        readerActive = true
+        pauseCondition.unlock()
         let worker = Thread { [weak self] in self?.loop() }
         worker.name = "assistant"
         worker.start()
@@ -300,15 +310,62 @@ final class Assistant {
 
     func stop() {
         stateLock.lock()
+        let wasRunning = running
         stopped = true
         running = false
         turn = nil
         stateLock.unlock()
+        if wasRunning { session.routeToAssistant([]) }
+        pauseCondition.lock()
+        pauseCondition.broadcast()
+        pauseCondition.unlock()
+    }
+
+    /// Blocks until the reader is parked (or not running), so the caller can read the link alone.
+    /// Every call must be balanced by `resumeReading()`. Returns false if the reader did not park in time.
+    @discardableResult
+    func pauseReading(timeout: TimeInterval = 3) -> Bool {
+        pauseCondition.lock()
+        defer { pauseCondition.unlock() }
+        pauseRequests += 1
+        let deadline = Date().addingTimeInterval(timeout)
+        while readerActive && !readerParked {
+            if !pauseCondition.wait(until: deadline) { return readerParked || !readerActive }
+        }
+        return true
+    }
+
+    func resumeReading() {
+        pauseCondition.lock()
+        pauseRequests = max(0, pauseRequests - 1)
+        pauseCondition.broadcast()
+        pauseCondition.unlock()
+    }
+
+    private func parkWhilePaused() {
+        pauseCondition.lock()
+        defer { pauseCondition.unlock() }
+        guard pauseRequests > 0 else { return }
+        readerParked = true
+        pauseCondition.broadcast()
+        while pauseRequests > 0 && registered {
+            _ = pauseCondition.wait(until: Date().addingTimeInterval(1))
+        }
+        readerParked = false
     }
 
     private func loop() {
+        defer {
+            pauseCondition.lock()
+            readerActive = false
+            readerParked = false
+            pauseCondition.broadcast()
+            pauseCondition.unlock()
+        }
         do {
             while registered {
+                parkWhilePaused()
+                guard registered else { return }
                 if let message = try nextIfAvailable(timeout: receiveTimeout), registered {
                     try handle(message)
                 }
@@ -321,12 +378,8 @@ final class Assistant {
         }
     }
 
-    private var receiveTimeout: TimeInterval {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        // Incoming frames wake the transport immediately. Only an active turn has time-based work.
-        return turn == nil ? 15 : 1
-    }
+    /// Short so a pause request is honoured within half a second; frames still wake the read at once.
+    private var receiveTimeout: TimeInterval { 0.5 }
 
     private func handle(_ message: DataX.Message) throws {
         if accepts(message, on: s0) {

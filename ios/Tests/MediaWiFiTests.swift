@@ -73,4 +73,26 @@ final class MediaWiFiTests: XCTestCase {
                                                                  requestedPassword: "requested-only"))
         }
     }
+
+    /// A fixed, readable network lets iOS remember the hotspot after one manual join.
+    func testHotspotCredentialsStayTheSameAndAreReadable() throws {
+        let suite = "hotspot-test-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let first = MediaHotspotCredentials.current(defaults)
+        let second = MediaHotspotCredentials.current(defaults)
+        XCTAssertEqual(first.ssid, second.ssid)
+        XCTAssertEqual(first.password, second.password)
+        XCTAssertTrue(MediaHotspotCredentials.isValid(ssid: first.ssid, password: first.password))
+        XCTAssertTrue(first.ssid.hasPrefix("GlassesLink-"))
+        XCTAssertEqual(first.password.count, 14)
+        XCTAssertEqual(first.password.filter { $0 == "-" }.count, 2)
+        XCTAssertFalse(first.password.contains { "0o1li".contains($0) })
+        XCTAssertNoThrow(try MediaWiFiProtocol.makeRequest(countryCode: "US", id: UUID(),
+                                                           ssid: first.ssid, password: first.password))
+
+        defaults.set("short", forKey: MediaHotspotCredentials.passwordKey)
+        let replaced = MediaHotspotCredentials.current(defaults)
+        XCTAssertTrue(MediaHotspotCredentials.isValid(ssid: replaced.ssid, password: replaced.password))
+    }
 }
