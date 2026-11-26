@@ -173,6 +173,12 @@ final class Assistant: @unchecked Sendable {
     /// True when the words come from the phone's recogniser (a language the glasses do not recognise).
     /// Then the glasses' request only names the turn, and the microphone stream is handed out below.
     var transcribesOnPhone: () -> Bool = { HeyMetaLanguage.phoneLocale != nil }
+    /// A question the phone heard in a turn the glasses then closed without asking anything: they
+    /// recognise English only, so Chinese ends this way. The glasses will not play an answer to it.
+    var onUnclaimedQuestion: ((String) -> Void)?
+    /// Turns the glasses closed while the phone was still recognising, by wake id, and until when its
+    /// words are still taken.
+    private var unclaimed: [String: TimeInterval] = [:]
     /// The microphone stream of the turn with this wake id began / one chunk of it / it ended.
     var onMicrophoneBegan: ((String) -> Void)?
     var onMicrophoneAudio: ((Data) -> Void)?
@@ -594,13 +600,17 @@ final class Assistant: @unchecked Sendable {
                 // The wake itself arrives as a fulfillment request too (intent IN:WAKE_WORD), before the
                 // one that carries the words: the 0.99 log has two event 57 for one wake. Closing the
                 // turn here put its id on the done list, and the real question was then dropped unseen.
-                log("assistant: fulfillment event without a question (wake or unsupported); waiting for the next")
+                log("assistant: fulfillment event without a question (wake or unsupported); waiting for the next · "
+                    + Self.requestFacts(inner))
                 return
             }
             acceptTranscript(request.transcript, interaction: request.interaction, simplified: request.simplified)
         case EV.sessionModeUpdateResponse:
             try acknowledgeSpeechStart(inner)
-        case EV.interactionClosed, EV.remoteInteractionComplete:
+        case EV.interactionClosed:
+            // {1 interaction, 2 audioLogData {3 transcription}}: with words, the glasses did it themselves.
+            closeTurn(inner.text(1), glassesWords: inner.structField(2).text(3))
+        case EV.remoteInteractionComplete:
             closeTurn(inner.text(1))
         case EV.sessionStateUpdate:
             let reply = ThriftWriter()
@@ -689,6 +699,21 @@ final class Assistant: @unchecked Sendable {
         }
         try send(EV.startOfUserSpeech, ThriftWriter().string(1, interaction).done())
         log("assistant: confirmed speech start for a matching glasses turn")
+    }
+
+    /// What a request the app does not answer was about, without its words: the intent, and whether the
+    /// glasses want or already took a picture for it (a question about what the wearer sees).
+    static func requestFacts(_ fields: [Int: Any]) -> String {
+        let understanding = fields.structField(2)
+        let onDevice = fields.structField(55)
+        let image = understanding.structField(4)
+        let intent = fields.text(23).isEmpty ? onDevice.text(1) : fields.text(23)
+        let wantsImage = image.bool(20) || understanding.bool(5) || onDevice.bool(8)
+        let inline = max(image.bytes(4)?.count ?? 0, image.bytes(16)?.count ?? 0)
+        let words = understanding.structField(1).text(1).count
+        return "intent \(intent.isEmpty ? "none" : intent), wants a picture \(wantsImage), picture id "
+            + "\(image.text(3).isEmpty ? "no" : "yes"), capture handle \(image.text(8).isEmpty ? "no" : "yes"), "
+            + "inline \(inline) B, \(words) characters, invocation \(fields.int(11) ?? -1)"
     }
 
     static func spokenRequest(_ fields: [Int: Any], requireTranscript: Bool = true)
@@ -793,13 +818,32 @@ final class Assistant: @unchecked Sendable {
         stateLock.unlock()
         if newlyAwake { notifyWake(interaction) }
         log("assistant: glasses request received; the words come from the phone's recogniser")
-        if let heard { deliver(heard.isEmpty ? glassesTranscript : heard, interaction: interaction, wakeID: wake) }
+        if let heard {
+            deliver(Self.question(phone: heard, glasses: glassesTranscript), interaction: interaction, wakeID: wake)
+        }
+    }
+
+    /// The phone listens in the language chosen in the app, the glasses in English. Chinese comes back
+    /// from the phone in Chinese characters. Anything else it wrote was English heard by a recogniser of
+    /// Chinese, and then the glasses' own words are the better ones.
+    static func question(phone: String, glasses: String) -> String {
+        if phone.isEmpty { return glasses }
+        if glasses.isEmpty { return phone }
+        let chinese = phone.unicodeScalars.contains { (0x3400 ... 0x9FFF).contains($0.value) }
+        return chinese ? phone : glasses
     }
 
     /// What the phone recognised in the microphone stream of the turn `wakeID` woke.
     func submitPhoneTranscript(_ text: String, wakeID: String) {
         let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let now = ProcessInfo.processInfo.systemUptime
         stateLock.lock()
+        if let until = unclaimed.removeValue(forKey: wakeID) {
+            // The glasses closed this turn while the phone was still at it.
+            stateLock.unlock()
+            if !stopped, !words.isEmpty, now < until { handOver(words) }
+            return
+        }
         guard !stopped, let active = turn, active.includes(wakeID), !active.replying, active.phoneText == nil else {
             stateLock.unlock()
             return
@@ -808,11 +852,20 @@ final class Assistant: @unchecked Sendable {
         if let request = active.requestID {
             turn?.phoneDeadline = .infinity
             stateLock.unlock()
-            deliver(words.isEmpty ? (active.glassesTranscript ?? "") : words, interaction: request, wakeID: active.wakeID)
+            deliver(Self.question(phone: words, glasses: active.glassesTranscript ?? ""), interaction: request,
+                    wakeID: active.wakeID)
         } else {
-            // The request usually arrives within a moment of the stream ending.
-            turn?.phoneDeadline = ProcessInfo.processInfo.systemUptime + 2.5
+            // The request, or the glasses closing the turn, usually comes within a second of the stream ending.
+            turn?.phoneDeadline = now + 2
             stateLock.unlock()
+        }
+    }
+
+    private func handOver(_ words: String) {
+        log("assistant: the glasses asked nothing in this turn; the phone heard \(words.count) characters and answers itself")
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.registered else { return }
+            self.onUnclaimedQuestion?(words)
         }
     }
 
@@ -833,16 +886,33 @@ final class Assistant: @unchecked Sendable {
         }
     }
 
-    private func closeTurn(_ interaction: String) {
+    /// `glassesWords`: what the glasses heard in a turn they are ending, when they say. A turn they
+    /// understood they have dealt with ("take a photo"); one they did not, and never asked about, was
+    /// perhaps Chinese, and then the phone's words for it are a question nobody has answered.
+    private func closeTurn(_ interaction: String, glassesWords: String = "") {
         guard !interaction.isEmpty else { return }
+        let understood = !glassesWords.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let now = ProcessInfo.processInfo.systemUptime
         stateLock.lock()
+        if understood { unclaimed.removeValue(forKey: interaction) }
         guard let active = turn, active.includes(interaction) else {
             stateLock.unlock()
             return
         }
+        var question: String?
+        if transcribesOnPhone(), !understood, active.requestID == nil, active.microphone != nil {
+            if let words = active.phoneText {
+                if !words.isEmpty { question = words }
+            } else {
+                unclaimed = unclaimed.filter { $0.value > now }
+                unclaimed[active.wakeID] = now + 12
+                if let related = active.relatedWakeID { unclaimed[related] = now + 12 }
+            }
+        }
         forgetTurn()
         stateLock.unlock()
         notifyTurnEnded(active.requestID ?? active.wakeID)
+        if let question { handOver(question) }
     }
 
     private func forgetTurn() {
@@ -913,12 +983,12 @@ final class Assistant: @unchecked Sendable {
                 stateLock.unlock()
                 deliver(active.glassesTranscript ?? "", interaction: request, wakeID: active.wakeID)
             } else if let words = active.phoneText, !words.isEmpty {
-                // Words but no request from the glasses: the wake's own id names the turn.
-                turn?.requestID = active.wakeID
-                turn?.deadline = now + 65
-                turn?.nextKeepalive = now + 3
+                // Words but no request from the glasses, and no word that they closed the turn either:
+                // they are not waiting for an answer, so it cannot be played through them.
+                forgetTurn()
                 stateLock.unlock()
-                deliver(words, interaction: active.wakeID, wakeID: active.wakeID)
+                notifyTurnEnded(active.wakeID)
+                handOver(words)
             } else {
                 stateLock.unlock()
                 notifyMissingTranscript(active.wakeID)

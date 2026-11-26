@@ -3,12 +3,17 @@ import AVFoundation
 /// How the glasses pack Opus packets into one chunk of the assistant's microphone stream (Visor's
 /// GlassesEars.hear): big-endian length-prefixed packets, 16-byte records, grouped records, or one bare
 /// packet. Whichever reads the chunk to its last byte is the one.
+///
+/// This firmware (greathammerhead, glasses log 35) sends none of Visor's three but the layout of Opus's
+/// own test streams: `[u32 BE length][u32 BE final range][packet]`. Taken for a bare packet, its eight
+/// header bytes were decoded as sound, and the recogniser heard noise.
 enum OpusFraming {
     private static let groupHead = 9
 
     /// Which of the layouts a chunk turned out to have; `bare` is also what an unknown layout looks like.
     enum Layout: String {
         case lengths = "length-prefixed"
+        case ranged = "length and range"
         case records
         case bare
     }
@@ -21,8 +26,23 @@ enum OpusFraming {
         // No little-endian lengths at the top level: a record starts with its own little-endian length,
         // which would pass for one packet holding the rest of the chunk.
         if let found = lengthPrefixed(bytes, bigEndian: true) { return (found, .lengths) }
+        if let found = ranged(bytes) { return (found, .ranged) }
         if let found = records(bytes) { return (found, .records) }
         return ([chunk], .bare)
+    }
+
+    /// `[u32 BE length][u32 BE final range][packet]`, once or more. A length of zero is a frame the
+    /// encoder left out (silence); it carries no packet.
+    private static func ranged(_ b: [UInt8]) -> [Data]? {
+        var at = 0
+        var out: [Data] = []
+        while at + 8 <= b.count {
+            let n = u32(b, at, bigEndian: true)
+            guard n <= b.count - at - 8 else { return nil }
+            if n > 0 { out.append(Data(b[at + 8 ..< at + 8 + n])) }
+            at += 8 + n
+        }
+        return at == b.count && at > 0 ? out : nil
     }
 
     private static func u32(_ b: [UInt8], _ at: Int, bigEndian: Bool) -> Int {

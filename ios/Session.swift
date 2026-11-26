@@ -1521,7 +1521,9 @@ final class Session {
         guard ownerTrustCompleted || knownServiceChannel("captures") != nil, let offer = try Self.airshipOffer(message) else { return false }
         // Drop answers this queue entry. Deleting a capture is a separate svc18 command.
         try sendAirshipReply(Self.airDrop, on: offer.mirror, payload: PB.bytes(1, offer.id))
-        emit("media: declined an unrequested Airship offer")
+        // The namespace and size say what it was: the assistant's photo for a question about what the
+        // wearer sees comes this way too, outside the media namespace.
+        emit("media: declined an unrequested Airship offer (\(offer.namespace.isEmpty ? "no namespace" : offer.namespace), \(offer.size) B)")
         return true
     }
 

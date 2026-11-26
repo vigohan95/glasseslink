@@ -206,6 +206,18 @@ enum VideoLeveling {
         case unchanged(String)
     }
 
+    /// "1512×2016，30 帧/秒，12.3 秒", for the log. The glasses' own stabilised 1080p clip is 1512×2016;
+    /// one of another size left them without that step (glasses log 35: a wider, darker picture).
+    static func describe(_ url: URL) async -> String? {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let size = try? await track.load(.naturalSize),
+              let rate = try? await track.load(.nominalFrameRate),
+              let duration = try? await asset.load(.duration) else { return nil }
+        return String(format: "%d×%d，%.0f 帧/秒，%.1f 秒", Int(size.width), Int(size.height), Double(rate),
+                      duration.seconds)
+    }
+
     /// A levelled HEVC copy in the temporary folder, or why there is none.
     static func leveledCopy(of url: URL, imu imuFile: URL?, frames framesFile: URL?) async -> Outcome {
         let asset = AVURLAsset(url: url)

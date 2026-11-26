@@ -1250,6 +1250,103 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(OpusFraming.duration(of: Data([0x0B, 0x03])), 0.060, accuracy: 1e-9)
     }
 
+    /// The chunks of glasses log 35, which 1.04 took for bare packets: a length, the encoder's final
+    /// range, then the packet, whose first byte 0x48 is SILK wideband, 20 ms, mono.
+    func testMicrophoneChunksOfThisFirmwareCarryALengthAndARange() {
+        let packet = Data([0x48, 0x01, 0x1d, 0x23]) + Data(repeating: 0x5a, count: 36)
+        let chunk = Data([0, 0, 0, 0x28, 0x0d, 0x0b, 0x40, 0x8d]) + packet
+        let split = OpusFraming.split(chunk)
+        XCTAssertEqual(split.layout, .ranged)
+        XCTAssertEqual(split.packets, [packet])
+        XCTAssertEqual(OpusFraming.duration(of: split.packets[0]), 0.020, accuracy: 1e-9)
+        // Two in one chunk, and a frame the encoder left out between them.
+        let second = Data([0x48, 0x80, 0xf3, 0x8f, 0x11])
+        let more = chunk + Data([0, 0, 0, 0, 1, 2, 3, 4]) + Data([0, 0, 0, 5, 0x70, 0xd0, 0xb8, 0x00]) + second
+        XCTAssertEqual(OpusFraming.split(more).layout, .ranged)
+        XCTAssertEqual(OpusFraming.packets(in: more), [packet, second])
+        // Visor's layouts are still told apart from it.
+        XCTAssertEqual(OpusFraming.split(Data([0, 0, 0, 2, 0x08, 1])).layout, .lengths)
+        XCTAssertEqual(OpusFraming.split(Data([0x08, 1, 2, 3])).layout, .bare)
+    }
+
+    /// Chinese is the phone's to hear and English the glasses': which of the two transcripts is the question.
+    func testChineseComesFromThePhoneAndEnglishFromTheGlasses() {
+        XCTAssertEqual(Assistant.question(phone: "今天天气怎么样", glasses: "can you tell me"), "今天天气怎么样")
+        XCTAssertEqual(Assistant.question(phone: "what time is eat", glasses: "What time is it?"), "What time is it?")
+        XCTAssertEqual(Assistant.question(phone: "", glasses: "What time is it?"), "What time is it?")
+        XCTAssertEqual(Assistant.question(phone: "现在几点", glasses: ""), "现在几点")
+        XCTAssertEqual(Assistant.question(phone: "", glasses: ""), "")
+    }
+
+    /// Chinese to glasses that recognise English: they hear nothing, ask nothing and close the turn, and
+    /// the phone's words for it are a question the app answers itself. A turn the glasses understood and
+    /// dealt with ("take a photo") is not.
+    func testAQuestionTheGlassesDidNotAskAboutIsHandedToTheApp() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let assistant = Assistant(session: session)
+        assistant.transcribesOnPhone = { true }
+        assistant.onTranscript = { _, _ in XCTFail("the glasses asked nothing") }
+        let wake = ResultBox<String>()
+        let streamEnded = ResultBox<XCTestExpectation>()
+        let closed = ResultBox<XCTestExpectation>()
+        assistant.onMicrophoneEnded = { id in
+            wake.value = id
+            streamEnded.value?.fulfill()
+        }
+        assistant.onTurnEnded = { _ in closed.value?.fulfill() }
+        let handed = expectation(description: "the question reached the app")
+        let question = ResultBox<String>()
+        assistant.onUnclaimedQuestion = { words in
+            question.value = words
+            handed.fulfill()
+        }
+        let registered = expectation(description: "assistant registered")
+        DispatchQueue.global(qos: .userInitiated).async {
+            do { try assistant.register(timeout: 8) } catch { XCTFail("registration failed: \(error)") }
+            registered.fulfill()
+        }
+        let messages = try nextPhoneMessage(peer, type: Int(Assistant.MT.initMessageRequest), timeout: 8)
+        try peer.write(DataX.message(messages.channel ^ 0x8000,
+                                     tags: [DataX.tag(2, UInt16(Assistant.MT.initMessageResponse), last: true)],
+                                     payload: PB.uint(1, 5)))
+        let stream = try nextPhoneMessage(peer, type: Int(Assistant.MT.initStreamRequest), timeout: 8)
+        try peer.write(DataX.message(stream.channel ^ 0x8000,
+                                     tags: [DataX.tag(2, UInt16(Assistant.MT.initStreamResponse), last: true)],
+                                     payload: PB.uint(1, 5)))
+        wait(for: [registered], timeout: 10)
+        assistant.startLoop()
+        defer { assistant.stop() }
+
+        func send(_ channel: UInt16, _ type: Int32?, _ payload: Data) throws {
+            let tags = type.map { [DataX.tag(2, UInt16($0), last: true)] } ?? []
+            try peer.write(DataX.message(channel ^ 0x8000, tags: tags, payload: payload))
+        }
+        /// One turn: wake, a microphone stream, and the glasses closing it with `words` of their own.
+        func turn(_ id: String, glassesHeard words: String) throws {
+            let ended = expectation(description: "\(id): the microphone stream ended")
+            let over = expectation(description: "\(id): the glasses closed the turn")
+            streamEnded.value = ended
+            closed.value = over
+            try send(messages.channel, Assistant.MT.startInteraction, ThriftWriter().string(1, id).done())
+            try send(stream.channel, Assistant.MT.streamHeader, PB.string(1, "stream-0123456789") + PB.string(2, id))
+            try send(stream.channel, Assistant.MT.streamAudio, Data([0, 0, 0, 1, 0, 0, 0, 0, 0x48]))
+            try send(stream.channel, Assistant.MT.streamEnd, Data())
+            wait(for: [ended], timeout: 5)
+            let close = ThriftWriter().string(1, id).structField(2, ThriftWriter().string(3, words).done()).done()
+            try send(messages.channel, Assistant.MT.netEvent, assistant.netEvent(Assistant.EV.interactionClosed, close))
+            wait(for: [over], timeout: 5)
+        }
+
+        // The glasses understood this one and did it themselves; the phone's words for it are not a question.
+        try turn("turn-en", glassesHeard: "take a photo")
+        assistant.submitPhoneTranscript("take a photo", wakeID: try XCTUnwrap(wake.value))
+        // This one they closed without a word of their own, before the phone was done recognising.
+        try turn("turn-zh", glassesHeard: "")
+        assistant.submitPhoneTranscript("今天天气怎么样", wakeID: try XCTUnwrap(wake.value))
+        wait(for: [handed], timeout: 5)
+        XCTAssertEqual(question.value, "今天天气怎么样")
+    }
+
     /// How many times a second the signal changes sign: twice its frequency for a tone.
     private func signChanges(_ buffers: [AVAudioPCMBuffer]) -> (changes: Int, frames: Int) {
         var changes = 0, frames = 0

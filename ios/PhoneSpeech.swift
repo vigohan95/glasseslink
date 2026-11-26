@@ -393,18 +393,48 @@ enum PhoneVoice {
             && !voice.voiceTraits.contains(.isNoveltyVoice) && !voice.voiceTraits.contains(.isPersonalVoice)
     }
 
-    /// The most natural installed voice for the language: a downloaded premium or enhanced one, else the
-    /// one the system itself uses for that language.
-    static func voice(for localeTag: String) -> AVSpeechSynthesisVoice? {
-        let natural = AVSpeechSynthesisVoice.speechVoices().filter { $0.language == localeTag && isNatural($0) }
-        let downloaded = natural.filter { $0.quality.rawValue > AVSpeechSynthesisVoiceQuality.default.rawValue }
-            .max { $0.quality.rawValue < $1.quality.rawValue }
-        if let downloaded { return downloaded }
-        if let standard = AVSpeechSynthesisVoice(language: localeTag), isNatural(standard) { return standard }
-        return natural.first ?? AVSpeechSynthesisVoice(language: localeTag)
+    /// One installed voice, for the settings page.
+    struct Choice: Identifiable {
+        let id: String
+        let name: String
     }
 
-    /// "婷婷（标准音质）", for the log and the settings page.
+    private static func chosenKey(_ localeTag: String) -> String { "answerVoice." + localeTag }
+
+    /// The natural voices installed for the language, best first: a downloaded premium or enhanced one
+    /// before a standard one, a woman's voice before a man's (the user asked for one), and the system's
+    /// own voice for the language before the rest.
+    static func candidates(for localeTag: String) -> [AVSpeechSynthesisVoice] {
+        let standard = AVSpeechSynthesisVoice(language: localeTag)?.identifier
+        func rank(_ voice: AVSpeechSynthesisVoice) -> Int {
+            voice.quality.rawValue * 100 + (voice.gender == .female ? 10 : 0) + (voice.identifier == standard ? 1 : 0)
+        }
+        return AVSpeechSynthesisVoice.speechVoices().filter { $0.language == localeTag && isNatural($0) }
+            .sorted { rank($0) > rank($1) }
+    }
+
+    static func choices(for localeTag: String) -> [Choice] {
+        candidates(for: localeTag).map { Choice(id: $0.identifier, name: label($0)) }
+    }
+
+    /// The voice the user picked for the language; empty for "the best there is", also once it is gone.
+    static func chosenIdentifier(for localeTag: String) -> String {
+        let stored = UserDefaults.standard.string(forKey: chosenKey(localeTag)) ?? ""
+        return stored.isEmpty || AVSpeechSynthesisVoice(identifier: stored) == nil ? "" : stored
+    }
+
+    static func choose(_ identifier: String, for localeTag: String) {
+        UserDefaults.standard.set(identifier, forKey: chosenKey(localeTag))
+    }
+
+    /// The voice answers in this language are read with: the user's pick, else the best installed.
+    static func voice(for localeTag: String) -> AVSpeechSynthesisVoice? {
+        let stored = chosenIdentifier(for: localeTag)
+        if !stored.isEmpty, let picked = AVSpeechSynthesisVoice(identifier: stored) { return picked }
+        return candidates(for: localeTag).first ?? AVSpeechSynthesisVoice(language: localeTag)
+    }
+
+    /// "婷婷（标准音质 · 女声）", for the log and the settings page.
     static func label(_ voice: AVSpeechSynthesisVoice?) -> String {
         guard let voice else { return "系统默认" }
         let quality: String
@@ -413,11 +443,9 @@ enum PhoneVoice {
         case .enhanced: quality = "优化音质"
         default: quality = "标准音质"
         }
-        return "\(voice.name)（\(quality)）"
+        let gender = voice.gender == .female ? " · 女声" : (voice.gender == .male ? " · 男声" : "")
+        return "\(voice.name)（\(quality)\(gender)）"
     }
-
-    /// The voice an answer in `localeTag` is read with right now, for the settings page.
-    static func currentLabel(for localeTag: String) -> String { label(voice(for: localeTag)) }
 
     /// Marks that would be read aloud as symbols.
     static func speakable(_ text: String) -> String {
@@ -516,5 +544,51 @@ enum PhoneVoice {
             lock.unlock()
             handler?(result)
         }
+    }
+}
+
+/// The iPhone speaking aloud through whatever its audio output is, which is the glasses when they are
+/// paired for sound. For the answers the glasses will not play themselves.
+@MainActor
+final class PhoneSpeaker: NSObject, AVSpeechSynthesizerDelegate {
+    private let synthesizer = AVSpeechSynthesizer()
+
+    override init() {
+        super.init()
+        synthesizer.delegate = self
+    }
+
+    /// Speaks `text` and returns the voice chosen for it.
+    @discardableResult
+    func say(_ text: String, preferred localeTag: String) -> String {
+        let words = PhoneVoice.speakable(text)
+        guard !words.isEmpty else { return "" }
+        if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .voicePrompt, options: [.duckOthers])
+        try? session.setActive(true)
+        let voice = PhoneVoice.voice(for: PhoneVoice.languageTag(of: words, preferred: localeTag))
+        let utterance = AVSpeechUtterance(string: words)
+        utterance.voice = voice
+        synthesizer.speak(utterance)
+        return PhoneVoice.label(voice)
+    }
+
+    func stop() {
+        if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        Task { @MainActor in self.release() }
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        Task { @MainActor in self.release() }
+    }
+
+    /// Hands the audio output back, so music that was turned down comes up again.
+    private func release() {
+        guard !synthesizer.isSpeaking else { return }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 }

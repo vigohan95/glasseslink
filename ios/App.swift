@@ -1947,6 +1947,7 @@ final class Glasses: NSObject, ObservableObject {
                      + (result.url == nil ? "不处理" : "iPhone 相册存摆正后的版本，App 里保留原件"))
             }
         }
+        if !capture.isPhoto, let made = await VideoLeveling.describe(file) { note("视频规格：\(made)") }
         if !capture.isPhoto, VideoLeveling.isEnabled {
             if mediaImportID != nil { transferDetail = "正在摆正视频…" }
             switch await VideoLeveling.leveledCopy(of: file, imu: LocalMediaLibrary.sidecarURL(for: capture, .imu),
@@ -2289,6 +2290,8 @@ final class Glasses: NSObject, ObservableObject {
     private var submittedVoiceTurn: String?
     /// Why the phone's recogniser gave nothing for the current question, when the phone's set-up is why.
     private var hearingProblem: String?
+    /// Answers the glasses will not play: spoken by the iPhone, whose audio output is the glasses.
+    private lazy var phoneSpeaker = PhoneSpeaker()
     private var voiceWait: Task<Void, Never>?
     private var voiceAnswer: Task<Void, Never>?
 
@@ -2343,6 +2346,7 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     private func resetVoiceTurn() {
+        phoneSpeaker.stop()
         voiceWait?.cancel()
         voiceWait = nil
         voiceAnswer?.cancel()
@@ -2431,6 +2435,12 @@ final class Glasses: NSObject, ObservableObject {
                     self.assistantMessage = problem
                 }
                 assistant.submitPhoneTranscript(heard.text, wakeID: wake)
+            }
+        }
+        a.onUnclaimedQuestion = { [weak self, weak a] words in
+            Task { @MainActor in
+                guard let self, let a, self.assistantRef === a else { return }
+                self.answerThroughPhone(words)
             }
         }
         a.onUnheard = { [weak self, weak a] interaction in
@@ -2571,6 +2581,57 @@ final class Glasses: NSObject, ObservableObject {
                 self.assistantMessage = "模型已回复，眼镜播报发送失败 · \(Glasses.explain(error))"
             }
         }
+    }
+
+    /// A question the phone heard in a turn the glasses closed without asking anything. They recognise
+    /// English only, so Chinese ends that way (glasses log 35), and they play no answer to a turn they
+    /// have closed. The iPhone speaks it instead; its audio output is the glasses when they are paired.
+    private func answerThroughPhone(_ transcript: String) {
+        let question = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty else { return }
+        voiceWait?.cancel()
+        voiceAnswer?.cancel()
+        hearingProblem = nil
+        assistantTranscriptMissing = false
+        assistantAnswer = ""
+        let client = configuredModel
+        let tag = HeyMetaLanguage.phoneLocale ?? "zh-CN"
+        assistantMessage = "听到：「\(question)」，正在问 \(client.model)…"
+        note("眼镜语音：这一句眼镜没有受理，由 iPhone 识别，回答从 iPhone 的音频播出")
+        holdBackgroundTime("hey-meta-answer", seconds: 28)
+        voiceAnswer = Task { [weak self] in
+            let text: String
+            do {
+                text = try await client.ask(question: Glasses.spokenAnswerPrompt(question))
+            } catch {
+                guard let self, !Task.isCancelled else { return }
+                self.assistantMessage = "模型请求失败 · \(Glasses.explain(error))"
+                self.note("眼镜语音的模型请求失败：\(Glasses.explain(error))")
+                self.phoneSpeaker.say(Glasses.spokenFailure(for: question), preferred: tag)
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.assistantAnswer = text
+            let voice = self.phoneSpeaker.say(text, preferred: tag)
+            self.readAudioOutput()
+            self.assistantMessage = "已回答，声音从「\(self.audioRouteName)」播出。"
+            self.note("回答已从 iPhone 音频播出：\(voice)，输出 \(self.audioRouteName)")
+        }
+    }
+
+    /// One sentence in the voice the answers have, through the iPhone's audio output.
+    func previewAnswerVoice(_ tag: String) {
+        let sample: String
+        if tag.hasPrefix("zh-HK") {
+            sample = "你好，我係你嘅眼鏡助手，有咩可以幫到你？"
+        } else if tag.hasPrefix("zh") {
+            sample = "你好，我是你的眼镜助手。今天想问点什么？"
+        } else {
+            sample = "Hi, I'm your glasses assistant. What would you like to know?"
+        }
+        let voice = phoneSpeaker.say(sample, preferred: tag)
+        readAudioOutput()
+        showToast("试听：\(voice)")
     }
 
     func stopAssistant() {

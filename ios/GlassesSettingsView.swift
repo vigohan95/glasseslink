@@ -138,6 +138,37 @@ enum CuratedSettings {
     }
 }
 
+/// Which installed voice reads the answers in one language, and a way to hear it before the glasses do.
+private struct AnswerVoiceRows: View {
+    @ObservedObject var g: Glasses
+    let title: String
+    let tag: String
+    @State private var chosen = ""
+    @State private var choices: [PhoneVoice.Choice] = []
+
+    var body: some View {
+        Picker(title, selection: $chosen) {
+            Text("自动（音质最好的女声）").tag("")
+            ForEach(choices) { choice in
+                Text(choice.name).tag(choice.id)
+            }
+        }
+        .task(id: tag) {
+            choices = PhoneVoice.choices(for: tag)
+            chosen = PhoneVoice.chosenIdentifier(for: tag)
+        }
+        .onChange(of: chosen) { _, picked in
+            PhoneVoice.choose(picked, for: tag)
+        }
+        Button {
+            Haptics.tap()
+            g.previewAnswerVoice(tag)
+        } label: {
+            Label("试听\(title)", systemImage: "play.circle")
+        }
+    }
+}
+
 /// The settings page on the 眼镜 tab: what the glasses really have, read from them, in Chinese.
 struct GlassesSettingsView: View {
     @ObservedObject var g: Glasses
@@ -146,7 +177,6 @@ struct GlassesSettingsView: View {
     @AppStorage(PhotoLeveling.enabledKey) private var levelPhotos = true
     @AppStorage(VideoLeveling.enabledKey) private var levelVideos = true
     @AppStorage(HeyMetaLanguage.key) private var heyMetaLanguage = "zh-CN"
-    @State private var answerVoice = ""
 
     private var ready: Bool { g.canUseGlasses && g.settingsReadAt != nil }
 
@@ -162,17 +192,14 @@ struct GlassesSettingsView: View {
                         Text(choice.name).tag(choice.tag)
                     }
                 }
-                .task(id: heyMetaLanguage) {
-                    answerVoice = heyMetaLanguage == HeyMetaLanguage.glasses
-                        ? "" : PhoneVoice.currentLabel(for: heyMetaLanguage)
-                }
-                if !answerVoice.isEmpty {
-                    LabeledContent("回答的声音", value: answerVoice)
+                if heyMetaLanguage != HeyMetaLanguage.glasses {
+                    AnswerVoiceRows(g: g, title: "中文声音", tag: heyMetaLanguage)
+                    AnswerVoiceRows(g: g, title: "英文声音", tag: "en-US")
                 }
             } header: {
                 Label("Hey Meta 用什么语言问", systemImage: "character.bubble")
             } footer: {
-                Text("眼镜自己只听得懂英文。选中文时，说完「Hey Meta」后你的话会传到 iPhone 上识别，回答也由 iPhone 合成语音、送回眼镜播放。首次使用会请求「语音识别」权限，iPhone 的「听写」也要开着（设置 › 通用 › 键盘）。\n\n想让回答的声音更自然：到 iPhone「设置 › 辅助功能 › 朗读内容 › 声音」里，下载这门语言标着「优化音质」或「高音质」的声音，这里会自动改用它。")
+                Text("眼镜自己只听得懂英文。选中文时，说完「Hey Meta」后你的话会传到 iPhone 上识别，回答由 iPhone 的声音读出来；中文问题眼镜不受理时，声音直接走 iPhone 的音频输出（也就是眼镜）。首次使用会请求「语音识别」权限，iPhone 的「听写」也要开着（设置 › 通用 › 键盘）。\n\n自带的「标准音质」声音比较机械。想要好听的女声：到 iPhone「设置 › 辅助功能 › 朗读内容 › 声音」，进「中文」或「英语」，点一个女声旁边的下载，选「高音质」（没有就选「优化音质」）。下载完回到这里，它会出现在列表里，「自动」也会改用它。")
             }
             ForEach(CuratedSettings.sections) { section in
                 Section {
