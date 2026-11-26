@@ -1454,12 +1454,7 @@ struct DeviceTabBody: View {
             Text("拍摄和导入走眼镜控制连接。播放声音由 iPhone 选择音频设备。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            Button { g.requestGlassesAudioConnection() } label: {
-                Label("尝试接通眼镜音频", systemImage: "headphones")
-            }
-            .buttonStyle(.bordered)
-            .disabled(!g.canRequestGlassesAudioConnection)
-            .accessibilityHint("会重新连接眼镜，并请求 iPhone 接通蓝牙音频")
+            glassesAudioStatus
             Button {
                 if audioTest.isPlaying { stopAudioTest() }
                 else { audioTest.start { g.readAudioOutput() } }
@@ -1471,7 +1466,7 @@ struct DeviceTabBody: View {
             if let error = audioTest.error { Text(error).font(.footnote).foregroundStyle(.secondary) }
             Text(audioTest.isPlaying
                  ? "测试音持续 15 秒。可打开 iPhone 控制中心，在播放卡片中选择眼镜。"
-                 : "先在「设置 → 蓝牙」确认眼镜已连接。播放视频或抖音时，在控制中心的播放卡片中选择眼镜。")
+                 : "播放视频或其他 App 时，在控制中心的播放卡片中选择眼镜。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             Divider()
@@ -1481,6 +1476,31 @@ struct DeviceTabBody: View {
             }
         }
         .glassesPanel(padding: 13)
+    }
+
+    /// Only a system Bluetooth pairing makes the glasses an iPhone headset, so this says which
+    /// state iOS is in and, when needed, walks through the repair that fixed the 0.99 report.
+    @ViewBuilder private var glassesAudioStatus: some View {
+        switch g.glassesAudio {
+        case .glasses(let profile):
+            Label("眼镜音频已接通 · \(profile)", systemImage: "checkmark.circle.fill")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(GlassesTheme.accent)
+        case .otherBluetooth(let name):
+            Text("当前声音走「\(name)」。要用眼镜，请在右上角的输出选择或控制中心里选眼镜。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        case .unavailable:
+            VStack(alignment: .leading, spacing: 5) {
+                Text("眼镜还不是 iPhone 的耳机，修复一次即可：").font(.footnote.weight(.semibold))
+                Text("1. 设置 → 蓝牙：「我的设备」里已有眼镜就点 ⓘ →「忽略此设备」")
+                Text("2. 折叠眼镜，长按拍摄键约 5 秒到指示灯闪蓝，再展开")
+                Text("3. 在「设置 → 蓝牙 → 其他设备」里点眼镜，弹窗选「配对」")
+                Text("4. 回到这里，会自动显示「眼镜音频已接通」")
+            }
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        }
     }
 
     private func stopAudioTest() {

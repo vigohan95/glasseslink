@@ -212,6 +212,7 @@ final class Glasses: NSObject, ObservableObject {
     @Published private(set) var audioRouteName = "未检测到媒体输出"
     @Published private(set) var audioRouteUsesBluetooth = false
     @Published private(set) var audioMediaProfile: String?
+    @Published private(set) var glassesAudio: GlassesAudioState = .unavailable
     private var audioRouteObserver: AnyCancellable?
     @Published var captures: [Capture] = []
     @Published private(set) var importedCaptures: [String: Capture] = {
@@ -293,6 +294,9 @@ final class Glasses: NSObject, ObservableObject {
         LogStore.shared.start(fileURL: logURL)
         note("GlassesLink \(short) (\(build)) · iOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
         note("启动。owner=\(owner == nil ? "无" : "有")")
+        // 0.99 set this from the "接通眼镜音频" button and never cleared it, so every later connect
+        // carried the transport-bridging option. Audio comes from the system pairing instead.
+        UserDefaults.standard.removeObject(forKey: "requestedGlassesAudioBridging")
         readAudioOutput()
         switch UserDefaults.standard.string(forKey: "ownerState") ?? "" {
         case "verified": ownerState = .verified
@@ -585,14 +589,10 @@ final class Glasses: NSObject, ObservableObject {
             let reason = p.state == .connected ? "打开眼镜蓝牙通道超时" : "蓝牙连接眼镜超时"
             self.failConnection(reason, peripheral: p)
         }
-        let bridgeAudio = !forRegistration && verifiedPeripheralNames[id.uuidString] != nil
-            && UserDefaults.standard.bool(forKey: "requestedGlassesAudioBridging")
-        let options: [String: Any]? = bridgeAudio ? [CBConnectPeripheralOptionEnableTransportBridgingKey: true] : nil
         if p.state == .connected {
-            if let options { central.connect(p, options: options) }
             openLink(p)
         } else if p.state == .disconnected {
-            central.connect(p, options: options)
+            central.connect(p, options: nil)
         }
     }
 
@@ -2014,18 +2014,19 @@ final class Glasses: NSObject, ObservableObject {
         case .bluetoothLE: audioMediaProfile = "蓝牙 LE 音频"
         default: audioMediaProfile = nil
         }
-    }
-
-    var canRequestGlassesAudioConnection: Bool {
-        canUseGlasses && !phaseBusy && !busy && !settingsLoading && !recording && !mediaImportInProgress
-            && live == nil && assistantRef == nil
-    }
-
-    func requestGlassesAudioConnection() {
-        guard canRequestGlassesAudioConnection else { return }
-        UserDefaults.standard.set(true, forKey: "requestedGlassesAudioBridging")
-        note("音频：已请求 iOS 接通眼镜的经典蓝牙音频")
-        reconnect(forRegistration: false)
+        let session = AVAudioSession.sharedInstance()
+        let state = GlassesAudioState.from(
+            outputs: outputs.map { AudioPortInfo(type: $0.portType, name: $0.portName) },
+            inputs: (session.availableInputs ?? []).map { AudioPortInfo(type: $0.portType, name: $0.portName) },
+            glassesNames: verifiedPeripheralNames.values.compactMap { ScanEntry.usableName($0) })
+        if state != glassesAudio {
+            glassesAudio = state
+            switch state {
+            case .glasses(let profile): note("音频：眼镜已是 iPhone 的音频设备 · \(profile)")
+            case .otherBluetooth(let name): note("音频：当前蓝牙音频设备是 \(name)，不是眼镜")
+            case .unavailable: note("音频：iOS 没有把眼镜当作音频设备（需要在系统蓝牙里配对）")
+            }
+        }
     }
 
     func beginVideoPlayback() throws {

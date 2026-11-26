@@ -169,7 +169,8 @@ private final class MicrophoneCheck: ObservableObject {
             try activate(.playAndRecord, options: .allowBluetooth)
             var ports = wirelessInputs()
             var selected = selectedPort(in: ports, glassesName: glassesName, inputID: inputID)
-            for _ in 0 ..< 12 {
+            // A freshly re-paired headset can take a couple of seconds to offer its mic.
+            for _ in 0 ..< 30 {
                 if selected != nil { break }
                 try await Task.sleep(for: .milliseconds(100))
                 ports = wirelessInputs()
@@ -275,11 +276,12 @@ private final class MicrophoneCheck: ObservableObject {
             let expected = GlassesAudioInput.normalizedName(glassesName)
             let sameName = ports.filter { GlassesAudioInput.normalizedName($0.portName) == expected }
             if sameName.count == 1 { return sameName[0] }
-            return nil
         }
 
         let namedGlasses = ports.filter { ScanEntry.matchesRayBanMetaName($0.portName) }
-        return namedGlasses.count == 1 ? namedGlasses[0] : nil
+        if namedGlasses.count == 1 { return namedGlasses[0] }
+        // The headset name can differ from the advertised one; a lone Bluetooth mic is the glasses'.
+        return ports.count == 1 ? ports[0] : nil
     }
 
     private func describeCurrentInput() {
