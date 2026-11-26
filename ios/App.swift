@@ -269,7 +269,13 @@ final class Glasses: NSObject, ObservableObject {
     @Published var testingModel = false
     @Published var modelTestLine = ""
     @Published var modelTestOK = false
-    @Published var settings: [String: String] = [:]
+    @Published var settings: [String: String] = [:] {
+        didSet {
+            if settings["assistant_voice_id"] != oldValue["assistant_voice_id"] {
+                assistantRef?.useGlassesVoice(settings["assistant_voice_id"])
+            }
+        }
+    }
     @Published var settingsLoading = false
     /// Set once the glasses' settings stores were read on this connection; nil means "not read yet",
     /// which is different from an empty read (glasses that never had a setting changed store nothing).
@@ -2384,6 +2390,7 @@ final class Glasses: NSObject, ObservableObject {
         assistantAnswer = ""
         assistantRegistering = true
         a.log = { [weak self] line in self?.note("asst: \(line)") }
+        a.useGlassesVoice(settings["assistant_voice_id"])
         a.onTurn = { [weak self, weak a] interaction in
             Task { @MainActor in
                 guard let self, let a, self.assistantRef === a, self.voiceTurn != interaction else { return }

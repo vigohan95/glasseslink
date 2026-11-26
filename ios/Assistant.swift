@@ -190,6 +190,22 @@ final class Assistant: @unchecked Sendable {
     private var streamIDs: [String: String] = [:]
     private var latestStream = ""
     private var lastEventLogged = 0
+    /// The glasses' own voice (assistant_voice_id), named in every answer they read themselves; nil keeps
+    /// the one in the captured template. A partner voice ("3p_") is never named: the glasses do not read
+    /// text in it.
+    private var glassesVoiceID: String?
+
+    func useGlassesVoice(_ id: String?) {
+        stateLock.lock()
+        glassesVoiceID = id.flatMap { $0.isEmpty || $0.hasPrefix("3p_") ? nil : $0 }
+        stateLock.unlock()
+    }
+
+    private func currentGlassesVoice() -> String? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return glassesVoiceID
+    }
     /// Sent this far ahead of when it plays, so a late Bluetooth packet does not leave the glasses with
     /// nothing to play; and how long after the last sound the closing events wait.
     private static let speechLead = 0.24
@@ -1161,7 +1177,8 @@ final class Assistant: @unchecked Sendable {
             stateLock.unlock()
         }
 
-        guard let varm = Varm.build(interaction: interaction, transcript: transcript, text: text, onGlasses: true) else {
+        guard let varm = Varm.build(interaction: interaction, transcript: transcript, text: text, onGlasses: true,
+                                    voiceID: currentGlassesVoice()) else {
             throw LinkError.unexpected("缺少眼镜播报所需的语音模板")
         }
         let asks = Varm.asks.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil

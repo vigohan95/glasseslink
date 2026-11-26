@@ -848,7 +848,10 @@ final class CompatibilityTests: XCTestCase {
             case .choice(let options):
                 let known = Set((info.control.options ?? []).map(\.value))
                 for option in options {
-                    XCTAssertTrue(known.contains(option.value), "\(item.key)=\(option.value)")
+                    // The catalogue's choices, or the firmware's own default (the stock voice is not among
+                    // the choices Meta's app offers).
+                    XCTAssertTrue(known.contains(option.value) || option.value == row.defaultValue,
+                                  "\(item.key)=\(option.value)")
                     XCTAssertFalse(option.label.isEmpty)
                 }
             case .percent(let minimum, let maximum):
