@@ -61,6 +61,16 @@ struct ModelClient {
         try await complete(question: "Reply with the single word: ok", image: nil, maxTokens: 64)
     }
 
+    /// A JPEG no longer than `maxPixel` on its long edge, upright.
+    static func modelImage(_ data: Data, maxPixel: Int = 1568) -> Data? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                        kCGImageSourceCreateThumbnailWithTransform: true,
+                                        kCGImageSourceThumbnailMaxPixelSize: maxPixel]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return UIImage(cgImage: image).jpegData(compressionQuality: 0.8)
+    }
+
     func ask(question: String, image: Data? = nil) async throws -> String {
         try await complete(question: question, image: image, maxTokens: 800)
     }
@@ -71,12 +81,8 @@ struct ModelClient {
 
         var content: Any = question
         if let image, !image.isEmpty {
-            let jpeg: Data
-            if image.starts(with: [0xFF, 0xD8]) {
-                jpeg = image
-            } else if let converted = UIImage(data: image)?.jpegData(compressionQuality: 0.84) {
-                jpeg = converted
-            } else {
+            // Originals are several megabytes; the model APIs cap an image near 5 MB and gain nothing past ~1568 px.
+            guard let jpeg = Self.modelImage(image) ?? (image.starts(with: [0xFF, 0xD8]) ? image : nil) else {
                 throw LinkError.io("这张照片无法转换为模型支持的格式。")
             }
             let encoded = jpeg.base64EncodedString()

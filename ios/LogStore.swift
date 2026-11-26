@@ -129,12 +129,26 @@ final class LogStore: ObservableObject {
         }
     }
 
+    /// Keeps the newest part once the file passes `limit`; it used to grow for ever (2.2 MB in a few days).
+    static func trimIfLarge(_ url: URL, limit: Int = 2_000_000, keep: Int = 1_000_000) {
+        guard let size = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.intValue,
+              size > limit, let handle = try? FileHandle(forReadingFrom: url) else { return }
+        defer { try? handle.close() }
+        guard (try? handle.seek(toOffset: UInt64(size - keep))) != nil,
+              let read = try? handle.readToEnd() else { return }
+        // Start at a whole line.
+        var tail = Data(read)
+        if let newline = tail.firstIndex(of: 0x0A) { tail = Data(tail[tail.index(after: newline)...]) }
+        try? tail.write(to: url, options: .atomic)
+    }
+
     private func fileHandle() -> FileHandle? {
         if let handle { return handle }
         guard let fileURL else { return nil }
         if !FileManager.default.fileExists(atPath: fileURL.path) {
             FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         }
+        Self.trimIfLarge(fileURL)
         guard let output = try? FileHandle(forWritingTo: fileURL) else { return nil }
         do {
             try output.seekToEnd()

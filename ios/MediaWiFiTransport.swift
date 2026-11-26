@@ -128,10 +128,11 @@ final class MediaWiFiTransport: SessionTransport, @unchecked Sendable {
                     try Task.checkCancellation()
                     try transport.adoptConfiguration(ownedSSID)
                     return transport
-                } catch MediaWiFiError.connectionFailed where retries < 3 {
-                    // The system can report that the configuration was applied before TCP is available.
+                } catch MediaWiFiError.connectionFailed where deadline - ProcessInfo.processInfo.systemUptime > 0.3 {
+                    // The system can report that the configuration was applied before TCP is available,
+                    // and the glasses' listener can come up after the hotspot: keep trying until the deadline.
                     transport.close()
-                    let pause = min(0.3 * pow(2, Double(retries)), max(0, deadline - ProcessInfo.processInfo.systemUptime))
+                    let pause = min(0.3 * pow(2, Double(min(retries, 2))), max(0, deadline - ProcessInfo.processInfo.systemUptime))
                     retries += 1
                     try await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000))
                 } catch {
@@ -202,6 +203,10 @@ final class MediaWiFiTransport: SessionTransport, @unchecked Sendable {
             let error = connectionFailure(timedOut: false)
             ready.resolve(.failure(error))
             finish(.io(error.description))
+        case .waiting:
+            // Refused or unreachable. NWConnection would sit here until the network path changes;
+            // fail this attempt so the caller's retry loop makes a fresh one.
+            ready.resolve(.failure(MediaWiFiError.connectionFailed))
         case .cancelled:
             finish(.io("眼镜 Wi-Fi 数据通道已关闭。"))
         default:

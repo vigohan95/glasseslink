@@ -43,6 +43,8 @@ targets:
       - LiveView.swift
       - GlassesSettingsView.swift
       - PhotoLeveling.swift
+      - VideoLeveling.swift
+      - MotionLog.swift
       - Thrift.swift
       - Assistant.swift
       - SettingsSchema.swift

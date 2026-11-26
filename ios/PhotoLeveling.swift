@@ -46,9 +46,24 @@ enum PhotoLeveling {
         return horizon.angle
     }
 
-    /// Rotated by `angle` (Vision's value as it comes), enlarged and cropped back to the original size.
-    static func straightened(_ image: CIImage, by angle: Double) -> CIImage {
-        image.applyingFilter("CIStraightenFilter", parameters: [kCIInputAngleKey: angle]).cropped(to: image.extent)
+    /// How much a width x height picture must grow so that, turned by `angle`, it still covers its own
+    /// frame: 1.07 for 3 degrees on a 3:4 portrait, 1.11 for 5.
+    static func zoom(width: Double, height: Double, angle: Double) -> Double {
+        guard width > 0, height > 0 else { return 1 }
+        let c = cos(abs(angle)), s = sin(abs(angle))
+        return max((width * c + height * s) / width, (width * s + height * c) / height)
+    }
+
+    /// Turned about its centre by `angle` (Vision's value as it comes; counter-clockwise positive in Core
+    /// Image's y-up space), enlarged by `zoom` or by just enough, and cut back to the original frame.
+    static func straightened(_ image: CIImage, by angle: Double, zoom: Double? = nil) -> CIImage {
+        let frame = image.extent
+        let scale = CGFloat(zoom ?? Self.zoom(width: Double(frame.width), height: Double(frame.height), angle: angle))
+        let transform = CGAffineTransform(translationX: -frame.midX, y: -frame.midY)
+            .concatenating(CGAffineTransform(rotationAngle: CGFloat(angle)))
+            .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+            .concatenating(CGAffineTransform(translationX: frame.midX, y: frame.midY))
+        return image.transformed(by: transform).cropped(to: frame)
     }
 
     /// A level HEIC copy at the original size when the photo needs one, and what Vision saw either way

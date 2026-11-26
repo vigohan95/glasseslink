@@ -780,6 +780,8 @@ final class Session {
         guard let req = peerRequest else {
             throw LinkError.unexpected(Self.missingPeerEncryptionRequest)
         }
+        // sharedSecret traps on any other length.
+        guard req.pub.count == 64 else { throw LinkError.unexpected("glasses key is not 64 bytes") }
         let en = peerEnable
         emit("peer version=\(req.version) quirks req=\(req.quirks) enable=\(en == nil ? "absent" : "\(en!.quirks)")")
 
@@ -1062,7 +1064,9 @@ final class Session {
             }
             let slice = warned ? left : min(left, 3)
             let m: DataX.Message
-            do { m = try recvMessage(timeout: slice) } catch { continue }
+            do { m = try recvMessage(timeout: slice) }
+            catch LinkError.io(let reason) { throw LinkError.io(reason) }
+            catch { continue }
             if let e = m.error, m.channel == mirror {
                 // svc36 answers with 0x1000 (SUCCESS) on the mirror channel; 0x0000 also
                 // appears on plain data frames. Treating only the latter as success is what
@@ -1302,6 +1306,93 @@ final class Session {
 
         func discard() { try? FileManager.default.removeItem(at: directory) }
         deinit { discard() }
+
+        /// Removes staging folders a previous run of the app left behind (a crash or a kill mid-transfer).
+        static func purgeLeftovers() {
+            let tmp = FileManager.default.temporaryDirectory
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: tmp.path)) ?? []
+            for name in names where name.hasPrefix("glasses-media-") {
+                try? FileManager.default.removeItem(at: tmp.appendingPathComponent(name))
+            }
+        }
+    }
+
+    // MARK: resuming an interrupted transfer
+
+    /// What is already on the phone of a file whose transfer broke off.
+    struct PartialTransfer {
+        let file: StagedMediaFile
+        let received: Int
+        let checksum: UInt32
+    }
+
+    /// Receptions that broke off, kept across sessions: glasses log 33 has a 26 MB video dropped at 16 MB
+    /// and again at 25 MB, each retry starting from zero at ~26 KB/s. The next offer of the same asset is
+    /// answered with a cursor at what is here, the way the sender itself rewinds to a receiver's cursor.
+    private static let partialLock = NSLock()
+    private static var partials: [(id: UUID, file: StagedMediaFile)] = []
+    private static var resumeDeclined = false
+    private static let partialLimit = 6
+
+    /// False once a sender ignored a resume cursor; later transfers then start from zero as before.
+    static var resumeAllowed: Bool {
+        partialLock.lock()
+        defer { partialLock.unlock() }
+        return !resumeDeclined
+    }
+
+    static func declineResume() {
+        partialLock.lock()
+        resumeDeclined = true
+        partials.removeAll()
+        partialLock.unlock()
+    }
+
+    /// For tests: forget every kept partial and allow resuming again.
+    static func resetResumeState() {
+        partialLock.lock()
+        resumeDeclined = false
+        partials.removeAll()
+        partialLock.unlock()
+    }
+
+    private static func keepPartial(_ file: StagedMediaFile) {
+        partialLock.lock()
+        defer { partialLock.unlock() }
+        guard !resumeDeclined else { return }
+        partials.removeAll { $0.id == file.assetID }
+        partials.append((file.assetID, file))
+        if partials.count > partialLimit { partials.removeFirst(partials.count - partialLimit) }
+    }
+
+    /// The kept part of `assetID`, with its length and checksum read back from disk, when it is a real
+    /// prefix of a file of `size` bytes.
+    static func takePartial(assetID: UUID, size: Int) -> PartialTransfer? {
+        partialLock.lock()
+        let kept = partials.first { $0.id == assetID }?.file
+        partials.removeAll { $0.id == assetID }
+        let allowed = !resumeDeclined
+        partialLock.unlock()
+        guard allowed, let file = kept, file.size == size,
+              let handle = try? FileHandle(forReadingFrom: file.url) else { return nil }
+        defer { try? handle.close() }
+        var received = 0
+        var checksum: UInt32 = 1
+        while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            received += chunk.count
+            checksum = updateAdler32(checksum, with: chunk)
+        }
+        guard received > 0, received < size else { return nil }
+        return PartialTransfer(file: file, received: received, checksum: checksum)
+    }
+
+    /// A sender's check: where it is in the file and the checksum up to there. Nil when it says neither.
+    static func airshipCursor(_ payload: Data) -> (offset: Int, checksum: UInt32?)? {
+        guard !payload.isEmpty, let fields = try? PB.parse(payload) else { return nil }
+        let offset = fields[1]?.first as? Int
+        let checksum = (fields[2]?.first as? Int).flatMap { UInt32(exactly: $0) }
+        guard offset != nil || checksum != nil else { return nil }
+        return (offset ?? 0, checksum)
     }
 
     struct StagedMediaBatch {
@@ -1316,18 +1407,34 @@ final class Session {
         private let handle: FileHandle
         private(set) var received = 0
         private(set) var checksum: UInt32 = 1
+        /// Bytes this reception started with from an earlier, interrupted one; 0 for a fresh file.
+        let resumedFrom: Int
+        var loggedCheck = false
         var messageType: Int
 
-        init(offer: AirshipOffer, assetID: UUID, messageType: Int) throws {
+        init(offer: AirshipOffer, assetID: UUID, messageType: Int, resuming partial: PartialTransfer? = nil) throws {
             self.offer = offer
             self.messageType = messageType
-            let staged = try StagedMediaFile(assetID: assetID, name: offer.name, size: offer.size)
+            let staged = try partial?.file ?? StagedMediaFile(assetID: assetID, name: offer.name, size: offer.size)
             file = staged
-            do { handle = try FileHandle(forWritingTo: staged.url) }
-            catch { throw LinkError.io("无法打开眼镜素材临时文件。") }
+            do {
+                handle = try FileHandle(forWritingTo: staged.url)
+                if let partial {
+                    try handle.truncate(atOffset: UInt64(partial.received))
+                    try handle.seekToEnd()
+                    received = partial.received
+                    checksum = partial.checksum
+                }
+            } catch { throw LinkError.io("无法打开眼镜素材临时文件。") }
+            resumedFrom = partial?.received ?? 0
         }
 
         deinit { try? handle.close() }
+
+        /// Flushes what arrived so a later reception can continue from it.
+        func pause() {
+            try? handle.synchronize()
+        }
 
         func append(_ chunk: Data) throws {
             guard chunk.count <= offer.size - received else {
@@ -1481,19 +1588,29 @@ final class Session {
                     if let previous = active.first(where: { $0.value.file.assetID == assetID })?.key {
                         active.removeValue(forKey: previous)
                     }
+                    let reception: StagedReception
                     do {
-                        active[offer.channel] = try StagedReception(offer: offer, assetID: assetID,
-                                                                   messageType: message.type ?? Int(Self.airOffer))
+                        reception = try StagedReception(offer: offer, assetID: assetID,
+                                                        messageType: message.type ?? Int(Self.airOffer),
+                                                        resuming: Self.takePartial(assetID: assetID, size: offer.size))
                     } catch {
                         pending.remove(assetID)
                         batch.failures[assetID] = error
                         try drop(offer)
                         continue
                     }
-                    try sendAirshipReply(Self.airCursor, on: offer.mirror, payload: PB.uint(2, 1))
+                    active[offer.channel] = reception
+                    // Offset 0 with the checksum of nothing accepts a fresh file; a cursor at what an
+                    // interrupted transfer left asks the sender to go on from there.
+                    let cursor = reception.received == 0
+                        ? PB.uint(2, 1)
+                        : PB.uint(1, UInt64(reception.received)) + PB.uint(2, UInt64(reception.checksum))
+                    try sendAirshipReply(Self.airCursor, on: offer.mirror, payload: cursor)
                     idleDeadline = ProcessInfo.processInfo.systemUptime + timeout
-                    onBytes?(assetID, 0, offer.size)
-                    emit("media: accepted selected Airship offer (\(offer.size)B)")
+                    onBytes?(assetID, reception.received, offer.size)
+                    emit(reception.received == 0
+                         ? "media: accepted selected Airship offer (\(offer.size)B)"
+                         : "media: resuming selected Airship offer at \(reception.received)/\(offer.size)B")
                     continue
                 }
                 guard let transfer = active[message.channel] else { continue }
@@ -1505,6 +1622,8 @@ final class Session {
                     guard !message.payload.isEmpty else { continue }
                     do { try transfer.append(message.payload) }
                     catch {
+                        // More bytes than the resumed file has room for: the sender started over.
+                        if transfer.resumedFrom > 0 { Self.declineResume() }
                         fail(transfer, error)
                         try drop(offer)
                         continue
@@ -1512,6 +1631,27 @@ final class Session {
                     idleDeadline = ProcessInfo.processInfo.systemUptime + timeout
                     onBytes?(assetID, transfer.received, offer.size)
                 case Int(Self.airCheck):
+                    let theirs = Self.airshipCursor(message.payload)
+                    if !transfer.loggedCheck {
+                        transfer.loggedCheck = true
+                        emit("media: first check, sender at \(theirs.map { String($0.offset) } ?? "-"), receiver at \(transfer.received)")
+                    }
+                    // A sender that ignored the resume cursor is back at the start while this side kept
+                    // appending after the old part. Start the file over; the cursor below rewinds the sender.
+                    if transfer.resumedFrom > 0, let theirs,
+                       theirs.offset < transfer.received || (theirs.offset == transfer.received
+                                                              && theirs.checksum != nil && theirs.checksum != transfer.checksum) {
+                        emit("media: sender did not resume (it is at \(theirs.offset), this side at \(transfer.received)); starting the file over")
+                        Self.declineResume()
+                        do {
+                            try transfer.reset()
+                            onBytes?(assetID, 0, offer.size)
+                        } catch {
+                            fail(transfer, error)
+                            try drop(offer)
+                            continue
+                        }
+                    }
                     let offset = transfer.received == 0 ? Data() : PB.uint(1, UInt64(transfer.received))
                     try sendAirshipReply(Self.airCursor, on: offer.mirror,
                                          payload: offset + PB.uint(2, UInt64(transfer.checksum)))
@@ -1522,7 +1662,11 @@ final class Session {
                         pending.remove(assetID)
                         batch.files[assetID] = transfer.file
                         onFileCompleted?(transfer.file)
-                    } catch { fail(transfer, error) }
+                    } catch {
+                        // A resumed file that does not add up means the sender never went on from the cursor.
+                        if transfer.resumedFrom > 0 { Self.declineResume() }
+                        fail(transfer, error)
+                    }
                     try drop(offer)
                 case Int(Self.airReset):
                     do {
@@ -1546,6 +1690,12 @@ final class Session {
         }
         if abandonOffers {
             for transfer in active.values { try? drop(transfer.offer) }
+        }
+        // What broke off stays on the phone; the next offer of the same asset continues from it.
+        for transfer in active.values where transfer.received > 0 && transfer.received < transfer.offer.size {
+            transfer.pause()
+            Self.keepPartial(transfer.file)
+            emit("media: kept \(transfer.received)/\(transfer.offer.size)B of an interrupted file")
         }
         return batch
     }
@@ -1778,6 +1928,8 @@ final class Session {
     // MARK: svc33 RLDrive — the settings store
 
     private var drivePeerChannels: Set<UInt16> = []
+    /// type -> writer -> version as the glasses last reported them, per store.
+    private var driveVersions: [String: Drive.Versions] = [:]
 
     private func driveReply(_ message: DataX.Message, on channel: UInt16, namespace: String,
                             requestID: String, assembler: Drive.Assembler) throws -> Drive.Reply? {
@@ -1826,6 +1978,7 @@ final class Session {
                                              requestID: requestID, assembler: assembler) else { continue }
             if reply.round == 1 {
                 collected += reply.objects
+                driveVersions[namespace, default: [:]].merge(reply.types) { _, new in new }
                 if !receivedValues {
                     let replyTypes = Set(reply.types.keys).union([Drive.kv]).sorted()
                     let acknowledgement = Drive.build(namespace: namespace, requestID: requestID, round: 2,
@@ -1847,11 +2000,11 @@ final class Session {
     func driveWrite(key: String, value: String, namespace: String = Drive.deviceSettings,
                     timeout: TimeInterval = 8) throws -> Bool {
         let ch = serviceChannel("drive", service: Drive.service)
-        let known = try driveObjects(namespace: namespace, timeout: timeout)
-        var versions: Drive.Versions = [:]
-        for object in known {
-            versions[object.type, default: [:]][Drive.localWriter] = (versions[object.type]?[Drive.localWriter] ?? 0) + 1
-        }
+        _ = try driveObjects(namespace: namespace, timeout: timeout)
+        // The glasses' own count of this writer's versions. Counting objects instead gave the same
+        // number for a second write of one key, which a replica ignores: the first toggle stuck and
+        // the toggle back did not.
+        let versions = driveVersions[namespace] ?? [:]
         let requestID = UUID().uuidString.lowercased()
         let object = Drive.Object(uri: key, type: Drive.kv, data: value, deleted: false, raw: Data())
         let sync = Drive.build(namespace: namespace, requestID: requestID, round: 1,
@@ -1862,7 +2015,8 @@ final class Session {
         while true {
             let left = deadline.timeIntervalSinceNow
             if left <= 0 { break }
-            let m = try recvMessage(timeout: left)
+            let m: DataX.Message
+            do { m = try recvMessage(timeout: left) } catch LinkError.unexpected(_) { break }
             if let reply = try driveReply(m, on: ch, namespace: namespace,
                                           requestID: requestID, assembler: assembler), reply.terminated { break }
         }

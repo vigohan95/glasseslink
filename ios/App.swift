@@ -168,7 +168,12 @@ final class Glasses: NSObject, ObservableObject {
     /// A Bluetooth import takes minutes; auto-lock would suspend the app and the glasses drop the stalled
     /// link (glasses log 32: four drops, each while an import ran in the background). Keep the screen on.
     @Published private(set) var mediaImportInProgress = false {
-        didSet { UIApplication.shared.isIdleTimerDisabled = mediaImportInProgress }
+        didSet { updateIdleTimer() }
+    }
+
+    /// Also on while recording: the timed stop is a timer in the app, and a locked phone suspends it.
+    private func updateIdleTimer() {
+        UIApplication.shared.isIdleTimerDisabled = mediaImportInProgress || recording
     }
     private var mediaWiFiAuthenticating = false
     @Published private(set) var mediaImportCancelling = false
@@ -192,9 +197,41 @@ final class Glasses: NSObject, ObservableObject {
     private var manualMediaDecision: CheckedContinuation<Bool, Never>?
     private var manualMediaTimeout: Task<Void, Never>?
     private struct OriginalRequest {
+        /// The photo or video itself, or one of the sensor logs that let the phone level it.
+        enum Role { case main, imu, frames }
         let capture: Capture
         let asset: CaptureAsset
         let assetID: UUID
+        var role: Role = .main
+    }
+
+    /// Over Bluetooth (~30 KB/s) a long clip's IMU log costs minutes; past this the frames are levelled by Vision alone.
+    private static let bluetoothSidecarLimit = 1_000_000
+
+    /// The capture's IMU and frame logs, asked before the capture itself so they are here when it is levelled.
+    private func sidecarRequests(for capture: Capture, saveToPhotos: Bool) -> [OriginalRequest] {
+        let wanted = saveToPhotos && (capture.isPhoto ? PhotoLeveling.isEnabled : VideoLeveling.isEnabled)
+        guard wanted else { return [] }
+        let kinds: [(Int, OriginalRequest.Role)] = [(MotionLog.framesAssetType, .frames), (MotionLog.imuAssetType, .imu)]
+        return kinds.compactMap { type, role in
+            guard let asset = capture.assets.first(where: { $0.type == type && $0.size > 0 }),
+                  let id = UUID(uuidString: asset.uuid) else { return nil }
+            return OriginalRequest(capture: capture, asset: asset, assetID: id, role: role)
+        }
+    }
+
+    /// Keeps a sensor log beside the original; one that cannot be kept only costs the levelling its best input.
+    private func finishSidecar(_ staged: Session.StagedMediaFile, request: OriginalRequest) async {
+        defer { staged.discard() }
+        let kind: LocalMediaLibrary.Sidecar = request.role == .imu ? .imu : .frames
+        let capture = request.capture
+        do {
+            try await Task.detached(priority: .utility) {
+                try LocalMediaLibrary.storeSidecar(staged.url, capture: capture, kind)
+            }.value
+        } catch {
+            note("传感器记录未保存（\(kind.rawValue)）：\(Glasses.explain(error))")
+        }
     }
     private enum QueuedCameraAction { case photo, startVideo, stopVideo }
     private var queuedCamera: (action: QueuedCameraAction, peripheralID: UUID)?
@@ -235,7 +272,9 @@ final class Glasses: NSObject, ObservableObject {
     @Published private var localMediaIndex = LocalMediaLibrary.load()
     var localCaptures: [Capture] { localMediaIndex.values.map(\.capture) }
     @Published var thumbs: [String: UIImage] = [:]
-    @Published var recording = false
+    @Published var recording = false {
+        didSet { updateIdleTimer() }
+    }
     @Published private(set) var lastVideoURL: URL?
     @Published var live: LiveStream?
     @Published var liveLine = "—"
@@ -322,6 +361,7 @@ final class Glasses: NSObject, ObservableObject {
             note("—— 上次崩溃现场 ——")
             for line in prev.split(separator: "\n").prefix(40) { note("  \(line)") }
         }
+        Session.StagedMediaFile.purgeLeftovers()
         loadThumbs()
     }
 
@@ -720,9 +760,11 @@ final class Glasses: NSObject, ObservableObject {
         guard !connected, channel == nil, !openingL2CAP, phase != .handshaking,
               let id = savedGlassesID, canRetryConnection(id) else { return }
         if connecting, let p = peripheral, p.state != .connected {
+            // Also for an adopted candidate: an overdue timer firing on the next wake failed the
+            // connect, and two such failures put the glasses' new identifier on the rejected list.
+            connectionTimeoutTask?.cancel()
+            connectionTimeoutTask = nil
             if p.identifier == id {
-                connectionTimeoutTask?.cancel()
-                connectionTimeoutTask = nil
                 stopRotationWatch()
                 startRotationWatch(id)
                 glassesLine = "后台等待眼镜回来"
@@ -735,6 +777,9 @@ final class Glasses: NSObject, ObservableObject {
     func enterForeground() {
         if wentToBackground { note("App 回到前台") }
         wentToBackground = false
+        // A candidate that failed while the app was half asleep gets another chance.
+        rejectedCandidates.removeAll()
+        candidateFailures.removeAll()
         if connecting, connectionTimeoutTask == nil, let p = peripheral, p.state != .connected,
            let attempt = connectionAttempt {
             // A background wait: give it the foreground timeout and the full scan for a rotated identifier.
@@ -872,6 +917,10 @@ final class Glasses: NSObject, ObservableObject {
                     // canRetryConnection would refuse every later reconnect to the real glasses.
                     rejectedCandidates.insert(adopted)
                     note("候选眼镜不认这台 iPhone 的主人身份（0x\(String(code, radix: 16))），不是你的眼镜")
+                } else if let saved = savedGlassesID, let tried = peripheral?.identifier, saved != tried {
+                    // A tap on another pair nearby: remember that pair, keep the saved one's owner state.
+                    rejectedCandidates.insert(tried)
+                    note("这副眼镜不认这台 iPhone 的主人身份（0x\(String(code, radix: 16))），不是你保存的那副")
                 } else {
                     resetRecovery()
                     ownerState = .rejected(code)
@@ -1415,6 +1464,7 @@ final class Glasses: NSObject, ObservableObject {
                 failure = failure ?? LinkError.unexpected("一项素材没有可导入的原件。")
                 continue
             }
+            requests += sidecarRequests(for: capture, saveToPhotos: saveToPhotos)
             requests.append(OriginalRequest(capture: capture, asset: asset, assetID: assetID))
         }
 
@@ -1433,6 +1483,10 @@ final class Glasses: NSObject, ObservableObject {
                 for request in requests {
                     guard mediaImportID == job else { return }
                     guard let staged = files[request.assetID] else { retry.append(request); continue }
+                    if request.role != .main {
+                        await finishSidecar(staged, request: request)
+                        continue
+                    }
                     let error = await finishMediaFile(staged, capture: request.capture, job: job,
                                                       saveToPhotos: saveToPhotos, cancellation: cancellation)
                     failure = failure ?? error
@@ -1448,13 +1502,24 @@ final class Glasses: NSObject, ObservableObject {
         var refreshedSilentLink = false
         requestLoop: for (index, request) in requests.enumerated() {
             guard mediaImportID == job, !cancellation.isCancelled else { break }
-            var triesLeft = 2
+            if request.role != .main, request.asset.size > Self.bluetoothSidecarLimit { continue }
+            var triesLeft = request.role == .main ? 2 : 1
+            // A dropped link keeps what arrived (Session's partial transfers); each file may go on from
+            // there a few times. glasses log 33: a 26 MB video died at 16 MB and at 25 MB, from zero each time.
+            var resumesLeft = 4
+            var extraRestores = 0
             while triesLeft > 0 {
                 triesLeft -= 1
                 var active = bluetooth
                 if active == nil || session !== active || stream == nil {
                     active = await restoreMediaBluetooth(control: control, job: job)
+                    // After a drop the glasses' Bluetooth can take most of a minute to come back.
+                    while active == nil, extraRestores > 0, mediaImportID == job, !cancellation.isCancelled {
+                        extraRestores -= 1
+                        active = await restoreMediaBluetooth(control: control, job: job)
+                    }
                 }
+                extraRestores = 0
                 guard let active, mediaImportID == job, !cancellation.isCancelled else {
                     if mediaImportID == job, !cancellation.isCancelled {
                         mediaImportFailedIDs.formUnion(requests[index...].map(\.capture.id))
@@ -1485,6 +1550,10 @@ final class Glasses: NSObject, ObservableObject {
                     guard let staged = batch.files[assetID] else {
                         throw batch.error ?? batch.failures[assetID] ?? LinkError.unexpected("眼镜没有发送文件。")
                     }
+                    if request.role != .main {
+                        await finishSidecar(staged, request: request)
+                        break
+                    }
                     let error = await finishMediaFile(staged, capture: capture, job: job,
                                                       saveToPhotos: saveToPhotos, cancellation: cancellation)
                     failure = failure ?? error
@@ -1496,6 +1565,19 @@ final class Glasses: NSObject, ObservableObject {
                         note("眼镜只确认了请求、没有发送文件：重建蓝牙会话后再请求一次")
                         bluetooth = await restartMediaBluetooth(control: control, job: job)
                         continue
+                    }
+                    if request.role == .main, offered.seen, resumesLeft > 0, Session.resumeAllowed, Self.isLinkLoss(error) {
+                        resumesLeft -= 1
+                        triesLeft += 1
+                        extraRestores = 3
+                        bluetooth = nil
+                        note("传输中断：已收到的部分留在手机上，重连后从断点继续")
+                        transferDetail = "蓝牙 · 连接中断，重连后续传"
+                        continue
+                    }
+                    if request.role != .main {
+                        note("传感器记录未取到，这项改用画面判断水平：\(Glasses.explain(error))")
+                        break
                     }
                     mediaImportFailedIDs.insert(capture.id)
                     failure = failure ?? error
@@ -1646,7 +1728,7 @@ final class Glasses: NSObject, ObservableObject {
     private func closeMediaHotspot(using link: Session, job: UUID) async {
         guard let pending = pendingMediaHotspot, pending.job == job else { return }
         guard ContinuousClock.now < pending.deadline else { pendingMediaHotspot = nil; return }
-        guard peripheral?.identifier == pending.peripheralID, link.verifiedPeerIdentity == pending.peerKey else { return }
+        guard link.verifiedPeerIdentity == pending.peerKey else { return }
         if (try? await onGlassesQueue { try link.destroyMediaSoftAP() }) != nil,
            pendingMediaHotspot?.job == job { pendingMediaHotspot = nil }
     }
@@ -1665,6 +1747,18 @@ final class Glasses: NSObject, ObservableObject {
         "Answer in the same language as the question, in one to three short spoken sentences that the "
             + "glasses will read aloud. No lists, markdown or emoji. Only text was received, no image.\n\n"
             + "Question: \(question)"
+    }
+
+    /// What the glasses say when the model could not answer, in the language of the question.
+    nonisolated static func spokenFailure(for question: String) -> String {
+        let chinese = question.unicodeScalars.contains { (0x4E00 ... 0x9FFF).contains($0.value) }
+        return chinese ? "抱歉，模型没有回应，请稍后再试。" : "Sorry, the model did not answer. Please try again."
+    }
+
+    /// The link went away or stalled after bytes had arrived: what is here can be continued.
+    nonisolated static func isLinkLoss(_ error: Error) -> Bool {
+        if case LinkError.io = error { return true }
+        return isSilentTransfer(error)
     }
 
     nonisolated static func isSilentTransfer(_ error: Error) -> Bool {
@@ -1787,6 +1881,19 @@ final class Glasses: NSObject, ObservableObject {
             if let horizon = result.horizon {
                 note(String(format: "照片水平线：%.1f°，把握 %.2f，", horizon.angle * 180 / .pi, horizon.confidence)
                      + (result.url == nil ? "不处理" : "iPhone 相册存摆正后的版本，App 里保留原件"))
+            }
+        }
+        if !capture.isPhoto, VideoLeveling.isEnabled {
+            if mediaImportID != nil { transferDetail = "正在摆正视频…" }
+            switch await VideoLeveling.leveledCopy(of: file, imu: LocalMediaLibrary.sidecarURL(for: capture, .imu),
+                                                   frames: LocalMediaLibrary.sidecarURL(for: capture, .frames)) {
+            case .leveled(let url, let plan):
+                source = url
+                leveled = url
+                note(String(format: "视频已摆正：最大 %.1f°，放大 %.0f%%，依据 ", plan.maximumDegrees, (plan.zoom - 1) * 100)
+                     + plan.source + "；iPhone 相册存摆正后的版本，App 里保留原片")
+            case .unchanged(let why):
+                note("视频未摆正：\(why)")
             }
         }
         try await persistCapture(nil, isPhoto: capture.isPhoto, original: source,
@@ -2159,8 +2266,12 @@ final class Glasses: NSObject, ObservableObject {
         }
         a.onTurnEnded = { [weak self, weak a] interaction in
             Task { @MainActor in
-                guard let self, let a, self.assistantRef === a, self.voiceTurn == interaction,
-                      self.submittedVoiceTurn != interaction else { return }
+                guard let self, let a, self.assistantRef === a, self.voiceTurn == interaction else { return }
+                // The glasses gave up on this question: no point in finishing the model call.
+                guard self.submittedVoiceTurn != interaction else {
+                    self.voiceAnswer?.cancel()
+                    return
+                }
                 self.voiceWait?.cancel()
                 self.assistantTranscriptMissing = true
                 self.assistantMessage = "眼镜已结束这轮语音，App 没收到问题文字。"
@@ -2261,7 +2372,12 @@ final class Glasses: NSObject, ObservableObject {
             } catch {
                 guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
                 self.assistantMessage = "模型请求失败 · \(Glasses.explain(error))"
-                self.note("眼镜语音的模型请求失败")
+                self.note("眼镜语音的模型请求失败：\(Glasses.explain(error))")
+                // Say so and close the turn; the glasses otherwise wait in silence for up to a minute.
+                let sorry = Self.spokenFailure(for: question)
+                try? await Task.detached(priority: .userInitiated) {
+                    try assistant.complete(interaction: interaction, text: sorry, transcript: question)
+                }.value
                 return
             }
             guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }

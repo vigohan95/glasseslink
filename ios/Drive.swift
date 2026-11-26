@@ -81,7 +81,7 @@ enum Drive {
             writers[localWriter] = round == 0 ? 0 : base + mine.count
             var typeData = Data()
             for (writer, version) in writers.sorted(by: { $0.key < $1.key }) {
-                typeData += PB.bytes(11, PB.string(1, writer) + PB.uint(2, UInt64(version)))
+                typeData += PB.bytes(11, PB.string(1, writer) + PB.uint(2, UInt64(max(0, version))))
             }
             typeData += PB.string(12, type)
             for (index, object) in mine.enumerated() {

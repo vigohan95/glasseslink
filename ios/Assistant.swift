@@ -68,6 +68,7 @@ final class Assistant: @unchecked Sendable {
     private var pauseRequests = 0
     private var readerParked = false
     private var readerActive = false
+    private weak var readerThread: Thread?
 
     private enum Endpoint: String {
         case messages = "assistant-m0"
@@ -300,11 +301,15 @@ final class Assistant: @unchecked Sendable {
         }
         running = true
         stateLock.unlock()
-        session.routeToAssistant([m0, m0 ^ 0x8000, s0, s0 ^ 0x8000], quiet: [s0, s0 ^ 0x8000])
+        // Only the mirrors: 0x80NN is also how the glasses number their own channels, and after they
+        // restart those start low again. A file offer on a number equal to m0 or s0 would be parked
+        // here and never answered, which blocks their transfer queue.
+        session.routeToAssistant([m0 ^ 0x8000, s0 ^ 0x8000], quiet: [s0 ^ 0x8000])
         pauseCondition.lock()
         readerActive = true
         pauseCondition.unlock()
         let worker = Thread { [weak self] in self?.loop() }
+        readerThread = worker
         worker.name = "assistant"
         worker.start()
     }
@@ -319,6 +324,12 @@ final class Assistant: @unchecked Sendable {
         if wasRunning { session.routeToAssistant([]) }
         pauseCondition.lock()
         pauseCondition.broadcast()
+        // Whoever stops the assistant reads the link next (live view, a reconnect): wait for the reader
+        // to leave its read so it cannot swallow the first reply.
+        if Thread.current !== readerThread {
+            let deadline = Date().addingTimeInterval(0.5)
+            while readerActive, pauseCondition.wait(until: deadline) {}
+        }
         pauseCondition.unlock()
     }
 
@@ -398,8 +409,9 @@ final class Assistant: @unchecked Sendable {
         }
     }
 
-    /// Short so a pause request is honoured within half a second; frames still wake the read at once.
-    private var receiveTimeout: TimeInterval { 0.5 }
+    /// Short so a pause request is honoured at once: with Hey Meta on, every link operation waits for
+    /// the reader to leave its read, and half a second of that made the shutter feel late.
+    private var receiveTimeout: TimeInterval { 0.15 }
 
     private func handle(_ message: DataX.Message) throws {
         if accepts(message, on: s0) {
@@ -509,8 +521,10 @@ final class Assistant: @unchecked Sendable {
         switch id {
         case EV.fulfillmentRequest:
             guard let request = Self.spokenRequest(inner) else {
-                log("assistant: glasses fulfillment event did not contain a supported question")
-                closeTurn(inner.text(1))
+                // The wake itself arrives as a fulfillment request too (intent IN:WAKE_WORD), before the
+                // one that carries the words: the 0.99 log has two event 57 for one wake. Closing the
+                // turn here put its id on the done list, and the real question was then dropped unseen.
+                log("assistant: fulfillment event without a question (wake or unsupported); waiting for the next")
                 return
             }
             acceptTranscript(request.transcript, interaction: request.interaction, simplified: request.simplified)

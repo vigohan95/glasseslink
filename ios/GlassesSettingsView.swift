@@ -156,6 +156,7 @@ struct GlassesSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var percentDrafts: [String: Double] = [:]
     @AppStorage(PhotoLeveling.enabledKey) private var levelPhotos = true
+    @AppStorage(VideoLeveling.enabledKey) private var levelVideos = true
 
     private var ready: Bool { g.canUseGlasses && g.settingsReadAt != nil }
 
@@ -179,10 +180,18 @@ struct GlassesSettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                Toggle(isOn: $levelVideos) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("视频自动摆正")
+                        Text("眼镜的防抖只管抖，不管歪。导入时会一并取回眼镜随视频记录的陀螺仪数据，算出每一刻头歪了多少，把存进 iPhone 相册的那份逐帧转正；最多修正 8°，明显是故意歪头的不修。导入会因此多花一点时间。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             } header: {
                 Label("导入到 iPhone 相册时", systemImage: "level")
             } footer: {
-                Text("视频的水平校正由眼镜自己完成：GlassesLink 每次连接都会打开两段式防抖（Meta App 也是这样），配合上面「视频防抖」选「中」效果最好。")
+                Text("App 里保留的始终是原件；关掉开关后重新存到相册，得到的就是未处理的原样。")
             }
             Section {
                 NavigationLink("全部原始设置（开发者）") { SettingsView(g: g) }

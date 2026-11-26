@@ -75,7 +75,17 @@ struct RootView: View {
                     LoginWebView(url: Meta.authorize(state: UUID().uuidString),
                                  onCode: { code in
                                      g.route = .becomeOwner
-                                     g.becomeOwner(userToken: code)
+                                     // The page hands back an OAuth code; registration needs the token it
+                                     // exchanges for (the diagnostics screen already did this).
+                                     g.note("拿到 code，交换 token…")
+                                     Task {
+                                         do {
+                                             let token = try await MetaClient(log: { g.note($0) }).exchangeCode(code)
+                                             g.becomeOwner(userToken: token)
+                                         } catch {
+                                             g.note("token 交换失败：\(error)")
+                                         }
+                                     }
                                  },
                                  onCancel: { g.route = .becomeOwner })
                         .ignoresSafeArea()

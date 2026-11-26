@@ -22,6 +22,12 @@ private final class ResultBox<Value>: @unchecked Sendable {
 }
 
 final class CompatibilityTests: XCTestCase {
+    /// Kept partial transfers are process-wide; no test may inherit another's.
+    override func setUp() {
+        super.setUp()
+        Session.resetResumeState()
+    }
+
     private func hex(_ d: Data) -> String { d.map { String(format: "%02x", $0) }.joined() }
 
     private func bytes(_ s: String) -> Data {
@@ -869,9 +875,23 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertFalse(PhotoLeveling.shouldLevel(degrees: 30))
     }
 
+    /// The row where the bright sky ends in column `x` of a rendered picture (row 0 is one edge; only
+    /// differences between columns matter).
+    private func skyEdge(_ image: CIImage, x: Int) throws -> Int {
+        let frame = image.extent
+        let width = Int(frame.width), height = Int(frame.height)
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        CIContext().render(image, toBitmap: &pixels, rowBytes: width * 4, bounds: frame, format: .RGBA8, colorSpace: space)
+        let sky = (0 ..< height).map { pixels[($0 * width + x) * 4 + 2] > 128 }
+        // The picture is half sky, half ground: the edge is where the column changes.
+        return try XCTUnwrap((1 ..< height).first { sky[$0] != sky[$0 - 1] })
+    }
+
     /// Vision's sign convention decides whether a photo is straightened or tilted twice as far; the first
-    /// CI run of this test showed the angle comes back as the correction, not the tilt. So check the
-    /// whole round trip: straighten by the detected angle and the horizon must read level afterwards.
+    /// CI run showed the angle comes back as the correction, not the tilt. Vision does not find a horizon
+    /// again in the turned pictures, so the proof is in the pixels: after straightening by the detected
+    /// angle the sky ends at the same height left and right, and turned the other way the slope doubles.
     func testStraighteningByTheDetectedAngleLevelsTheHorizon() throws {
         let frame = CGRect(x: 0, y: 0, width: 1200, height: 900)
         let sky = CIImage(color: CIColor(red: 0.55, green: 0.75, blue: 0.95)).cropped(to: frame)
@@ -881,6 +901,16 @@ final class CompatibilityTests: XCTestCase {
             .transformed(by: CGAffineTransform(rotationAngle: CGFloat(tilt)))
             .transformed(by: CGAffineTransform(translationX: frame.midX, y: frame.midY))
         let scene = ground.composited(over: sky).cropped(to: frame)
+        let slope = { (image: CIImage) in abs(try self.skyEdge(image, x: 1000) - self.skyEdge(image, x: 200)) }
+        XCTAssertEqual(Double(try slope(scene)), 800 * tan(tilt), accuracy: 6)   // 84 rows over 800 columns
+
+        // The geometry on its own: turning by minus the tilt levels it, and the frame stays covered.
+        let byHand = PhotoLeveling.straightened(scene, by: -tilt)
+        XCTAssertEqual(byHand.extent, frame)
+        XCTAssertLessThanOrEqual(try slope(byHand), 3)
+        XCTAssertEqual(PhotoLeveling.zoom(width: 1512, height: 2016, angle: 3 * Double.pi / 180), 1.068, accuracy: 0.002)
+        XCTAssertEqual(PhotoLeveling.zoom(width: 1512, height: 2016, angle: 0), 1, accuracy: 1e-9)
+
         guard let horizon = PhotoLeveling.detectedHorizon(of: scene) else {
             throw XCTSkip("Vision found no horizon in the synthetic scene here")
         }
@@ -891,14 +921,8 @@ final class CompatibilityTests: XCTestCase {
         } else {
             XCTAssertNil(PhotoLeveling.levelingAngle(of: scene))
         }
-
-        // Vision may find nothing to report on a level picture; turning the wrong way must read about 12°.
-        let level = PhotoLeveling.straightened(scene, by: correction)
-        XCTAssertLessThan(abs((PhotoLeveling.detectedHorizon(of: level)?.angle ?? 0) * 180 / Double.pi), 1.5)
-        XCTAssertNil(PhotoLeveling.levelingAngle(of: level))
-        let doubled = PhotoLeveling.straightened(scene, by: -correction)
-        let wrongWay = try XCTUnwrap(PhotoLeveling.detectedHorizon(of: doubled))
-        XCTAssertEqual(abs(wrongWay.angle * 180 / Double.pi), 12, accuracy: 3)
+        XCTAssertLessThanOrEqual(try slope(PhotoLeveling.straightened(scene, by: correction)), 40)
+        XCTAssertGreaterThan(try slope(PhotoLeveling.straightened(scene, by: -correction)), 130)
     }
 
     /// The ack of a svc31 write comes back on the mirror channel. Waiting on the phone's own channel
@@ -943,5 +967,267 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertFalse(ratio.accepts("nan"))
         XCTAssertFalse(SettingSchema(key: "x", field: nil, kind: "other", defaultValue: nil,
                                      namespace: "individual_device_settings", parsed: false).accepts("1"))
+    }
+
+    // MARK: resuming an interrupted transfer
+
+    private func resumableAsset() throws -> (asset: UUID, id: Data, content: Data) {
+        let asset = try XCTUnwrap(UUID(uuidString: "20112233-4455-4677-8999-aabbccddeeff"))
+        let content = Data((0 ..< 5000).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ 7) })
+        return (asset, withUnsafeBytes(of: asset.uuid) { Data($0) }, content)
+    }
+
+    /// A first session that gets `count` bytes of the file and then stops, as a dropped link would.
+    private func interruptTransfer(of file: (asset: UUID, id: Data, content: Data), after count: Int) throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        try peer.write(mediaOffer(channel: 0x8010, id: file.id, size: UInt64(file.content.count)))
+        try peer.write(DataX.message(0x8010, tags: [DataX.tag(2, Session.airData, last: true)],
+                                     payload: Data(file.content.prefix(count))))
+        var got = 0
+        let broken = try session.receiveMediaFilesToDisk(expectedAssetIDs: [file.asset], timeout: 5,
+            onBytes: { _, received, _ in got = received }, isCancelled: { got >= count })
+        XCTAssertTrue(broken.error is CancellationError)
+        XCTAssertNil(broken.files[file.asset])
+    }
+
+    /// glasses log 33: a 26 MB video dropped at 16 MB and again at 25 MB, restarting from zero each time.
+    /// What arrived now stays on the phone, and the next offer is answered with a cursor at its end.
+    func testInterruptedFileContinuesFromWhatArrived() throws {
+        let file = try resumableAsset()
+        try interruptTransfer(of: file, after: 2000)
+
+        let (session, peer) = try encryptedLoopback(trust: true)
+        try peer.write(mediaOffer(channel: 0x8020, id: file.id, size: UInt64(file.content.count)))
+        let result = ResultBox<Session.StagedMediaBatch>()
+        let firstProgress = ResultBox<Int>()
+        let finished = expectation(description: "second session finished")
+        DispatchQueue.global(qos: .userInitiated).async {
+            result.value = try? session.receiveMediaFilesToDisk(expectedAssetIDs: [file.asset], timeout: 8,
+                onBytes: { _, received, _ in if firstProgress.value == nil { firstProgress.value = received } })
+            finished.fulfill()
+        }
+        let cursor = try DataX.parse(peer.nextFrame(timeout: 5))
+        XCTAssertEqual(cursor.channel, 0x0020)
+        XCTAssertEqual(cursor.type, Int(Session.airCursor))
+        let fields = try PB.parse(cursor.payload)
+        XCTAssertEqual(fields[1]?.first as? Int, 2000)
+        XCTAssertEqual(fields[2]?.first as? Int, Int(Session.adler32(Data(file.content.prefix(2000)))))
+
+        // The sender goes on from the cursor, checks once, and completes.
+        try peer.write(DataX.message(0x8020, tags: [DataX.tag(2, Session.airData, last: true)],
+                                     payload: Data(file.content.dropFirst(2000))))
+        let whole = PB.uint(1, UInt64(file.content.count)) + PB.uint(2, UInt64(Session.adler32(file.content)))
+        try peer.write(DataX.message(0x8020, tags: [DataX.tag(2, Session.airCheck, last: true)], payload: whole))
+        try peer.write(DataX.message(0x8020, tags: [DataX.tag(2, Session.airComplete, last: true)], payload: whole))
+        wait(for: [finished], timeout: 10)
+        let batch = try XCTUnwrap(result.value)
+        XCTAssertNil(batch.error)
+        XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(batch.files[file.asset]).url), file.content)
+        XCTAssertEqual(firstProgress.value, 2000)
+        XCTAssertTrue(Session.resumeAllowed)
+    }
+
+    /// Glasses that do not honour the cursor send the file from its start again. The first check shows
+    /// the two sides out of step: the file starts over, and later transfers no longer try to resume.
+    func testASenderThatIgnoresTheResumeCursorStartsTheFileOver() throws {
+        let file = try resumableAsset()
+        try interruptTransfer(of: file, after: 2000)
+
+        let (session, peer) = try encryptedLoopback(trust: true)
+        try peer.write(mediaOffer(channel: 0x8020, id: file.id, size: UInt64(file.content.count)))
+        let result = ResultBox<Session.StagedMediaBatch>()
+        let finished = expectation(description: "second session finished")
+        DispatchQueue.global(qos: .userInitiated).async {
+            result.value = try? session.receiveMediaFilesToDisk(expectedAssetIDs: [file.asset], timeout: 8)
+            finished.fulfill()
+        }
+        XCTAssertEqual(try PB.parse(DataX.parse(peer.nextFrame(timeout: 5)).payload)[1]?.first as? Int, 2000)
+
+        // From zero, as if no cursor had been sent: 1500 bytes, then the check that gives it away.
+        let dataTag = [DataX.tag(2, Session.airData, last: true)]
+        let head = Data(file.content.prefix(1500))
+        try peer.write(DataX.message(0x8020, tags: dataTag, payload: head))
+        try peer.write(DataX.message(0x8020, tags: [DataX.tag(2, Session.airCheck, last: true)],
+                                     payload: PB.uint(1, 1500) + PB.uint(2, UInt64(Session.adler32(head)))))
+        let rewind = try DataX.parse(peer.nextFrame(timeout: 5))
+        XCTAssertEqual(rewind.type, Int(Session.airCursor))
+        let asked = try PB.parse(rewind.payload)
+        XCTAssertNil(asked[1])                                   // offset 0
+        XCTAssertEqual(asked[2]?.first as? Int, 1)               // the checksum of nothing
+
+        // Sealed frames carry at most 4 KB of plaintext.
+        try peer.write(DataX.message(0x8020, tags: dataTag, payload: Data(file.content.prefix(2500))))
+        try peer.write(DataX.message(0x8020, tags: dataTag, payload: Data(file.content.dropFirst(2500))))
+        let whole = PB.uint(1, UInt64(file.content.count)) + PB.uint(2, UInt64(Session.adler32(file.content)))
+        try peer.write(DataX.message(0x8020, tags: [DataX.tag(2, Session.airComplete, last: true)], payload: whole))
+        wait(for: [finished], timeout: 10)
+        let batch = try XCTUnwrap(result.value)
+        XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(batch.files[file.asset]).url), file.content)
+        XCTAssertFalse(Session.resumeAllowed)
+        Session.resetResumeState()
+    }
+
+    func testSenderChecksAreReadAsOffsetAndChecksum() {
+        let cursor = Session.airshipCursor(PB.uint(1, 65_536) + PB.uint(2, 7))
+        XCTAssertEqual(cursor?.offset, 65_536)
+        XCTAssertEqual(cursor?.checksum, 7)
+        XCTAssertEqual(Session.airshipCursor(PB.uint(2, 1))?.offset, 0)
+        XCTAssertNil(Session.airshipCursor(Data()))
+        XCTAssertTrue(Glasses.isLinkLoss(LinkError.io("stream closed")))
+        XCTAssertTrue(Glasses.isLinkLoss(LinkError.unexpected("眼镜文件传输暂停过久，请重试。")))
+        XCTAssertFalse(Glasses.isLinkLoss(LinkError.unexpected("眼镜上已找不到这项素材。")))
+    }
+
+    // MARK: Hey Meta
+
+    /// The glasses announce a wake with a fulfillment request of its own (intent IN:WAKE_WORD) and send
+    /// the words in a second one. Treating the first as "no question" closed the turn and put its id on
+    /// the done list, so the real question was dropped without a trace.
+    func testTheWakeEventDoesNotCostTheQuestionThatFollows() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let assistant = Assistant(session: session)
+        let heard = expectation(description: "the question reached the app")
+        let question = ResultBox<String>()
+        assistant.onTranscript = { text, _ in
+            question.value = text
+            heard.fulfill()
+        }
+        let registered = expectation(description: "assistant registered")
+        DispatchQueue.global(qos: .userInitiated).async {
+            do { try assistant.register(timeout: 8) } catch { XCTFail("registration failed: \(error)") }
+            registered.fulfill()
+        }
+        let messages = try nextPhoneMessage(peer, type: Int(Assistant.MT.initMessageRequest), timeout: 8)
+        try peer.write(DataX.message(messages.channel ^ 0x8000,
+                                     tags: [DataX.tag(2, UInt16(Assistant.MT.initMessageResponse), last: true)],
+                                     payload: PB.uint(1, 5)))
+        let stream = try nextPhoneMessage(peer, type: Int(Assistant.MT.initStreamRequest), timeout: 8)
+        try peer.write(DataX.message(stream.channel ^ 0x8000,
+                                     tags: [DataX.tag(2, UInt16(Assistant.MT.initStreamResponse), last: true)],
+                                     payload: PB.uint(1, 5)))
+        wait(for: [registered], timeout: 10)
+        assistant.startLoop()
+        defer { assistant.stop() }
+
+        let mirror = messages.channel ^ 0x8000
+        func send(_ type: Int32, _ payload: Data) throws {
+            try peer.write(DataX.message(mirror, tags: [DataX.tag(2, UInt16(type), last: true)], payload: payload))
+        }
+        try send(Assistant.MT.startInteraction, ThriftWriter().string(1, "turn-9").done())
+        let wake = ThriftWriter().string(1, "turn-9").string(23, "IN:WAKE_WORD").done()
+        try send(Assistant.MT.netEvent, assistant.netEvent(Assistant.EV.fulfillmentRequest, wake))
+        let words = ThriftWriter().structField(1, ThriftWriter().string(1, "what is your name").done()).done()
+        let request = ThriftWriter().string(1, "turn-9").structField(2, words).done()
+        try send(Assistant.MT.netEvent, assistant.netEvent(Assistant.EV.fulfillmentRequest, request))
+        wait(for: [heard], timeout: 5)
+        XCTAssertEqual(question.value, "what is your name")
+    }
+
+    // MARK: video levelling
+
+    private func le<T: FixedWidthInteger>(_ value: T) -> Data { withUnsafeBytes(of: value.littleEndian) { Data($0) } }
+
+    /// An IMU log of a head held still at `roll` (positive: tilted to its right), 960 samples a second.
+    private func stillIMU(rollDegrees: Double, seconds: Double) -> [IMUSample] {
+        let roll = rollDegrees * Double.pi / 180
+        return (0 ..< Int(seconds * 960)).map { index in
+            IMUSample(timeNs: Int64(index) * 1_041_667, ax: Float(-9.81 * sin(roll)), ay: Float(9.81 * cos(roll)), az: 0,
+                      gx: 0, gy: 0, gz: 0)
+        }
+    }
+
+    func testSensorLogsAreReadAsFixedLittleEndianRecords() throws {
+        var imu = Data("SI".utf8) + le(UInt16(1))
+        imu += Data([0, 0]) + le(Int64(1_000_000_000))
+        for value in [Float(0.5), 9.7, -0.25, 0.01, -0.02, 0.03, 31.5] { imu += le(value.bitPattern) }
+        let sample = try XCTUnwrap(MotionLog.readIMU(imu)).first
+        XCTAssertEqual(sample, IMUSample(timeNs: 1_000_000_000, ax: 0.5, ay: 9.7, az: -0.25, gx: 0.01, gy: -0.02, gz: 0.03))
+        XCTAssertNil(MotionLog.readIMU(imu.dropLast()))
+        XCTAssertNil(MotionLog.readIMU(Data("SF".utf8) + imu.dropFirst(2)))
+
+        let frames = Data("SF".utf8) + le(UInt16(1)) + le(UInt16(7)) + le(Int64(2_000_000_000)) + le(Int64(8_000_000))
+        let record = try XCTUnwrap(MotionLog.readFrames(frames)).first
+        XCTAssertEqual(record, FrameRecord(frame: 7, timeNs: 2_000_000_000, exposureNs: 8_000_000))
+        XCTAssertEqual(record?.midExposureNs, 2_004_000_000)
+    }
+
+    func testHeadRollComesOutOfTheIMULogWithVisorsSign() throws {
+        let imu = stillIMU(rollDegrees: 5, seconds: 2)
+        let frames = (0 ..< 45).map { FrameRecord(frame: $0, timeNs: 200_000_000 + Int64($0) * 33_333_333, exposureNs: 8_000_000) }
+        let rolls = try XCTUnwrap(VideoLeveling.frameRolls(imu: imu, frames: frames))
+        XCTAssertEqual(rolls.count, frames.count)
+        for roll in rolls {
+            XCTAssertEqual(roll.radians * 180 / Double.pi, 5, accuracy: 0.05)
+            XCTAssertEqual(roll.weight, 1, accuracy: 1e-9)
+        }
+        // Looking straight down there is no roll to speak of.
+        XCTAssertLessThan(VideoLeveling.roll(of: SIMD3(0.05, 0.05, 1)).weight, 0.2)
+        // Frames outside what the log covers: no answer rather than a guess.
+        let late = frames.map { FrameRecord(frame: $0.frame, timeNs: $0.timeNs + 5_000_000_000, exposureNs: 0) }
+        XCTAssertNil(VideoLeveling.frameRolls(imu: imu, frames: late))
+    }
+
+    func testAHeadTurningDoesNotFoolTheGravityEstimate() {
+        // The head rolls from 0 to 10 degrees to the right over one second while a sideways push of
+        // 2 m/s^2 (a walking turn) leans the accelerometer the other way.
+        var imu: [IMUSample] = []
+        for index in 0 ..< 1920 {
+            let t = Double(index) / 960
+            let roll = min(t, 1) * 10 * Double.pi / 180
+            // Rolling right about the forward axis: the IMU's z points at the wearer, so the rate is on -z.
+            let rate = t < 1 ? Float(-10 * Double.pi / 180) : 0
+            let push = t > 1 ? 2.0 : 0
+            imu.append(IMUSample(timeNs: Int64(index) * 1_041_667, ax: Float(-9.81 * sin(roll) + push),
+                                 ay: Float(9.81 * cos(roll)), az: 0, gx: 0, gy: 0, gz: rate))
+        }
+        let sign: Double = VideoLeveling.gyroPredictionError(imu, gyroSign: -1) < VideoLeveling.gyroPredictionError(imu, gyroSign: 1) ? -1 : 1
+        let ups = VideoLeveling.upVectors(imu, gyroSign: sign)
+        // Right after the turn the gyro has carried "up" to 10 degrees; the push has had no time to drag it.
+        XCTAssertEqual(VideoLeveling.roll(of: ups[1000]).radians * 180 / Double.pi, 10, accuracy: 1.0)
+        // The accelerometer alone would read 10 degrees minus atan(2 / 9.66), about -1.7.
+        XCTAssertGreaterThan(VideoLeveling.roll(of: ups[1400]).radians * 180 / Double.pi, 6)
+    }
+
+    func testLevellingPlanFollowsTheIMUAndIsCheckedByThePicture() throws {
+        let degree = Double.pi / 180
+        let times = (0 ..< 90).map { Double($0) / 30 }
+        let tilted = [(radians: Double, weight: Double)](repeating: (5 * degree, 1), count: times.count)
+
+        // IMU alone: a head tilted 5 degrees to the right is corrected by -5 (Vision's sign for the same picture).
+        let alone = try XCTUnwrap(VideoLeveling.plan(frameTimes: times, imuRolls: tilted, vision: [], fps: 30, width: 1512, height: 2016))
+        XCTAssertEqual(alone.angle(at: 1.5) / degree, -5, accuracy: 0.01)
+        XCTAssertEqual(alone.zoom, PhotoLeveling.zoom(width: 1512, height: 2016, angle: 5 * degree), accuracy: 1e-9)
+
+        // The picture agrees: no change.
+        let agree = (0 ..< 5).map { (time: Double($0) * 0.6, angle: -5 * degree) }
+        let confirmed = try XCTUnwrap(VideoLeveling.plan(frameTimes: times, imuRolls: tilted, vision: agree, fps: 30, width: 1512, height: 2016))
+        XCTAssertEqual(confirmed.angle(at: 1.5) / degree, -5, accuracy: 0.05)
+
+        // The picture says the opposite: the IMU's sign was wrong for this clip, and the picture wins.
+        let opposite = agree.map { (time: $0.time, angle: 5 * degree) }
+        let turned = try XCTUnwrap(VideoLeveling.plan(frameTimes: times, imuRolls: tilted, vision: opposite, fps: 30, width: 1512, height: 2016))
+        XCTAssertEqual(turned.angle(at: 1.5) / degree, 5, accuracy: 0.05)
+
+        // The picture is already level (the glasses corrected it): nothing to do.
+        let level = agree.map { (time: $0.time, angle: 0.0) }
+        XCTAssertNil(VideoLeveling.plan(frameTimes: times, imuRolls: tilted, vision: level, fps: 30, width: 1512, height: 2016))
+
+        // No IMU log: enough frames with a horizon carry the clip; too few do not.
+        let pictureOnly = try XCTUnwrap(VideoLeveling.plan(frameTimes: times, imuRolls: nil, vision: agree, fps: 30, width: 1512, height: 2016))
+        XCTAssertEqual(pictureOnly.angle(at: 1.5) / degree, -5, accuracy: 0.1)
+        XCTAssertNil(VideoLeveling.plan(frameTimes: times, imuRolls: nil, vision: Array(agree.prefix(2)), fps: 30, width: 1512, height: 2016))
+    }
+
+    func testLevellingCorrectionIsCappedAndLetsGoOfADeliberateTilt() {
+        let degree = Double.pi / 180
+        XCTAssertEqual(VideoLeveling.limited(3 * degree), 3 * degree, accuracy: 1e-12)
+        XCTAssertEqual(VideoLeveling.limited(-8 * degree), -8 * degree, accuracy: 1e-12)
+        XCTAssertLessThan(abs(VideoLeveling.limited(15 * degree)), 8 * degree)
+        XCTAssertEqual(VideoLeveling.limited(30 * degree), 0, accuracy: 1e-12)
+        XCTAssertEqual(VideoLeveling.zeroPhaseSmooth([2, 2, 2, 2], tauFrames: 15), [2, 2, 2, 2])
+        let step = VideoLeveling.zeroPhaseSmooth([Double](repeating: 0, count: 60) + [Double](repeating: 1, count: 60), tauFrames: 15)
+        XCTAssertEqual(step[60], 0.5, accuracy: 0.1)   // no lag: the step is centred where it happened
+        XCTAssertEqual(VideoLeveling.median([3, 1, 2]), 2)
+        XCTAssertEqual(VideoLeveling.median([4, 1, 2, 3]), 2.5)
     }
 }

@@ -106,6 +106,15 @@ enum LocalMediaLibrary {
     }
 
     private static func destination(for capture: Capture, originalName: String) throws -> (item: Item, url: URL) {
+        let root = try prepareRoot()
+        let suffix = URL(fileURLWithPath: originalName).pathExtension.lowercased()
+        let allowed = capture.isPhoto ? ["heic", "heif", "jpg", "jpeg", "png"] : ["mp4", "mov", "m4v"]
+        let ext = allowed.contains(suffix) ? suffix : (capture.isPhoto ? "heic" : "mp4")
+        let fileName = identity(capture) + "." + ext
+        return (Item(capture: capture, fileName: fileName), root.appendingPathComponent(fileName))
+    }
+
+    private static func prepareRoot() throws -> URL {
         guard var root = originals else { throw LinkError.io("无法打开 App 的媒体目录。") }
         if !FileManager.default.fileExists(atPath: root.path) {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -113,11 +122,30 @@ enum LocalMediaLibrary {
             protection.isExcludedFromBackup = true
             try? root.setResourceValues(protection)
         }
-        let suffix = URL(fileURLWithPath: originalName).pathExtension.lowercased()
-        let allowed = capture.isPhoto ? ["heic", "heif", "jpg", "jpeg", "png"] : ["mp4", "mov", "m4v"]
-        let ext = allowed.contains(suffix) ? suffix : (capture.isPhoto ? "heic" : "mp4")
-        let identity = SHA256.hash(data: Data(capture.id.utf8)).map { String(format: "%02x", $0) }.joined()
-        let fileName = identity + "." + ext
-        return (Item(capture: capture, fileName: fileName), root.appendingPathComponent(fileName))
+        return root
+    }
+
+    private static func identity(_ capture: Capture) -> String {
+        SHA256.hash(data: Data(capture.id.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    // MARK: sensor logs
+
+    /// The capture's IMU or frame log, kept beside its original so it can be levelled again later.
+    enum Sidecar: String {
+        case imu, frames
+    }
+
+    static func sidecarURL(for capture: Capture, _ kind: Sidecar) -> URL? {
+        guard let root = originals else { return nil }
+        let url = root.appendingPathComponent(identity(capture) + "." + kind.rawValue)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    static func storeSidecar(_ source: URL, capture: Capture, _ kind: Sidecar) throws {
+        let destination = try prepareRoot().appendingPathComponent(identity(capture) + "." + kind.rawValue)
+        let files = FileManager.default
+        if files.fileExists(atPath: destination.path) { try files.removeItem(at: destination) }
+        try files.copyItem(at: source, to: destination)
     }
 }

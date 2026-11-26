@@ -136,7 +136,10 @@ struct ModelSheet: View {
                 model = value.suggestions.first ?? ""
             }
             .onChange(of: baseURL) { old, new in
-                if ModelClient.baseComponents(old) != ModelClient.baseComponents(new) {
+                // Only while the field still shows what was stored for the old address: a key just
+                // pasted for a new service must survive typing that service's URL.
+                if ModelClient.baseComponents(old) != ModelClient.baseComponents(new),
+                   key.isEmpty || key == ModelCredentials.read(for: old) {
                     key = ModelCredentials.read(for: new)
                 }
                 response = nil

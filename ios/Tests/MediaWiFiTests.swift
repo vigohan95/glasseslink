@@ -4,6 +4,11 @@ import XCTest
 @testable import GlassesLink
 
 final class MediaWiFiTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        Session.resetResumeState()
+    }
+
     func testAutomaticJoinErrorOffersManualJoinWithoutLeakingSystemDetails() {
         let code = NEHotspotConfigurationError.systemConfiguration.rawValue
         let error = NSError(domain: NEHotspotConfigurationErrorDomain, code: code,
