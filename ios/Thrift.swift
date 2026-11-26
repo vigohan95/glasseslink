@@ -16,6 +16,8 @@ enum TC {
     static let set: UInt8 = 10
     static let map: UInt8 = 11
     static let structure: UInt8 = 12
+    /// fbthrift's compact extension: a 4-byte big-endian IEEE float.
+    static let float: UInt8 = 13
 }
 
 enum ThriftError: Error, CustomStringConvertible {
@@ -150,7 +152,8 @@ enum Varint {
     }
 }
 
-/// Reads a compact struct into `[fieldId: value]`, where values are Int64, Data, Bool or [Any].
+/// Reads a compact struct into `[fieldId: value]`, where values are Int64, Double, Data, Bool, [Any],
+/// nested `[Int: Any]` structs or `[String: Any]` maps.
 enum ThriftCompact {
     private static let maximumDepth = 64
 
@@ -202,11 +205,35 @@ enum ThriftCompact {
             let decoded = (signed >> 1) ^ -(signed & 1)
             return (decoded, next)
         case TC.double:
+            // Visor's reader (core/protocol Thrift.kt) takes doubles little-endian.
             guard end - i >= 8 else { throw ThriftError.truncated("double") }
             var bits: UInt64 = 0
-            for k in 0..<8 { bits = (bits << 8) | UInt64(data[i + k]) }
-            i += 8
-            return (Double(bitPattern: bits), i)
+            for k in 0..<8 { bits |= UInt64(data[i + k]) << (8 * UInt64(k)) }
+            return (Double(bitPattern: bits), i + 8)
+        case TC.float:
+            guard end - i >= 4 else { throw ThriftError.truncated("float") }
+            var bits: UInt32 = 0
+            for k in 0..<4 { bits = (bits << 8) | UInt32(data[i + k]) }
+            return (Double(Float(bitPattern: bits)), i + 4)
+        case TC.map:
+            // ev57 keeps its slots as map<string, list<struct>>; without this case the whole
+            // event failed to parse and the glasses' transcript was lost.
+            let (size, afterSize) = try Varint.decode(data, i)
+            i = afterSize
+            guard size > 0 else { return ([String: Any](), i) }
+            guard i < end else { throw ThriftError.truncated("map") }
+            let kinds = data[i]
+            i += 1
+            // Every entry takes at least two bytes, so a larger count cannot be real.
+            guard size <= UInt64(end - i) / 2 else { throw ThriftError.truncated("map") }
+            var entries: [String: Any] = [:]
+            for _ in 0..<Int(size) {
+                let key = try readElement(data, i, kinds >> 4, depth: depth + 1)
+                let value = try readElement(data, key.next, kinds & 0x0F, depth: depth + 1)
+                entries[mapKey(key.value)] = value.value
+                i = value.next
+            }
+            return (entries, i)
         case TC.bin:
             let (len, next) = try Varint.decode(data, i)
             i = next
@@ -248,6 +275,23 @@ enum ThriftCompact {
             throw ThriftError.badType(type)
         }
     }
+
+    /// Inside a list, set or map a bool is a byte of its own (1 true, 2 false).
+    private static func readElement(_ data: Data, _ start: Int, _ type: UInt8, depth: Int) throws -> (value: Any, next: Int) {
+        guard type == TC.tTrue || type == TC.tFalse else { return try readValue(data, start, type, depth: depth) }
+        guard start < data.endIndex else { throw ThriftError.truncated("bool element") }
+        return (data[start] == TC.tTrue, start + 1)
+    }
+
+    /// Map keys become strings; binary keys that are not UTF-8 become hex.
+    private static func mapKey(_ value: Any) -> String {
+        switch value {
+        case let d as Data: return String(data: d, encoding: .utf8) ?? d.hex
+        case let n as Int64: return String(n)
+        case let b as Bool: return b ? "true" : "false"
+        default: return String(describing: value)
+        }
+    }
 }
 
 // Small accessors so call sites stay readable.
@@ -283,5 +327,9 @@ extension Dictionary where Key == Int, Value == Any {
 
     func list(_ fid: Int) -> [Any] {
         (self[fid] as? [Any]) ?? []
+    }
+
+    func mapField(_ fid: Int) -> [String: Any] {
+        (self[fid] as? [String: Any]) ?? [:]
     }
 }
