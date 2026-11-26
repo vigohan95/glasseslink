@@ -93,3 +93,30 @@ struct ScanEntry: Identifiable, Equatable {
         return id.uuidString < other.id.uuidString
     }
 }
+
+/// Meta's manufacturer data as CoreBluetooth reports it (company id 0x01AB first, little-endian).
+/// After the company id: legacy `[product:2 LE][flags]`, or V2 `[version ≥ 0x80][product:2 LE][reserved][flags]`
+/// (Visor `NearbyGlasses.advert`).
+enum MetaAdvertisement {
+    static let wristbandProducts: Set<Int> = [1537, 1538]
+
+    static func isMeta(_ manufacturerData: Data?) -> Bool {
+        guard let data = manufacturerData else { return false }
+        let bytes = [UInt8](data)
+        return bytes.count >= 2 && bytes[0] == 0xAB && bytes[1] == 0x01
+    }
+
+    static func product(_ manufacturerData: Data?) -> Int? {
+        guard isMeta(manufacturerData), let data = manufacturerData else { return nil }
+        let payload = [UInt8](data).dropFirst(2).map { Int($0) }
+        guard payload.count >= 3 else { return nil }
+        return payload[0] >= 0x80 ? payload[1] | payload[2] << 8 : payload[0] | payload[1] << 8
+    }
+
+    /// Glasses worth trying when the saved Bluetooth identifier is gone; the owner check decides.
+    static func isGlassesCandidate(manufacturerData: Data?, hasMetaService: Bool) -> Bool {
+        guard isMeta(manufacturerData) || hasMetaService else { return false }
+        if let product = product(manufacturerData), wristbandProducts.contains(product) { return false }
+        return true
+    }
+}

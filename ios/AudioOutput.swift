@@ -37,6 +37,39 @@ enum GlassesAudioInput {
     }
 }
 
+struct AudioPortInfo: Equatable {
+    let type: AVAudioSession.Port
+    let name: String
+}
+
+/// Whether iOS can use the glasses as a headset. Only a system Bluetooth pairing makes that true;
+/// the app's own data link never does (0.99's bridging reconnect could not create one).
+enum GlassesAudioState: Equatable {
+    case glasses(profile: String)
+    case otherBluetooth(name: String)
+    case unavailable
+
+    static func from(outputs: [AudioPortInfo], inputs: [AudioPortInfo], glassesNames: [String]) -> GlassesAudioState {
+        let wanted = Set(glassesNames.map(GlassesAudioInput.normalizedName))
+        func isGlasses(_ port: AudioPortInfo) -> Bool {
+            ScanEntry.matchesRayBanMetaName(port.name) || wanted.contains(GlassesAudioInput.normalizedName(port.name))
+        }
+        let wirelessOut = outputs.filter { [.bluetoothA2DP, .bluetoothLE, .bluetoothHFP].contains($0.type) }
+        if let port = wirelessOut.first(where: isGlasses) {
+            switch port.type {
+            case .bluetoothA2DP: return .glasses(profile: "蓝牙立体声 · A2DP")
+            case .bluetoothLE: return .glasses(profile: "蓝牙 LE 音频")
+            default: return .glasses(profile: "蓝牙通话模式 · HFP")
+            }
+        }
+        if inputs.contains(where: { [.bluetoothHFP, .bluetoothLE].contains($0.type) && isGlasses($0) }) {
+            return .glasses(profile: "眼镜麦克风可用")
+        }
+        if let other = wirelessOut.first { return .otherBluetooth(name: other.name) }
+        return .unavailable
+    }
+}
+
 @MainActor
 final class AudioRouteTest: ObservableObject {
     @Published private(set) var isPlaying = false

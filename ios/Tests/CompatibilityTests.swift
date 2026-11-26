@@ -6,6 +6,7 @@
 // A mismatch here would show up on the real device as a silent `service_not_found` or a
 // rejected trust message, which is expensive to debug over Bluetooth.
 
+import AVFoundation
 import XCTest
 @testable import GlassesLink
 
@@ -575,5 +576,30 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(values.count, 1)
         XCTAssertEqual(values.first?.uri, key)
         XCTAssertEqual(values.first?.data, value)
+    }
+
+    func testGlassesAudioStateNamesTheGlassesAndIgnoresOtherHeadsets() {
+        let glasses = [AudioPortInfo(type: .bluetoothA2DP, name: "RB Meta 046N")]
+        XCTAssertEqual(GlassesAudioState.from(outputs: glasses, inputs: [], glassesNames: []),
+                       .glasses(profile: "蓝牙立体声 · A2DP"))
+        XCTAssertEqual(GlassesAudioState.from(outputs: [AudioPortInfo(type: .bluetoothA2DP, name: "AirPods")],
+                                              inputs: [], glassesNames: []), .otherBluetooth(name: "AirPods"))
+        XCTAssertEqual(GlassesAudioState.from(outputs: [AudioPortInfo(type: .builtInSpeaker, name: "Speaker")],
+                                              inputs: [AudioPortInfo(type: .bluetoothHFP, name: "My Specs")],
+                                              glassesNames: ["My Specs"]), .glasses(profile: "眼镜麦克风可用"))
+        XCTAssertEqual(GlassesAudioState.from(outputs: [AudioPortInfo(type: .builtInSpeaker, name: "Speaker")],
+                                              inputs: [], glassesNames: []), .unavailable)
+    }
+
+    func testMetaAdvertisementReadsProductAndSkipsWristbands() {
+        XCTAssertEqual(MetaAdvertisement.product(Data([0xAB, 0x01, 0x02, 0x01, 0x01])), 258)
+        XCTAssertEqual(MetaAdvertisement.product(Data([0xAB, 0x01, 0x80, 0x06, 0x01, 0x00, 0x01])), 262)
+        XCTAssertTrue(MetaAdvertisement.isGlassesCandidate(manufacturerData: Data([0xAB, 0x01, 0x80, 0x06, 0x01, 0x00, 0x01]),
+                                                           hasMetaService: false))
+        XCTAssertFalse(MetaAdvertisement.isGlassesCandidate(manufacturerData: Data([0xAB, 0x01, 0x80, 0x01, 0x06, 0x00, 0x00]),
+                                                            hasMetaService: true))
+        XCTAssertNil(MetaAdvertisement.product(Data([0x4C, 0x00, 0x10, 0x05, 0x01])))
+        XCTAssertFalse(MetaAdvertisement.isGlassesCandidate(manufacturerData: Data([0x4C, 0x00, 0x10]), hasMetaService: false))
+        XCTAssertTrue(MetaAdvertisement.isGlassesCandidate(manufacturerData: nil, hasMetaService: true))
     }
 }
