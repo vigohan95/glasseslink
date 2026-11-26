@@ -1361,7 +1361,7 @@ final class CompatibilityTests: XCTestCase {
         assistant.onTurnEnded = { _ in closed.value?.fulfill() }
         let handed = expectation(description: "the question reached the app")
         let question = ResultBox<String>()
-        assistant.onUnclaimedQuestion = { words in
+        assistant.onUnclaimedQuestion = { words, _ in
             question.value = words
             handed.fulfill()
         }
