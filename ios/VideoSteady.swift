@@ -90,10 +90,10 @@ enum VideoSteady {
         guard let forward = inverse(m) else { return source }
         let w = Double(source.extent.width), h = Double(source.extent.height)
         func place(_ x: Double, _ y: Double) -> CIVector? {
-            let z = forward[2] * x + forward[5] * y + forward[8]
+            let z: Double = forward[2] * x + forward[5] * y + forward[8]
             guard z > 1e-9 else { return nil }
-            let u = (forward[0] * x + forward[3] * y + forward[6]) / z
-            let v = (forward[1] * x + forward[4] * y + forward[7]) / z
+            let u: Double = (forward[0] * x + forward[3] * y + forward[6]) / z
+            let v: Double = (forward[1] * x + forward[4] * y + forward[7]) / z
             // Pixels with y down to Core Image's y up.
             return CIVector(x: u, y: Double(outHeight) - v)
         }
@@ -113,10 +113,12 @@ enum VideoSteady {
         let a00 = m[0], a01 = m[3], a02 = m[6]
         let a10 = m[1], a11 = m[4], a12 = m[7]
         let a20 = m[2], a21 = m[5], a22 = m[8]
-        let c00 = a11 * a22 - a12 * a21, c01 = a02 * a21 - a01 * a22, c02 = a01 * a12 - a02 * a11
-        let c10 = a12 * a20 - a10 * a22, c11 = a00 * a22 - a02 * a20, c12 = a02 * a10 - a00 * a12
-        let c20 = a10 * a21 - a11 * a20, c21 = a01 * a20 - a00 * a21, c22 = a00 * a11 - a01 * a10
-        let det = a00 * c00 + a01 * c10 + a02 * c20
+        let c00: Double = a11 * a22 - a12 * a21, c01: Double = a02 * a21 - a01 * a22
+        let c02: Double = a01 * a12 - a02 * a11, c10: Double = a12 * a20 - a10 * a22
+        let c11: Double = a00 * a22 - a02 * a20, c12: Double = a02 * a10 - a00 * a12
+        let c20: Double = a10 * a21 - a11 * a20, c21: Double = a01 * a20 - a00 * a21
+        let c22: Double = a00 * a11 - a01 * a10
+        let det: Double = a00 * c00 + a01 * c10 + a02 * c20
         guard abs(det) > 1e-12 else { return nil }
         let r = [[c00, c01, c02], [c10, c11, c12], [c20, c21, c22]].map { $0.map { $0 / det } }
         // Back to column-major.
@@ -136,13 +138,18 @@ enum VideoSteady {
             for row in 0 ..< 3 {
                 a[row][0] = m[row][0] / f
                 a[row][1] = m[row][1] / f
-                a[row][2] = m[row][2] - m[row][0] * ow / 2 / f - m[row][1] * oh / 2 / f
+                let shiftX: Double = m[row][0] * ow / 2 / f
+                let shiftY: Double = m[row][1] * oh / 2 / f
+                a[row][2] = m[row][2] - shiftX - shiftY
             }
             let k = [[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]]
             var out = [Double](repeating: 0, count: 9)
             for row in 0 ..< 3 {
                 for col in 0 ..< 3 {
-                    out[col * 3 + row] = k[row][0] * a[0][col] + k[row][1] * a[1][col] + k[row][2] * a[2][col]
+                    let first: Double = k[row][0] * a[0][col]
+                    let second: Double = k[row][1] * a[1][col]
+                    let third: Double = k[row][2] * a[2][col]
+                    out[col * 3 + row] = first + second + third
                 }
             }
             return out
@@ -153,10 +160,10 @@ enum VideoSteady {
             let m = matrix(r)
             for x in [0, ow / 2, ow] {
                 for y in [0, oh / 2, oh] {
-                    let z = m[2] * x + m[5] * y + m[8]
+                    let z: Double = m[2] * x + m[5] * y + m[8]
                     if z <= 0 { return false }
-                    let u = (m[0] * x + m[3] * y + m[6]) / z
-                    let v = (m[1] * x + m[4] * y + m[7]) / z
+                    let u: Double = (m[0] * x + m[3] * y + m[6]) / z
+                    let v: Double = (m[1] * x + m[4] * y + m[7]) / z
                     if u < 0 || u > w || v < 0 || v > h { return false }
                 }
             }
@@ -176,7 +183,10 @@ enum VideoSteady {
                 let dt = Double(imu[k].timeNs - imu[k - 1].timeNs) / 1e9
                 let a = imu[k - 1], b = imu[k]
                 // The IMU's axes are Android's: x right, y up, z toward the wearer.
-                let step = SIMD3(Double(a.gx + b.gx) / 2 * dt, -Double(a.gy + b.gy) / 2 * dt, -Double(a.gz + b.gz) / 2 * dt)
+                let sx: Double = Double(a.gx + b.gx) / 2 * dt
+                let sy: Double = -Double(a.gy + b.gy) / 2 * dt
+                let sz: Double = -Double(a.gz + b.gz) / 2 * dt
+                let step = SIMD3<Double>(sx, sy, sz)
                 q.append(VideoSteady.normalize(VideoSteady.multiply(q[k - 1], VideoSteady.quaternion(step))))
             }
             let times = imu.map(\.timeNs)
@@ -191,7 +201,9 @@ enum VideoSteady {
                 let span = max(times[i] - times[i - 1], 1)
                 let share = min(max(Double(t - times[i - 1]) / Double(span), 0), 1)
                 let next = VideoSteady.aligned(q[i - 1], q[i])
-                return VideoSteady.normalize(q[i - 1] * (1 - share) + next * share)
+                let before: SIMD4<Double> = q[i - 1] * (1 - share)
+                let after: SIMD4<Double> = next * share
+                return VideoSteady.normalize(before + after)
             }
             let span = Double(max(frames[frames.count - 1].timeNs - frames[0].timeNs, 1))
             fps = Double(frames.count - 1) / (span / 1e9)
@@ -233,12 +245,19 @@ enum VideoSteady {
         /// `qs` averaged over a Gaussian `sigma` frames wide.
         private func smooth(_ qs: [SIMD4<Double>], sigma: Double) -> [SIMD4<Double>] {
             let reach = Int(3 * sigma)
-            let weights = (0 ... 2 * reach).map { exp(-Double(($0 - reach) * ($0 - reach)) / (2 * sigma * sigma)) }
+            let spread: Double = 2 * sigma * sigma
+            var weights: [Double] = []
+            for index in 0 ... 2 * reach {
+                let d = Double(index - reach)
+                weights.append(exp(-(d * d) / spread))
+            }
             let n = qs.count
             return (0 ..< n).map { i in
                 var sum = SIMD4<Double>(0, 0, 0, 0)
                 for k in -reach ... reach {
-                    sum += VideoSteady.aligned(qs[i], qs[min(max(i + k, 0), n - 1)]) * weights[k + reach]
+                    let j = min(max(i + k, 0), n - 1)
+                    let q: SIMD4<Double> = VideoSteady.aligned(qs[i], qs[j])
+                    sum += q * weights[k + reach]
                 }
                 return VideoSteady.normalize(sum)
             }
@@ -248,10 +267,13 @@ enum VideoSteady {
     // MARK: quaternions (w, x, y, z)
 
     static func multiply(_ a: SIMD4<Double>, _ b: SIMD4<Double>) -> SIMD4<Double> {
-        SIMD4(a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
-              a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
-              a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
-              a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0])
+        let aw: Double = a[0], ax: Double = a[1], ay: Double = a[2], az: Double = a[3]
+        let bw: Double = b[0], bx: Double = b[1], by: Double = b[2], bz: Double = b[3]
+        let w: Double = aw * bw - ax * bx - ay * by - az * bz
+        let x: Double = aw * bx + ax * bw + ay * bz - az * by
+        let y: Double = aw * by - ax * bz + ay * bw + az * bx
+        let z: Double = aw * bz + ax * by - ay * bx + az * bw
+        return SIMD4(w, x, y, z)
     }
 
     static func conjugate(_ q: SIMD4<Double>) -> SIMD4<Double> { SIMD4(q[0], -q[1], -q[2], -q[3]) }
@@ -277,7 +299,8 @@ enum VideoSteady {
     /// The rotation vector of unit quaternion `q`, the shorter way round.
     static func vector(_ q: SIMD4<Double>) -> SIMD3<Double> {
         let p = q[0] < 0 ? -q : q
-        let v = (p[1] * p[1] + p[2] * p[2] + p[3] * p[3]).squareRoot()
+        let squares: Double = p[1] * p[1] + p[2] * p[2] + p[3] * p[3]
+        let v = squares.squareRoot()
         if v < 1e-12 { return SIMD3(2 * p[1], 2 * p[2], 2 * p[3]) }
         let angle = 2 * atan2(v, p[0])
         return SIMD3(p[1] / v * angle, p[2] / v * angle, p[3] / v * angle)
@@ -286,11 +309,13 @@ enum VideoSteady {
     /// The rotation matrix of rotation vector `r`, rows first.
     static func rotation(_ r: SIMD3<Double>) -> [[Double]] {
         let q = quaternion(r)
-        let w = q[0], x = q[1], y = q[2], z = q[3]
-        return [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-        ]
+        let w: Double = q[0], x: Double = q[1], y: Double = q[2], z: Double = q[3]
+        let xx: Double = x * x, yy: Double = y * y, zz: Double = z * z
+        let xy: Double = x * y, xz: Double = x * z, yz: Double = y * z
+        let wx: Double = w * x, wy: Double = w * y, wz: Double = w * z
+        let row0: [Double] = [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)]
+        let row1: [Double] = [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)]
+        let row2: [Double] = [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)]
+        return [row0, row1, row2]
     }
 }

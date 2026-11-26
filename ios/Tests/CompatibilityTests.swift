@@ -1372,8 +1372,10 @@ final class CompatibilityTests: XCTestCase {
         let m = warps.matrix(at: 1.0)
         // The output's centre shows the input's centre; its corner shows the corner of the centred crop.
         func map(_ x: Double, _ y: Double) -> (Double, Double) {
-            let z = m[2] * x + m[5] * y + m[8]
-            return ((m[0] * x + m[3] * y + m[6]) / z, (m[1] * x + m[4] * y + m[7]) / z)
+            let z: Double = m[2] * x + m[5] * y + m[8]
+            let u: Double = (m[0] * x + m[3] * y + m[6]) / z
+            let v: Double = (m[1] * x + m[4] * y + m[7]) / z
+            return (u, v)
         }
         let centre = map(612, 816)
         XCTAssertEqual(centre.0, 720, accuracy: 1e-6)
