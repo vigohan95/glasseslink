@@ -23,6 +23,14 @@ struct GlassesApp: App {
 
 // MARK: - share sheet plumbing
 
+/// A short result shown at the top of the screen with a haptic: what just happened, in a few words.
+struct Toast: Identifiable, Equatable {
+    enum Kind { case success, failure, info }
+    let id = UUID()
+    let kind: Kind
+    let text: String
+}
+
 struct ShareBox: Identifiable {
     let id = UUID()
     let url: URL
@@ -240,6 +248,19 @@ final class Glasses: NSObject, ObservableObject {
     private var lastImportedPhotoURL: URL?
     @Published var answer = ""
     @Published var share: ShareBox?
+    /// The latest result to show; views present it and clear it after a few seconds.
+    @Published var toast: Toast?
+
+    /// Every action that finishes says so: a line on screen and a tap in the hand.
+    func showToast(_ text: String, _ kind: Toast.Kind = .info) {
+        guard UIApplication.shared.applicationState == .active else { return }
+        toast = Toast(kind: kind, text: text)
+        switch kind {
+        case .success: UINotificationFeedbackGenerator().notificationOccurred(.success)
+        case .failure: UINotificationFeedbackGenerator().notificationOccurred(.error)
+        case .info: UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
+    }
 
     @Published var modelBaseURL = UserDefaults.standard.string(forKey: "modelBaseURL") ?? "http://192.168.3.90:11434/v1"
     @Published var modelName = UserDefaults.standard.string(forKey: "modelName") ?? "gemma3:4b"
@@ -875,6 +896,7 @@ final class Glasses: NSObject, ObservableObject {
             phase = .connected
             assistantAutoTries = 0
             if UIApplication.shared.applicationState == .background { note("后台重新连上了眼镜") }
+            if trust { showToast("眼镜已连接", .success) }
             if trust {
                 verifiedAt = ContinuousClock.now
                 UserDefaults.standard.set(true, forKey: "isOwner")
@@ -1597,6 +1619,13 @@ final class Glasses: NSObject, ObservableObject {
             mediaMessage = "已导入 \(count) 项。"
         }
         note("媒体批次结束：完成 \(count)/\(captures.count) 项，取消=\(cancellation.isCancelled)")
+        if cancellation.isCancelled {
+            showToast("导入已停止，完成 \(count) 项")
+        } else if failure != nil {
+            showToast("导入了 \(count)/\(captures.count) 项，其余未完成", .failure)
+        } else {
+            showToast("已导入 \(count) 项", .success)
+        }
         resetMediaImportUI()
         busy = false
         if !connected, !autoReconnectSuppressed { autoReconnect() }
@@ -2956,7 +2985,9 @@ final class Glasses: NSObject, ObservableObject {
                     if accepted {
                         self.settings[key] = value
                         self.note("\(key) 已生效")
+                        self.showToast("已保存", .success)
                     } else {
+                        self.showToast("眼镜没有保存这项设置", .failure)
                         self.settingsMessage = "眼镜没有保存这个值，仍是原来的设置。"
                         self.note("\(key) 写入后读回仍是原值（眼镜未接受）")
                     }
