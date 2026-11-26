@@ -2050,10 +2050,10 @@ final class Glasses: NSObject, ObservableObject {
         case .bluetoothLE: audioMediaProfile = "蓝牙 LE 音频"
         default: audioMediaProfile = nil
         }
-        let session = AVAudioSession.sharedInstance()
+        let audioSession = AVAudioSession.sharedInstance()
         let state = GlassesAudioState.from(
             outputs: outputs.map { AudioPortInfo(type: $0.portType, name: $0.portName) },
-            inputs: (session.availableInputs ?? []).map { AudioPortInfo(type: $0.portType, name: $0.portName) },
+            inputs: (audioSession.availableInputs ?? []).map { AudioPortInfo(type: $0.portType, name: $0.portName) },
             glassesNames: verifiedPeripheralNames.values.compactMap { ScanEntry.usableName($0) })
         if state != glassesAudio {
             glassesAudio = state
