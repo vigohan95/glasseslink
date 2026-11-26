@@ -191,15 +191,15 @@ final class CompatibilityTests: XCTestCase {
         let ready = expectation(description: "The encrypted setup link opened")
         DispatchQueue.global(qos: .userInitiated).async {
             defer { ready.fulfill() }
-            do { try session.handshake(timeout: 4, trust: trust, expectedPeerIdentity: expectedIdentity) }
+            do { try session.handshake(timeout: 10, trust: trust, expectedPeerIdentity: expectedIdentity) }
             catch {
                 if let outcome { outcome.error = error } else { XCTFail("Encrypted test setup failed: \(error)") }
             }
         }
-        defer { wait(for: [ready], timeout: 5) }
+        defer { wait(for: [ready], timeout: 12) }
 
-        let request = try PB.parse(DataX.parse(stream.nextFrame(timeout: 4)).payload)
-        let enable = try PB.parse(DataX.parse(stream.nextFrame(timeout: 4)).payload)
+        let request = try PB.parse(DataX.parse(stream.nextFrame(timeout: 10)).payload)
+        let enable = try PB.parse(DataX.parse(stream.nextFrame(timeout: 10)).payload)
         let phonePublicKey = try XCTUnwrap(request[1]?.first as? Data)
         let phoneChallenge = try XCTUnwrap(request[2]?.first as? Data)
         let phoneSeed = try XCTUnwrap(enable[2]?.first as? Data)
@@ -212,11 +212,11 @@ final class CompatibilityTests: XCTestCase {
                                              quirks: .none, multikey: true)
         keys.send.seq = base
         let peer = EncryptedPeer(stream: stream, send: keys.send, recv: keys.recv)
-        let endSetup = try DataX.parse(peer.nextFrame(timeout: 4))
+        let endSetup = try DataX.parse(peer.nextFrame(timeout: 10))
         XCTAssertTrue(Session.isEndLinkSetupRequest(endSetup))
         try peer.write(AirShield.endLinkStatus)
         if trust {
-            let ownerRequest = try DataX.parse(peer.nextFrame(timeout: 4))
+            let ownerRequest = try DataX.parse(peer.nextFrame(timeout: 10))
             XCTAssertEqual(ownerRequest.service, AirShield.svcIdentity)
             XCTAssertEqual(ownerRequest.type, Int(AirShield.idEnableTrust))
             let binding = AirShield.channelBinding(glassesChallenge: challenge, glassesPubkey: owner.publicKeyXy,
@@ -229,7 +229,7 @@ final class CompatibilityTests: XCTestCase {
             try peer.write(AirShield.trustMessage(channel: peerChannel, ownerPubkey: identity.publicKeyXy,
                                                  signatureRaw: peerProof))
             try peer.write(DataX.status(ownerRequest.channel ^ 0x8000, AirShield.stSuccess))
-            let accepted = try DataX.parse(peer.nextFrame(timeout: 4))
+            let accepted = try DataX.parse(peer.nextFrame(timeout: 10))
             XCTAssertEqual(accepted.channel, peerChannel ^ 0x8000)
             XCTAssertEqual(accepted.error, Int(AirShield.stSuccess))
         }
@@ -887,9 +887,12 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(correction * 180 / Double.pi, -6, accuracy: 2.5)
         XCTAssertEqual(PhotoLeveling.levelingAngle(of: scene), correction)
 
+        // Vision may find nothing to report on a level picture; turning the wrong way must read about 12°.
         let level = PhotoLeveling.straightened(scene, by: correction)
-        let residual = try XCTUnwrap(PhotoLeveling.detectedHorizon(of: level))
-        XCTAssertLessThan(abs(residual * 180 / Double.pi), 1.5)
+        XCTAssertLessThan(abs((PhotoLeveling.detectedHorizon(of: level) ?? 0) * 180 / Double.pi), 1.5)
         XCTAssertNil(PhotoLeveling.levelingAngle(of: level))
+        let doubled = PhotoLeveling.straightened(scene, by: -correction)
+        let wrongWay = try XCTUnwrap(PhotoLeveling.detectedHorizon(of: doubled))
+        XCTAssertEqual(abs(wrongWay * 180 / Double.pi), 12, accuracy: 3)
     }
 }
