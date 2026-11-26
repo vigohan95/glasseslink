@@ -139,6 +139,10 @@ final class Glasses: NSObject, ObservableObject {
     private var scanStartedAt: ContinuousClock.Instant?
     private var recoveryScanID: UUID?
     private var recoveryScanUsed = false
+    /// A candidate connected because the saved identifier vanished; the owner check confirms it.
+    private var adoptingID: UUID?
+    /// Candidates that failed that check this launch, so recovery does not pick them again.
+    private var rejectedCandidates: Set<UUID> = []
     private var ignoredAdvertisers: Set<UUID> = []
     private var sawGlassesAdvertisement = false
     private var scanRound = 0
@@ -352,6 +356,7 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     private func rememberVerifiedPeripheral(_ p: CBPeripheral) {
+        if adoptingID == p.identifier { adoptingID = nil }
         let key = p.identifier.uuidString
         let name = ScanEntry.usableName(p.name)
         var saved = verifiedPeripheralNames
@@ -501,6 +506,25 @@ final class Glasses: NSObject, ObservableObject {
         return true
     }
 
+    /// iOS gives unpaired glasses a new identifier after their address rotates (0.99 log 08:46:12–08:46:27:
+    /// the saved one was never found, while the same glasses advertised under a new one). When the saved
+    /// identifier is gone, connect to a Meta glasses candidate instead; the owner check in the handshake
+    /// decides whether it is ours, and a successful one re-saves the new identifier.
+    private func adoptRecoveryCandidate(_ p: CBPeripheral, why: String) {
+        guard !rejectedCandidates.contains(p.identifier), channel == nil, !connecting else { return }
+        stopScanning()
+        resetRecovery()
+        discoveredPeripherals[p.identifier] = p
+        adoptingID = p.identifier
+        note("上次的蓝牙标识已失效，改连\(why)的眼镜 · \(p.identifier.uuidString.suffix(4))，握手时核对主人身份")
+        beginConnection(p.identifier)
+    }
+
+    private func systemConnectedCandidate() -> CBPeripheral? {
+        central.retrieveConnectedPeripherals(withServices: [CBUUID(string: Self.metaService)])
+            .first { !rejectedCandidates.contains($0.identifier) }
+    }
+
     /// The system's connected service matches and the last explicitly selected peripheral.
     func loadSystemPaired() {
         guard central.state == .poweredOn else { note("蓝牙不可用：\(central.state.rawValue)"); return }
@@ -556,6 +580,10 @@ final class Glasses: NSObject, ObservableObject {
         guard let p = knownPeripheral ?? central.retrievePeripherals(withIdentifiers: [id]).first else {
             if !forRegistration, canRetryConnection(id) {
                 recoveringID = id
+                if let connected = systemConnectedCandidate() {
+                    adoptRecoveryCandidate(connected, why: "系统已连接")
+                    return
+                }
                 if scanForRecovery(id) { return }
             }
             finishRecoveryOrShowFailure(id, reason: "未找到上次连接的眼镜。")
@@ -721,10 +749,17 @@ final class Glasses: NSObject, ObservableObject {
                 note("眼镜未回应快速握手，改用完整等待窗口")
             }
             if case LinkError.trustRejected(let code) = error {
-                resetRecovery()
-                ownerState = .rejected(code)
-                UserDefaults.standard.set("rejected:\(code)", forKey: "ownerState")
-                UserDefaults.standard.set(Self.ts(), forKey: "ownerStateAt")
+                if let adopted = adoptingID, adopted == peripheral?.identifier {
+                    // Someone else's glasses: drop the candidate and keep our own owner state, or
+                    // canRetryConnection would refuse every later reconnect to the real glasses.
+                    rejectedCandidates.insert(adopted)
+                    note("候选眼镜不认这台 iPhone 的主人身份（0x\(String(code, radix: 16))），不是你的眼镜")
+                } else {
+                    resetRecovery()
+                    ownerState = .rejected(code)
+                    UserDefaults.standard.set("rejected:\(code)", forKey: "ownerState")
+                    UserDefaults.standard.set(Self.ts(), forKey: "ownerStateAt")
+                }
             }
             // Release the link on failure: otherwise the next tap only reports
             // "链路已经打开了" and the user is stuck until the app is killed.
@@ -820,6 +855,7 @@ final class Glasses: NSObject, ObservableObject {
 
     private func failConnection(_ reason: String, peripheral p: CBPeripheral, underlying: Error? = nil) {
         guard peripheral === p else { return }
+        if adoptingID == p.identifier { adoptingID = nil }
         if mediaWiFiSwitching, mediaImportID != nil {
             releaseBluetoothForMediaWiFi()
             note("切换到眼镜 Wi-Fi 期间蓝牙控制通道关闭")
@@ -2513,6 +2549,8 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             $0.uuidString == "FD5F" || $0.uuidString == Self.metaService
         }
         let isConnectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue != false
+        let metaCandidate = MetaAdvertisement.isGlassesCandidate(manufacturerData: manufacturerData,
+                                                                 hasMetaService: hasMetaService)
         let candidate = hasMetaService || hasMetaManufacturer || ScanEntry.matchesRayBanMetaName(peripheralName)
             || ScanEntry.matchesRayBanMetaName(localName)
         let id = p.identifier
@@ -2546,6 +2584,9 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
             if target {
                 self.stopScanning()
                 self.beginConnection(id)
+            } else if self.recoveryScanID != nil, metaCandidate, isConnectable, (-90 ... -1).contains(rssi),
+                      !self.rejectedCandidates.contains(id) {
+                self.adoptRecoveryCandidate(p, why: "附近")
             }
         }
     }
