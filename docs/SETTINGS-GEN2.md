@@ -27,7 +27,7 @@ GlassesLink「眼镜设置」页里每一项的作用、依据和取值来源。
 | 设置 | 作用 | 取值（出厂默认） | 写入方式 | 依据可信度 | 官方原文 |
 | --- | --- | --- | --- | --- | --- |
 | 拍摄键<br>`capture_button_short_long_press` | 拍摄键单按和长按分别做什么。 | 单按拍照，长按录像、单按录像，长按拍照（默认：单按拍照，长按录像） | svc31 字段 7 | 高 | Capture button：Swaps what a short and a long press of the capture button do: photo or video. |
-| 视频画质<br>`resolution_and_framerate` | 画质越高越耗电、越占空间；高帧率每帧曝光更短，室内噪点会更多。 | 标准 · 1080p 30 帧、高帧率 · 1080p 60 帧、高分辨率 · 3K 30 帧（默认：标准 · 1080p 30 帧） | svc31 字段 109 | 高 | Resolution and frame rate：Changing resolution or frame rate affects battery life, storage, recording duration, and orientation. |
+| 视频画质<br>`resolution_and_framerate` | 日常用「标准」。高帧率（60 帧）这一档眼镜不做画面校正：画面更广、边缘弯曲（像鱼眼），每帧曝光更短，室内明显更暗、噪点更多。画质越高越耗电、越占空间。 | 标准 · 1080p 30 帧、高帧率 · 1080p 60 帧（画面不校正）、高分辨率 · 3K 30 帧（默认：标准 · 1080p 30 帧） | svc31 字段 109 | 高 | Resolution and frame rate：Changing resolution or frame rate affects battery life, storage, recording duration, and orientation. |
 | 单段视频最长<br>`video_duration_ms` | 录到这个时长自动停止。这是官方给的几档；过热和电量由眼镜另外的保护机制管。 | 30 秒、1 分钟、3 分钟、5 分钟（仅标准画质）、10 分钟（默认：3 分钟） | svc31 字段 17 | 高 | Video length：Choose a maximum video length. These limits help optimize for sharing and space. |
 | 视频防抖<br>`eis_mode` | 中（默认）：防抖并校正水平；强：画面最平稳；弱：保留动作感；自动：按画面运动自己选。 | 自动、强、中、弱（默认：中） | svc31 字段 108 | 高 | Video stabilization：How the camera stabilizes video. |
 | 灯光防闪烁<br>`flicker_reduction_mode` | 室内灯光下视频出现明暗条纹或闪烁时，按当地电网频率选：中国大陆、香港是 50 Hz，台湾、美国是 60 Hz。 | 自动、50 Hz、60 Hz（默认：自动） | svc31 字段 223 | 中 | Flicker reduction：Sets the flicker reduction mode the camera uses for capture. |
