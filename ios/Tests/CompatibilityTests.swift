@@ -312,6 +312,12 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(next.channel, capturesChannel)
         XCTAssertEqual(next.type, Int(Session.capDelete))
         XCTAssertEqual(next.payload, second)
+
+        // A confirmation of the same type as the one before comes without its type (glasses log 35): a
+        // batch of deletions stopped at the second item because of it.
+        let third = Data("third-capture".utf8)
+        try peer.write(DataX.message(mirror, tags: [], payload: third))
+        try session.requestCaptureDeletion(handle: "third-capture", timeout: 1)
     }
 
     func testMediaImportAcceptsSelectedOfferBeforeTheAssetAcknowledgement() throws {
@@ -1267,6 +1273,65 @@ final class CompatibilityTests: XCTestCase {
         // Visor's layouts are still told apart from it.
         XCTAssertEqual(OpusFraming.split(Data([0, 0, 0, 2, 0x08, 1])).layout, .lengths)
         XCTAssertEqual(OpusFraming.split(Data([0x08, 1, 2, 3])).layout, .bare)
+    }
+
+    func testQuestionsAboutWhatIsSeenAreToldFromTheRest() {
+        for question in ["帮我看看这是什么", "我面前是什么东西", "这上面写着什么", "what am I looking at?",
+                         "Can you read this sign", "describe the room"] {
+            XCTAssertTrue(VisualQuestion.sounds(question), question)
+        }
+        for question in ["今天天气怎么样", "讲个笑话", "what time is it", "it seems late", "who are you"] {
+            XCTAssertFalse(VisualQuestion.sounds(question), question)
+        }
+        XCTAssertTrue(Glasses.spokenAnswerPrompt("这是什么", picture: true).contains("attached picture"))
+        XCTAssertTrue(Glasses.spokenAnswerPrompt("这是什么", picture: false).contains("no picture arrived"))
+        XCTAssertNil(VisualQuestion.modelPicture(Data([1, 2, 3, 4, 5, 6, 7, 8])))
+    }
+
+    /// The glasses' picture for a question arrives on svc53 when they took it themselves, and as an
+    /// Airship file outside the media namespace when the phone asked for it; whoever reads the link then.
+    func testThePictureForAQuestionIsTakenFromEitherRoute() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let got = ResultBox<[String]>()
+        got.value = []
+        let pictures = ResultBox<[Data]>()
+        pictures.value = []
+        session.onAssistantPicture = { bytes, source in
+            pictures.value?.append(bytes)
+            got.value?.append(source)
+        }
+
+        // svc53: opened with the picture's id, pieces without a type after the first, then closed.
+        let photoChannel: UInt16 = 0x8031
+        let open = [DataX.tag(1, UInt16(Session.svcGlassesPhoto), last: false), DataX.tag(2, 1, last: true)]
+        try peer.write(DataX.message(photoChannel, tags: open, payload: PB.bytes(1, Data(repeating: 7, count: 16))))
+        try peer.write(DataX.message(photoChannel, tags: [DataX.tag(2, 2, last: true)], payload: Data("first-".utf8)))
+        try peer.write(DataX.message(photoChannel, tags: [], payload: Data("second".utf8)))
+        try peer.write(DataX.message(photoChannel, tags: [DataX.tag(2, 3, last: true)]))
+
+        // Airship: an offer in another namespace is the picture only while one is waited for.
+        let id = bytes("00112233445546778999aabbccddeeff")
+        let content = Data("a picture".utf8)
+        let offerChannel: UInt16 = 0x8032
+        let offer = [DataX.tag(1, UInt16(Session.svcAirship), last: false), DataX.tag(2, Session.airOffer, last: true)]
+        let named = PB.bytes(1, id) + PB.uint(2, UInt64(content.count)) + PB.string(3, "assistant") + PB.string(4, "p.heic")
+        session.wantAssistantPicture(for: 5)
+        try peer.write(DataX.message(offerChannel, tags: offer, payload: named))
+        try peer.write(DataX.message(offerChannel, tags: [DataX.tag(2, Session.airData, last: true)], payload: content))
+        let completion = PB.uint(1, UInt64(content.count)) + PB.uint(2, UInt64(Session.adler32(content)))
+        try peer.write(DataX.message(offerChannel, tags: [DataX.tag(2, Session.airComplete, last: true)], payload: completion))
+
+        // Any read of the link carries them along: here a deletion that is never confirmed.
+        XCTAssertThrowsError(try session.requestCaptureDeletion(handle: "nothing", timeout: 0.6))
+        XCTAssertEqual(pictures.value, [Data("first-second".utf8), content])
+        XCTAssertEqual(got.value, ["svc53", "airship assistant"])
+        XCTAssertFalse(session.assistantPictureArriving)
+
+        var sent: [DataX.Message] = []
+        while let frame = try? peer.nextFrame(timeout: 0.2) { sent.append(try DataX.parse(frame)) }
+        let replies = sent.filter { $0.channel == offerChannel ^ 0x8000 }
+        XCTAssertEqual(replies.map { $0.type ?? -1 }, [Int(Session.airCursor), Int(Session.airDrop)])
+        XCTAssertEqual(replies.first?.payload, PB.uint(2, 1))
     }
 
     /// Chinese is the phone's to hear and English the glasses': which of the two transcripts is the question.

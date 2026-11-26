@@ -1792,9 +1792,20 @@ final class Glasses: NSObject, ObservableObject {
 
     /// The glasses read the answer in their own voice, so it has to come back in the language of the
     /// question; the old Chinese instruction could turn an English question into a Chinese answer.
-    nonisolated static func spokenAnswerPrompt(_ question: String) -> String {
-        "Answer in the same language as the question, in one to three short spoken sentences that the "
-            + "glasses will read aloud. No lists, markdown or emoji. Only text was received, no image.\n\n"
+    /// `picture`: true when one from the glasses' camera goes with the question, false when the question
+    /// is about what the wearer sees and none could be had, nil for any other question.
+    nonisolated static func spokenAnswerPrompt(_ question: String, picture: Bool? = nil) -> String {
+        let seen: String
+        switch picture {
+        case .some(true):
+            seen = "The attached picture is from the glasses' camera and shows what the wearer is looking at right now; answer from it."
+        case .some(false):
+            seen = "The wearer seems to ask about what they see, but no picture arrived from the glasses; say so briefly."
+        case .none:
+            seen = "Only text was received, no image."
+        }
+        return "Answer in the same language as the question, in one to three short spoken sentences that the "
+            + "glasses will read aloud. No lists, markdown or emoji. \(seen)\n\n"
             + "Question: \(question)"
     }
 
@@ -2437,10 +2448,10 @@ final class Glasses: NSObject, ObservableObject {
                 assistant.submitPhoneTranscript(heard.text, wakeID: wake)
             }
         }
-        a.onUnclaimedQuestion = { [weak self, weak a] words in
+        a.onUnclaimedQuestion = { [weak self, weak a] words, turn in
             Task { @MainActor in
                 guard let self, let a, self.assistantRef === a else { return }
-                self.answerThroughPhone(words)
+                self.answerThroughPhone(words, interaction: turn, assistant: a)
             }
         }
         a.onUnheard = { [weak self, weak a] interaction in
@@ -2555,9 +2566,27 @@ final class Glasses: NSObject, ObservableObject {
         holdBackgroundTime("hey-meta-answer", seconds: 28)
         voiceAnswer = Task { [weak self, weak assistant] in
             guard let self, let assistant else { return }
+            var image: Data?
+            if assistant.wantsPicture(interaction) || VisualQuestion.sounds(question) {
+                self.assistantMessage = "听到：「\(question)」，正在让眼镜拍下眼前的画面…"
+                image = await self.pictureFromGlasses(interaction: interaction, assistant: assistant)
+                guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
+                if image == nil {
+                    // The ordinary shutter and a fetch over Bluetooth take most of a minute, longer than the
+                    // glasses wait for an answer: tell the wearer through them, then answer over the
+                    // phone's audio once the picture is here.
+                    try? await Self.speak(VisualQuestion.holdOn(for: question), interaction: interaction,
+                                          question: question, assistant: assistant)
+                    guard !Task.isCancelled, self.assistantRef === assistant else { return }
+                    self.answerThroughPhone(question, interaction: nil, assistant: nil, albumPicture: true)
+                    return
+                }
+                self.assistantMessage = "听到：「\(question)」，带着画面问 \(client.model)…"
+            }
             let text: String
             do {
-                text = try await client.ask(question: Self.spokenAnswerPrompt(question))
+                text = try await client.ask(question: Self.spokenAnswerPrompt(question, picture: image == nil ? nil : true),
+                                            image: image)
             } catch {
                 guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
                 self.assistantMessage = "模型请求失败 · \(Glasses.explain(error))"
@@ -2586,7 +2615,11 @@ final class Glasses: NSObject, ObservableObject {
     /// A question the phone heard in a turn the glasses closed without asking anything. They recognise
     /// English only, so Chinese ends that way (glasses log 35), and they play no answer to a turn they
     /// have closed. The iPhone speaks it instead; its audio output is the glasses when they are paired.
-    private func answerThroughPhone(_ transcript: String) {
+    ///
+    /// `albumPicture`: the question needs a picture and the glasses would not hand one over, so it is
+    /// taken with their ordinary shutter and fetched over Bluetooth.
+    private func answerThroughPhone(_ transcript: String, interaction: String?, assistant: Assistant?,
+                                    albumPicture: Bool = false) {
         let question = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty else { return }
         voiceWait?.cancel()
@@ -2596,13 +2629,29 @@ final class Glasses: NSObject, ObservableObject {
         assistantAnswer = ""
         let client = configuredModel
         let tag = HeyMetaLanguage.phoneLocale ?? "zh-CN"
+        let visual = albumPicture || VisualQuestion.sounds(question)
         assistantMessage = "听到：「\(question)」，正在问 \(client.model)…"
-        note("眼镜语音：这一句眼镜没有受理，由 iPhone 识别，回答从 iPhone 的音频播出")
+        note("眼镜语音：这一句由 iPhone 回答，声音从 iPhone 的音频播出")
         holdBackgroundTime("hey-meta-answer", seconds: 28)
         voiceAnswer = Task { [weak self] in
+            var image: Data?
+            if visual {
+                guard let self, !Task.isCancelled else { return }
+                self.assistantMessage = "听到：「\(question)」，正在取眼前的画面…"
+                if !albumPicture {
+                    self.phoneSpeaker.say(tag.hasPrefix("zh") ? "我看一下。" : "Let me take a look.", preferred: tag)
+                    if let interaction, let assistant {
+                        image = await self.pictureFromGlasses(interaction: interaction, assistant: assistant)
+                    }
+                }
+                if image == nil, !Task.isCancelled { image = await self.pictureThroughTheAlbum() }
+                guard !Task.isCancelled else { return }
+                self.assistantMessage = "听到：「\(question)」，\(image == nil ? "没拿到画面，直接" : "带着画面")问 \(client.model)…"
+            }
             let text: String
             do {
-                text = try await client.ask(question: Glasses.spokenAnswerPrompt(question))
+                text = try await client.ask(question: Glasses.spokenAnswerPrompt(question, picture: visual ? image != nil : nil),
+                                            image: image)
             } catch {
                 guard let self, !Task.isCancelled else { return }
                 self.assistantMessage = "模型请求失败 · \(Glasses.explain(error))"
@@ -2617,6 +2666,68 @@ final class Glasses: NSObject, ObservableObject {
             self.assistantMessage = "已回答，声音从「\(self.audioRouteName)」播出。"
             self.note("回答已从 iPhone 音频播出：\(voice)，输出 \(self.audioRouteName)")
         }
+    }
+
+    /// The glasses' own picture for a question about what the wearer sees, as a JPEG the model takes.
+    private func pictureFromGlasses(interaction: String, assistant: Assistant) async -> Data? {
+        guard let raw = await assistant.picture(for: interaction) else {
+            note("眼镜语音：眼镜没有为这个问题送来画面")
+            return nil
+        }
+        guard let jpeg = VisualQuestion.modelPicture(raw) else {
+            note("眼镜语音：眼镜送来的 \(raw.count) B 不是能读的图片，开头 \(raw.prefix(16).hex)")
+            return nil
+        }
+        lastPhoto = jpeg
+        note("眼镜语音：拿到眼镜为这个问题拍的画面，\(raw.count) B")
+        return jpeg
+    }
+
+    /// The slow way to a picture, with what works whatever the glasses make of the question: their
+    /// ordinary shutter, then the new photo fetched over Bluetooth, most of a minute for a megabyte.
+    private func pictureThroughTheAlbum() async -> Data? {
+        guard canUseGlasses, !mediaImportInProgress, !recording, live == nil else { return nil }
+        note("眼镜语音：改用普通拍照，再用蓝牙取回这张照片")
+        for _ in 0 ..< 24 where busy || settingsLoading { try? await Task.sleep(nanoseconds: 250_000_000) }
+        let known = Set(captures.map(\.id))
+        snap()
+        var fresh: Capture?
+        for _ in 0 ..< 30 {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            if Task.isCancelled { return nil }
+            if let found = captures.first(where: { $0.isPhoto && !known.contains($0.id) }) {
+                fresh = found
+                break
+            }
+        }
+        guard let fresh else {
+            note("眼镜语音：没有等到新照片")
+            return nil
+        }
+        for _ in 0 ..< 40 where busy || settingsLoading { try? await Task.sleep(nanoseconds: 250_000_000) }
+        // One photo is not worth the glasses' hotspot, which has to be joined by hand.
+        let route = importRoute
+        importRoute = .bluetooth
+        startMediaImport([fresh], saveToPhotos: false)
+        importRoute = route
+        for _ in 0 ..< 300 {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            if Task.isCancelled { return nil }
+            if let url = localMediaURL(for: fresh), let data = try? Data(contentsOf: url),
+               let jpeg = VisualQuestion.modelPicture(data) {
+                lastPhoto = jpeg
+                note("眼镜语音：照片已取回，\(data.count) B")
+                return jpeg
+            }
+            if !mediaImportInProgress { break }
+        }
+        if let url = localMediaURL(for: fresh), let data = try? Data(contentsOf: url),
+           let jpeg = VisualQuestion.modelPicture(data) {
+            lastPhoto = jpeg
+            return jpeg
+        }
+        note("眼镜语音：照片没有取回来")
+        return nil
     }
 
     /// One sentence in the voice the answers have, through the iPhone's audio output.

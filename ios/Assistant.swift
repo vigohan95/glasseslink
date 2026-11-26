@@ -41,6 +41,8 @@ final class Assistant: @unchecked Sendable {
         static let interactionClosed = 59
         static let voiceComplete = 60
         static let startOfUserSpeech = 71
+        static let remoteImageCaptureRequest = 73
+        static let remoteImageCaptureResponse = 74
         static let sessionModeUpdateResponse = 289
         static let sessionStateBroadcast = 333
         static let sessionStateUpdate = 339
@@ -175,7 +177,8 @@ final class Assistant: @unchecked Sendable {
     var transcribesOnPhone: () -> Bool = { HeyMetaLanguage.phoneLocale != nil }
     /// A question the phone heard in a turn the glasses then closed without asking anything: they
     /// recognise English only, so Chinese ends this way. The glasses will not play an answer to it.
-    var onUnclaimedQuestion: ((String) -> Void)?
+    /// (words, the turn's id).
+    var onUnclaimedQuestion: ((String, String) -> Void)?
     /// Turns the glasses closed while the phone was still recognising, by wake id, and until when its
     /// words are still taken.
     private var unclaimed: [String: TimeInterval] = [:]
@@ -200,6 +203,118 @@ final class Assistant: @unchecked Sendable {
 
     init(session: Session) {
         self.session = session
+        session.onAssistantPicture = { [weak self] bytes, source in self?.tookPicture(bytes, from: source) }
+    }
+
+    // MARK: the picture for a question about what the wearer sees
+
+    /// What a request says about the camera (Visor's Visual): the glasses want a picture for it, have
+    /// taken one already, or sent a small one inside the request.
+    struct VisualHint {
+        var wants = false
+        var captured = false
+        var inline: Data?
+    }
+
+    static func visualHint(_ fields: [Int: Any]) -> VisualHint {
+        let understanding = fields.structField(2)
+        let image = understanding.structField(4)
+        let inline = [image.bytes(4), image.bytes(16)].compactMap { $0 }.first { $0.count > 100 }
+        return VisualHint(wants: image.bool(20) || understanding.bool(5) || fields.structField(55).bool(8),
+                          captured: inline != nil || !image.text(3).isEmpty || !image.text(8).isEmpty,
+                          inline: inline)
+    }
+
+    private var visualHints: [String: VisualHint] = [:]
+    private var recentPicture: (bytes: Data, at: TimeInterval)?
+    private var pictureWaiter: CheckedContinuation<Data?, Never>?
+
+    /// True when the glasses themselves marked the request as one about what the wearer sees.
+    func wantsPicture(_ interaction: String) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        let hint = visualHints[interaction]
+        return hint?.wants == true || hint?.captured == true
+    }
+
+    private func tookPicture(_ bytes: Data, from source: String) {
+        stateLock.lock()
+        let waiting = pictureWaiter
+        pictureWaiter = nil
+        if waiting == nil { recentPicture = (bytes, ProcessInfo.processInfo.systemUptime) }
+        stateLock.unlock()
+        log("assistant: a picture from the glasses, \(bytes.count) B (\(source))")
+        waiting?.resume(returning: bytes)
+    }
+
+    /// A picture that is here already: inside the request, or sent a moment before the question.
+    private func readyPicture(_ interaction: String) -> Data? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if let inline = visualHints[interaction]?.inline { return inline }
+        if let recent = recentPicture, ProcessInfo.processInfo.systemUptime - recent.at < 10 {
+            recentPicture = nil
+            return recent.bytes
+        }
+        return nil
+    }
+
+    private func glassesTookPicture(_ interaction: String) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return visualHints[interaction]?.captured == true
+    }
+
+    private func parkPicture(_ continuation: CheckedContinuation<Data?, Never>) -> Data? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if let recent = recentPicture {
+            recentPicture = nil
+            return recent.bytes
+        }
+        pictureWaiter = continuation
+        return nil
+    }
+
+    private func giveUpPicture() {
+        stateLock.lock()
+        let waiting = pictureWaiter
+        pictureWaiter = nil
+        stateLock.unlock()
+        if waiting != nil { log("assistant: no picture came from the glasses") }
+        waiting?.resume(returning: nil)
+    }
+
+    /// The glasses' picture for `interaction`, as they send it (HEIC or JPEG, possibly behind other
+    /// data). If they have not taken one they are asked to with event 73, {1 false, 2 true, 3 false,
+    /// 4 interaction}; they answer 74 and send the file. Nil when nothing came within `timeout`, plus the
+    /// time a file that has begun to arrive needs.
+    func picture(for interaction: String, timeout: TimeInterval = 8) async -> Data? {
+        if let ready = readyPicture(interaction) { return ready }
+        session.wantAssistantPicture(for: timeout)
+        if !glassesTookPicture(interaction) {
+            let request = ThriftWriter().bool(1, false).bool(2, true).bool(3, false).string(4, interaction).done()
+            do {
+                try send(EV.remoteImageCaptureRequest, request)
+                log("assistant: asked the glasses for a picture (event 73)")
+            } catch {
+                log("assistant: could not ask the glasses for a picture: \(error)")
+                return nil
+            }
+        }
+        let limit = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            var waited = 0
+            while waited < 60, self?.session.assistantPictureArriving == true {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                waited += 1
+            }
+            self?.giveUpPicture()
+        }
+        defer { limit.cancel() }
+        return await withCheckedContinuation { continuation in
+            if let ready = parkPicture(continuation) { continuation.resume(returning: ready) }
+        }
     }
 
     // MARK: registration
@@ -585,7 +700,18 @@ final class Assistant: @unchecked Sendable {
             return
         }
         switch id {
+        case EV.remoteImageCaptureResponse:
+            log("assistant: the glasses took the picture (event 74)")
         case EV.fulfillmentRequest:
+            let hint = Self.visualHint(inner)
+            if hint.wants || hint.captured, !inner.text(1).isEmpty {
+                stateLock.lock()
+                if visualHints.count > 16 { visualHints.removeAll() }
+                visualHints[inner.text(1)] = hint
+                stateLock.unlock()
+                log("assistant: the glasses mark this question as one about what the wearer sees "
+                    + "(picture taken \(hint.captured), inside the request \(hint.inline?.count ?? 0) B)")
+            }
             let named = inner.text(8)
             if named.count > 8, !inner.text(1).isEmpty {
                 stateLock.lock()
@@ -724,10 +850,8 @@ final class Assistant: @unchecked Sendable {
         let intent = fields.text(23).isEmpty ? fallbackIntent : fields.text(23)
         guard intent != "IN:WAKE_WORD", intent != "IN:START_LIVE_AI" else { return nil }
 
-        let image = understanding.structField(4)
-        guard !understanding.bool(5), !image.bool(20), !onDevice.bool(8),
-              image.text(3).isEmpty, image.text(8).isEmpty,
-              (image.bytes(4)?.count ?? 0) <= 100, (image.bytes(16)?.count ?? 0) <= 100 else { return nil }
+        // A request about what the wearer sees is a question like any other; `visualHint` says what it
+        // tells about the camera.
         let interaction = fields.text(1)
         let transcript = understanding.structField(1).text(1).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !interaction.isEmpty, interaction.utf8.count <= 128,
@@ -841,7 +965,7 @@ final class Assistant: @unchecked Sendable {
         if let until = unclaimed.removeValue(forKey: wakeID) {
             // The glasses closed this turn while the phone was still at it.
             stateLock.unlock()
-            if !stopped, !words.isEmpty, now < until { handOver(words) }
+            if !stopped, !words.isEmpty, now < until { handOver(words, turn: wakeID) }
             return
         }
         guard !stopped, let active = turn, active.includes(wakeID), !active.replying, active.phoneText == nil else {
@@ -861,11 +985,11 @@ final class Assistant: @unchecked Sendable {
         }
     }
 
-    private func handOver(_ words: String) {
+    private func handOver(_ words: String, turn id: String) {
         log("assistant: the glasses asked nothing in this turn; the phone heard \(words.count) characters and answers itself")
         DispatchQueue.main.async { [weak self] in
             guard let self, self.registered else { return }
-            self.onUnclaimedQuestion?(words)
+            self.onUnclaimedQuestion?(words, id)
         }
     }
 
@@ -912,7 +1036,7 @@ final class Assistant: @unchecked Sendable {
         forgetTurn()
         stateLock.unlock()
         notifyTurnEnded(active.requestID ?? active.wakeID)
-        if let question { handOver(question) }
+        if let question { handOver(question, turn: active.wakeID) }
     }
 
     private func forgetTurn() {
@@ -988,7 +1112,7 @@ final class Assistant: @unchecked Sendable {
                 forgetTurn()
                 stateLock.unlock()
                 notifyTurnEnded(active.wakeID)
-                handOver(words)
+                handOver(words, turn: active.wakeID)
             } else {
                 stateLock.unlock()
                 notifyMissingTranscript(active.wakeID)

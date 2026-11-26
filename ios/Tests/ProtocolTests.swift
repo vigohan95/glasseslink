@@ -361,7 +361,7 @@ final class ProtocolTests: XCTestCase {
         XCTAssertFalse(request.simplified)
     }
 
-    func testAssistantRejectsWakeOnlyAndImageRequests() throws {
+    func testAssistantRejectsWakeOnlyAndTakesQuestionsAboutWhatIsSeen() throws {
         let words = ThriftWriter().string(1, "Hey Meta").done()
         let wakeUnderstanding = ThriftWriter().structField(1, words).done()
         let wake = ThriftWriter().string(1, "turn-1").structField(2, wakeUnderstanding)
@@ -370,8 +370,13 @@ final class ProtocolTests: XCTestCase {
         let asr = ThriftWriter().string(1, "这是什么？").done()
         let visual = ThriftWriter().binary(4, Data(repeating: 0x11, count: 101)).done()
         let understanding = ThriftWriter().structField(1, asr).structField(4, visual).done()
-        let photo = ThriftWriter().string(1, "turn-2").structField(2, understanding).done()
-        XCTAssertNil(Assistant.spokenRequest(try ThriftCompact.loads(photo)))
+        let photo = try ThriftCompact.loads(ThriftWriter().string(1, "turn-2").structField(2, understanding).done())
+        // A question about what the wearer sees is a question; what it says about the camera is read apart.
+        XCTAssertEqual(Assistant.spokenRequest(photo)?.transcript, "这是什么？")
+        let hint = Assistant.visualHint(photo)
+        XCTAssertTrue(hint.captured)
+        XCTAssertEqual(hint.inline?.count, 101)
+        XCTAssertFalse(Assistant.visualHint(try ThriftCompact.loads(wake)).captured)
     }
 
     func testCompleteLayout() throws {

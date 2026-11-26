@@ -547,6 +547,40 @@ enum PhoneVoice {
     }
 }
 
+/// Questions about what the wearer is looking at, which need a picture from the glasses' camera.
+enum VisualQuestion {
+    private static let chinese = ["看看", "看一下", "看下", "帮我看", "你看", "看到", "看见", "这是什么", "这是啥", "这什么",
+                                  "那是什么", "那是啥", "眼前", "面前", "手里", "手上", "读一下", "念一下", "读给我", "写的是",
+                                  "写的什么", "写着", "什么字", "什么牌子", "什么颜色", "什么东西", "这道题", "识别"]
+    private static let english = "look|looking|see|seeing|read this|read that|read the|describe|what is this|what's this|"
+        + "what is that|what's that|in front of me|identify|what am i|which is this|how much is this|"
+        + "translate this|picture|pictures|photo|photos"
+
+    /// Visor's soundsVisual, with Chinese: whole words in English, so "seems" does not count.
+    static func sounds(_ question: String) -> Bool {
+        let text = question.lowercased()
+        if chinese.contains(where: { text.contains($0) }) { return true }
+        return text.range(of: "\\b(\(english))\\b", options: .regularExpression) != nil
+    }
+
+    /// What is said while the slow way to a picture runs, in the language of the question.
+    static func holdOn(for question: String) -> String {
+        let han = question.unicodeScalars.contains { (0x3400 ... 0x9FFF).contains($0.value) }
+        return han ? "稍等，我拍一张看看。" : "One moment, let me take a picture."
+    }
+
+    /// Whatever the glasses sent, as a JPEG a model takes: a bare JPEG or HEIC, or one packed behind the
+    /// assistant's own data, which is then searched for where the image begins (Visor's toModelJpeg).
+    static func modelPicture(_ bytes: Data) -> Data? {
+        if let direct = ModelClient.modelImage(bytes) { return direct }
+        if let jpeg = bytes.range(of: Data([0xFF, 0xD8, 0xFF])),
+           let found = ModelClient.modelImage(Data(bytes[jpeg.lowerBound...])) { return found }
+        if let box = bytes.range(of: Data("ftyp".utf8)), box.lowerBound - bytes.startIndex >= 4,
+           let found = ModelClient.modelImage(Data(bytes[(box.lowerBound - 4)...])) { return found }
+        return nil
+    }
+}
+
 /// The iPhone speaking aloud through whatever its audio output is, which is the glasses when they are
 /// paired for sound. For the answers the glasses will not play themselves.
 @MainActor

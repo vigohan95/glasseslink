@@ -669,11 +669,156 @@ final class Session {
                 try? sendStatus(msg.channel, 0xC001)
                 continue
             }
+            if takeAssistantPicture(msg, mediaImportIsReading: handlesAirshipOffers) { continue }
             if !forAssistant, parkForAssistant(msg) { continue }
             if !handlesAirshipOffers, try rejectUnrequestedAirshipOffer(msg) { continue }
             noteCameraState(msg)
             return msg
         }
+    }
+
+    // MARK: the assistant's picture
+
+    /// A picture the glasses took for a question about what the wearer sees, and where it came from.
+    /// They send it on svc53 when they decided to take it themselves, and over Airship (outside the media
+    /// namespace) when the phone asked for it with event 73 (Visor's GlassesPhotos and Airship extras).
+    /// Called on the reading thread, whoever reads the link at the time.
+    var onAssistantPicture: ((Data, String) -> Void)?
+
+    static let svcGlassesPhoto = 53
+    /// Larger than any picture for a question; over Bluetooth this much already takes two minutes.
+    static let assistantPictureLimit = 3 * 1024 * 1024
+
+    private final class PictureTransfer {
+        let offer: AirshipOffer
+        var type: Int
+        var bytes = Data()
+        var checksum: UInt32 = 1
+        init(offer: AirshipOffer, type: Int) {
+            self.offer = offer
+            self.type = type
+        }
+    }
+
+    private let pictureLock = NSLock()
+    private var pictureWantedUntil: TimeInterval = 0
+    private var pictureArriving = false
+    /// Both only inside `recvMessage`, under its lock.
+    private var photoChannels: [UInt16: (type: Int, bytes: Data)] = [:]
+    private var pictureTransfers: [UInt16: PictureTransfer] = [:]
+
+    /// For this long the next file the glasses offer outside a media import is the picture a question waits for.
+    func wantAssistantPicture(for seconds: TimeInterval) {
+        pictureLock.lock()
+        pictureWantedUntil = ProcessInfo.processInfo.systemUptime + seconds
+        pictureLock.unlock()
+    }
+
+    /// True while a picture is on its way in, so a question waits for the rest of it.
+    var assistantPictureArriving: Bool {
+        pictureLock.lock()
+        defer { pictureLock.unlock() }
+        return pictureArriving
+    }
+
+    private func setPictureArriving(_ value: Bool) {
+        pictureLock.lock()
+        pictureArriving = value
+        pictureLock.unlock()
+    }
+
+    /// True when the message was part of a picture for the assistant and was used up here.
+    private func takeAssistantPicture(_ msg: DataX.Message, mediaImportIsReading: Bool) -> Bool {
+        guard msg.channel & 0x8000 != 0 else { return false }
+
+        // svc53: type 1 opens the picture with its id, type 2 carries the file in pieces, type 3 closes it.
+        if msg.service == Self.svcGlassesPhoto || photoChannels[msg.channel] != nil {
+            if msg.error != nil || (msg.service != nil && msg.service != Self.svcGlassesPhoto) {
+                photoChannels.removeValue(forKey: msg.channel)
+                setPictureArriving(!pictureTransfers.isEmpty)
+                return false
+            }
+            var entry = photoChannels[msg.channel] ?? (type: 1, bytes: Data())
+            entry.type = msg.type ?? entry.type
+            switch entry.type {
+            case 1:
+                entry.bytes = Data()
+                setPictureArriving(true)
+            case 2:
+                if entry.bytes.count + msg.payload.count <= Self.assistantPictureLimit { entry.bytes.append(msg.payload) }
+            case 3:
+                let bytes = entry.bytes
+                entry.bytes = Data()
+                setPictureArriving(!pictureTransfers.isEmpty)
+                if !bytes.isEmpty {
+                    emit("assistant picture on svc53, \(bytes.count) B")
+                    onAssistantPicture?(bytes, "svc53")
+                }
+            default:
+                break
+            }
+            photoChannels[msg.channel] = entry
+            return true
+        }
+
+        // A new offer on a channel replaces what was coming on it.
+        let offer: AirshipOffer? = mediaImportIsReading ? nil : (try? Self.airshipOffer(msg))
+        if offer == nil, let transfer = pictureTransfers[msg.channel] {
+            if msg.error != nil || (msg.service != nil && msg.service != Self.svcAirship) {
+                pictureTransfers.removeValue(forKey: msg.channel)
+                setPictureArriving(!pictureTransfers.isEmpty)
+                return false
+            }
+            if let type = msg.type { transfer.type = type }
+            var finished = false
+            switch transfer.type {
+            case Int(Self.airData):
+                if transfer.bytes.count + msg.payload.count <= transfer.offer.size {
+                    transfer.bytes.append(msg.payload)
+                    transfer.checksum = Self.updateAdler32(transfer.checksum, with: msg.payload)
+                } else {
+                    finished = true
+                }
+            case Int(Self.airCheck):
+                let offset = transfer.bytes.isEmpty ? Data() : PB.uint(1, UInt64(transfer.bytes.count))
+                try? sendAirshipReply(Self.airCursor, on: transfer.offer.mirror,
+                                      payload: offset + PB.uint(2, UInt64(transfer.checksum)))
+            case Int(Self.airComplete):
+                finished = true
+                let whole = Self.hasVerifiedAirshipCompletion(msg.payload, size: transfer.offer.size,
+                                                              received: transfer.bytes.count, checksum: transfer.checksum)
+                emit("assistant picture over Airship (\(transfer.offer.namespace)), \(transfer.bytes.count) of "
+                     + "\(transfer.offer.size) B\(whole ? "" : ", size or checksum did not match")")
+                if whole { onAssistantPicture?(transfer.bytes, "airship \(transfer.offer.namespace)") }
+            case Int(Self.airReset):
+                transfer.bytes = Data()
+                transfer.checksum = 1
+            case Int(Self.airStopped):
+                finished = true
+            default:
+                break
+            }
+            if finished {
+                pictureTransfers.removeValue(forKey: msg.channel)
+                try? sendAirshipReply(Self.airDrop, on: transfer.offer.mirror, payload: PB.bytes(1, transfer.offer.id))
+                setPictureArriving(!pictureTransfers.isEmpty || !photoChannels.values.allSatisfy { $0.bytes.isEmpty })
+            }
+            return true
+        }
+
+        guard let offer, ownerTrustCompleted else { return false }
+        pictureLock.lock()
+        let wanted = ProcessInfo.processInfo.systemUptime < pictureWantedUntil
+        pictureLock.unlock()
+        // Some pairs send the question's picture in "Sharing" a moment before the question itself.
+        let early = offer.namespace == "Sharing" && offer.size < 2 * 1024 * 1024
+        guard wanted || early, offer.size > 0, offer.size <= Self.assistantPictureLimit else { return false }
+        pictureTransfers[offer.channel] = PictureTransfer(offer: offer, type: msg.type ?? Int(Self.airOffer))
+        setPictureArriving(true)
+        // Offset 0 with the checksum of nothing accepts a fresh file.
+        try? sendAirshipReply(Self.airCursor, on: offer.mirror, payload: PB.uint(2, 1))
+        emit("assistant picture: taking the Airship offer (\(offer.namespace.isEmpty ? "no namespace" : offer.namespace), \(offer.size) B)")
+        return true
     }
 
     /// Every change of the glasses' camera, also the ones made with their own button, whoever is reading
@@ -1176,6 +1321,9 @@ final class Session {
         }
     }
 
+    /// The type of the last typed reply on the captures channel; an untyped one after it has the same.
+    private var lastCaptureReplyType: Int?
+
     func requestCaptureDeletion(handle: String, timeout: TimeInterval = 8) throws {
         guard ownerTrustCompleted else { throw LinkError.unexpected("删除前需要验证眼镜主人身份") }
         let payload = Data(handle.utf8)
@@ -1202,8 +1350,13 @@ final class Session {
             }
             var reply = message.payload
             while reply.last == 0 { reply.removeLast() }
-            if message.type == Int(Self.capDeleteOK), reply == payload { return }
-            if message.type == Int(Self.capDeleteFailed), reply.starts(with: failurePrefix) {
+            // A reply of the same type as the one before it comes without the type. The second deletion of
+            // a batch was confirmed that way, went unrecognised, and stopped the batch after two items
+            // (glasses log 35, 21:55:06).
+            let type = message.type ?? lastCaptureReplyType
+            if let named = message.type { lastCaptureReplyType = named }
+            if type == Int(Self.capDeleteOK) || message.type == nil, reply == payload { return }
+            if type == Int(Self.capDeleteFailed) || message.type == nil, reply.starts(with: failurePrefix) {
                 throw LinkError.unexpected("眼镜拒绝删除该素材")
             }
         }
