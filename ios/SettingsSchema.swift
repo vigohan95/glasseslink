@@ -16,6 +16,19 @@ struct SettingSchema {
     /// svc31: no field, or one the firmware acks and drops.
     var viaDrive: Bool { field == nil || !parsed }
     var writable: Bool { ["bool", "int", "str", "float"].contains(kind) && key != "sg_disable_thermal_shutdown" }
+
+    /// Whether `value` is something this setting can hold. Text that is not is never sent: the store
+    /// keeps strings, so it would take "30fps" for a number and report it as applied.
+    func accepts(_ value: String) -> Bool {
+        let text = value.trimmingCharacters(in: .whitespaces)
+        switch kind {
+        case "bool": return SettingsSchemaTable.boolValue(text) != nil
+        case "int": return Int64(text) != nil
+        case "float": return Double(text).map { $0.isFinite } ?? false
+        case "str": return true
+        default: return false
+        }
+    }
 }
 
 enum SettingsSchemaTable {

@@ -59,7 +59,7 @@ struct SettingsView: View {
                     .disabled(!g.canUseGlasses || g.settingsLoading || g.busy)
             }
         }
-        .task(id: g.canUseGlasses) {
+        .task(id: "\(g.canUseGlasses)-\(g.busy)") {
             if g.canUseGlasses, g.settingsReadAt == nil, !g.settingsLoading, !g.busy { g.loadSettings() }
         }
         .alert("修改 \(editing?.name ?? "")", isPresented: Binding(

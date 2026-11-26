@@ -195,7 +195,8 @@ struct GlassesSettingsView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } }
         }
-        .task(id: g.canUseGlasses) {
+        // Keyed on busy too: opened while Hey Meta registers, the read starts as soon as the link is free.
+        .task(id: "\(g.canUseGlasses)-\(g.busy)") {
             if g.canUseGlasses, g.settingsReadAt == nil, !g.settingsLoading, !g.busy { g.loadSettings() }
         }
     }
@@ -215,6 +216,11 @@ struct GlassesSettingsView: View {
                     if !g.settingsLoading {
                         Button("读取") { g.loadSettings() }.disabled(g.busy)
                     }
+                }
+            } else if g.settingsLoading {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text(g.settingsWriting == nil ? "正在重新读取…" : "正在写入并核对…").foregroundStyle(.secondary)
                 }
             } else if let message = g.settingsMessage {
                 Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)

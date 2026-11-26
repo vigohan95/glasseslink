@@ -43,8 +43,9 @@ enum MediaNaming {
 
     /// A copy under the readable name for the share sheet; the stored original is left alone.
     static func shareableCopy(of original: URL, isPhoto: Bool, timestampNS: Int?) throws -> URL {
-        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("share-\(UUID().uuidString)",
-                                                                                   isDirectory: true)
+        // One folder, emptied first: each share used to leave its copy behind in tmp.
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("share", isDirectory: true)
+        try? FileManager.default.removeItem(at: folder)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let name = fileName(isPhoto: isPhoto, timestampNS: timestampNS, fileExtension: original.pathExtension)
         let copy = folder.appendingPathComponent(name)

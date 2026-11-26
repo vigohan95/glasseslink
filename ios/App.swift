@@ -1779,10 +1779,14 @@ final class Glasses: NSObject, ObservableObject {
         var leveled: URL?
         defer { if let leveled { try? FileManager.default.removeItem(at: leveled) } }
         if capture.isPhoto, PhotoLeveling.isEnabled {
-            if let result = await Task.detached(priority: .userInitiated, operation: { PhotoLeveling.leveledCopy(of: file) }).value {
-                source = result.url
-                leveled = result.url
-                note(String(format: "照片自动摆正 %.1f°：iPhone 相册存摆正后的版本，App 里保留原件", result.degrees))
+            let result = await Task.detached(priority: .userInitiated, operation: { PhotoLeveling.leveledCopy(of: file) }).value
+            if let url = result.url {
+                source = url
+                leveled = url
+            }
+            if let horizon = result.horizon {
+                note(String(format: "照片水平线：%.1f°，把握 %.2f，", horizon.angle * 180 / .pi, horizon.confidence)
+                     + (result.url == nil ? "不处理" : "iPhone 相册存摆正后的版本，App 里保留原件"))
             }
         }
         try await persistCapture(nil, isPhoto: capture.isPhoto, original: source,
@@ -2096,8 +2100,8 @@ final class Glasses: NSObject, ObservableObject {
             let sent = (try? sess.writeSettingsField(schema, value: "true")) ?? false
             DispatchQueue.main.async {
                 guard let self, self.session === sess else { return }
-                self.note(sent ? "视频防抖：已打开两段式防抖（Meta App 每次连接也会这样做）"
-                               : "视频防抖：眼镜没有确认两段式防抖")
+                self.note(sent ? "视频防抖：已发送两段式防抖开关（Meta App 每次连接也会这样做）"
+                               : "视频防抖：两段式防抖开关没有发出")
             }
         }
     }
@@ -2804,6 +2808,10 @@ final class Glasses: NSObject, ObservableObject {
             settingsMessage = "这一项不能从手机修改。"
             return
         }
+        if let schema, !schema.accepts(value) {
+            settingsMessage = "这个值的格式不对，没有写入。"
+            return
+        }
         note("写设置 \(key) = \(value)")
         settingsLoading = true
         settingsWriting = key
@@ -2811,28 +2819,24 @@ final class Glasses: NSObject, ObservableObject {
         onGlassesQueueAsync { [weak self] in
             do {
                 let uuid = (try? sess.requestPeerDeviceInfo())?.deviceUUID
-                var stores: [String: String]?
+                // Only the store this key lives in is read back, not all four.
+                let store = Drive.settingsNamespace(schema?.namespace ?? Drive.deviceSettings, deviceUUID: uuid)
+                var fresh: [String: String]?
                 var accepted = false
                 if let schema, !schema.viaDrive, try sess.writeSettingsField(schema, value: value) {
                     sess.settle(for: 0.8)
-                    stores = try? sess.readSettingsStores(deviceUUID: uuid).values
-                    accepted = SettingsSchemaTable.same(kind: schema.kind, stores?[key], value)
+                    fresh = try? sess.readSettingsStores(deviceUUID: uuid, only: [store]).values
+                    accepted = SettingsSchemaTable.same(kind: schema.kind, fresh?[key], value)
                 }
                 if !accepted {
-                    let base = schema?.namespace ?? Drive.deviceSettings
-                    _ = try sess.driveWrite(key: key, value: value,
-                                            namespace: Drive.settingsNamespace(base, deviceUUID: uuid))
-                    stores = try? sess.readSettingsStores(deviceUUID: uuid).values
-                    accepted = SettingsSchemaTable.same(kind: schema?.kind, stores?[key], value)
+                    // driveWrite reads the store back itself and says whether the value is there.
+                    accepted = try sess.driveWrite(key: key, value: value, namespace: store)
                 }
                 DispatchQueue.main.async {
                     guard let self, self.session === sess else { return }
                     self.settingsLoading = false
                     self.settingsWriting = nil
-                    if let stores {
-                        self.settings = stores
-                        self.settingsReadAt = Date()
-                    }
+                    if let fresh { self.settings.merge(fresh) { _, new in new } }
                     if accepted {
                         self.settings[key] = value
                         self.note("\(key) 已生效")
@@ -3275,7 +3279,13 @@ struct ContentView: View {
                              onCancel: { showLogin = false })
             }
             .sheet(item: $g.share) { box in ActivityView(url: box.url) }
-            .sheet(isPresented: $showSettings) { NavigationStack { SettingsView(g: g) } }
+            .sheet(isPresented: $showSettings) {
+                NavigationStack {
+                    SettingsView(g: g).toolbar {
+                        ToolbarItem(placement: .cancellationAction) { Button("完成") { showSettings = false } }
+                    }
+                }
+            }
             .sheet(isPresented: $showLive) { LiveView(g: g) }
             .sheet(isPresented: $showQuick) { NavigationStack { GlassesSettingsView(g: g) } }
             .sheet(isPresented: $g.showSelfTest) { SelfTestView(g: g) }

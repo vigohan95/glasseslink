@@ -865,7 +865,7 @@ final class CompatibilityTests: XCTestCase {
     func testPhotoLevelingOnlyFixesAModestTilt() {
         XCTAssertFalse(PhotoLeveling.shouldLevel(degrees: 0.3))
         XCTAssertTrue(PhotoLeveling.shouldLevel(degrees: -4))
-        XCTAssertTrue(PhotoLeveling.shouldLevel(degrees: 11.5))
+        XCTAssertTrue(PhotoLeveling.shouldLevel(degrees: 9.5))
         XCTAssertFalse(PhotoLeveling.shouldLevel(degrees: 30))
     }
 
@@ -881,18 +881,67 @@ final class CompatibilityTests: XCTestCase {
             .transformed(by: CGAffineTransform(rotationAngle: CGFloat(tilt)))
             .transformed(by: CGAffineTransform(translationX: frame.midX, y: frame.midY))
         let scene = ground.composited(over: sky).cropped(to: frame)
-        guard let correction = PhotoLeveling.detectedHorizon(of: scene) else {
+        guard let horizon = PhotoLeveling.detectedHorizon(of: scene) else {
             throw XCTSkip("Vision found no horizon in the synthetic scene here")
         }
+        let correction = horizon.angle
         XCTAssertEqual(correction * 180 / Double.pi, -6, accuracy: 2.5)
-        XCTAssertEqual(PhotoLeveling.levelingAngle(of: scene), correction)
+        if horizon.confidence >= PhotoLeveling.minimumConfidence {
+            XCTAssertEqual(PhotoLeveling.levelingAngle(of: scene), correction)
+        } else {
+            XCTAssertNil(PhotoLeveling.levelingAngle(of: scene))
+        }
 
         // Vision may find nothing to report on a level picture; turning the wrong way must read about 12°.
         let level = PhotoLeveling.straightened(scene, by: correction)
-        XCTAssertLessThan(abs((PhotoLeveling.detectedHorizon(of: level) ?? 0) * 180 / Double.pi), 1.5)
+        XCTAssertLessThan(abs((PhotoLeveling.detectedHorizon(of: level)?.angle ?? 0) * 180 / Double.pi), 1.5)
         XCTAssertNil(PhotoLeveling.levelingAngle(of: level))
         let doubled = PhotoLeveling.straightened(scene, by: -correction)
         let wrongWay = try XCTUnwrap(PhotoLeveling.detectedHorizon(of: doubled))
-        XCTAssertEqual(abs(wrongWay * 180 / Double.pi), 12, accuracy: 3)
+        XCTAssertEqual(abs(wrongWay.angle * 180 / Double.pi), 12, accuracy: 3)
+    }
+
+    /// The ack of a svc31 write comes back on the mirror channel. Waiting on the phone's own channel
+    /// number never matched, and on an idle link the wait threw, so every settings write looked failed.
+    func testSettingsWriteTakesItsAckFromTheMirrorChannel() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let schema = SettingSchema(key: "wakeword_sound_enabled", field: 37, kind: "bool", defaultValue: "true",
+                                   namespace: "individual_device_settings", parsed: true)
+        let result = ResultBox<Bool>()
+        let done = expectation(description: "write returned")
+        let started = Date()
+        DispatchQueue.global(qos: .userInitiated).async {
+            result.value = try? session.writeSettingsField(schema, value: "false", timeout: 8)
+            done.fulfill()
+        }
+        let write = try DataX.parse(peer.nextFrame(timeout: 5))
+        XCTAssertEqual(write.service, Session.svcSettings)
+        XCTAssertEqual(write.type, Int(Session.mtSyncData))
+        XCTAssertEqual(write.payload, PB.uint(37, 0))
+        try peer.write(DataX.message(write.channel ^ 0x8000, tags: [DataX.tag(2, Session.mtAck, last: true)]))
+        wait(for: [done], timeout: 9)
+        XCTAssertEqual(result.value, true)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 7, "returned on the ack, not on the timeout")
+
+        // Without any ack the write still counts as sent; the caller's read-back decides.
+        XCTAssertEqual(try session.writeSettingsField(schema, value: "true", timeout: 0.3), true)
+    }
+
+    func testSettingValuesAreCheckedAgainstTheirKind() {
+        let toggle = SettingSchema(key: "wakeword_sound_enabled", field: 37, kind: "bool", defaultValue: "true",
+                                   namespace: "individual_device_settings", parsed: true)
+        XCTAssertTrue(toggle.accepts("1"))
+        XCTAssertTrue(toggle.accepts("false"))
+        XCTAssertFalse(toggle.accepts("maybe"))
+        let number = SettingSchema(key: "video_fps", field: 1, kind: "int", defaultValue: "30",
+                                   namespace: "individual_device_settings", parsed: true)
+        XCTAssertTrue(number.accepts(" 30 "))
+        XCTAssertFalse(number.accepts("30fps"))
+        let ratio = SettingSchema(key: "audio_balance", field: 225, kind: "float", defaultValue: "0.0",
+                                  namespace: "individual_device_settings", parsed: true)
+        XCTAssertTrue(ratio.accepts("-0.4"))
+        XCTAssertFalse(ratio.accepts("nan"))
+        XCTAssertFalse(SettingSchema(key: "x", field: nil, kind: "other", defaultValue: nil,
+                                     namespace: "individual_device_settings", parsed: false).accepts("1"))
     }
 }

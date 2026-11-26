@@ -1714,7 +1714,9 @@ final class Session {
             let message: DataX.Message
             do { message = try recvMessage(timeout: deadline.timeIntervalSinceNow) }
             catch LinkError.unexpected(_) { break }
-            guard message.channel == ch || message.channel == (ch ^ 0x8000) else { continue }
+            // Only the mirror: 0x80NN is also how the glasses number their own channels.
+            guard message.channel == (ch ^ 0x8000),
+                  message.service == nil || message.service == Self.svcPeerBuildInfo else { continue }
             if let code = message.error {
                 if code != Int(AirShield.stOK), code != Int(AirShield.stSuccess) { break }
                 continue
@@ -1729,14 +1731,21 @@ final class Session {
         return nil
     }
 
-    /// Every stored setting across the stores the Meta app keeps. A store that does not answer is skipped;
-    /// the read fails only when none of them answers, or when the link itself breaks.
-    func readSettingsStores(deviceUUID: String?, timeout: TimeInterval = 5) throws
+    /// Stores that did not answer while another did: not asked again on this session, so each later
+    /// read does not wait out their timeout.
+    private var silentSettingsStores: Set<String> = []
+
+    /// Every stored setting across the stores the Meta app keeps, or just `only` after a write. A store
+    /// that does not answer is skipped; the read fails only when none answers, or when the link breaks.
+    func readSettingsStores(deviceUUID: String?, only: [String]? = nil, timeout: TimeInterval = 3) throws
         -> (values: [String: String], counts: [String: Int]) {
         var values: [String: String] = [:]
         var counts: [String: Int] = [:]
         var firstFailure: Error?
-        for namespace in Drive.settingsNamespaces(deviceUUID: deviceUUID) {
+        var unanswered: [String] = []
+        let stores = only ?? Drive.settingsNamespaces(deviceUUID: deviceUUID).filter { !silentSettingsStores.contains($0) }
+        defer { if only == nil, !counts.isEmpty { silentSettingsStores.formUnion(unanswered) } }
+        for namespace in stores {
             do {
                 let objects = try driveObjects(namespace: namespace, timeout: timeout)
                 var stored = 0
@@ -1746,8 +1755,10 @@ final class Session {
                 }
                 counts[namespace] = stored
             } catch LinkError.unexpected(let reason) {
+                unanswered.append(namespace)
                 firstFailure = firstFailure ?? LinkError.unexpected(reason)
             } catch LinkError.serviceError(let operation, let code) {
+                unanswered.append(namespace)
                 firstFailure = firstFailure ?? LinkError.serviceError(operation, code)
             }
         }
@@ -1950,7 +1961,7 @@ final class Session {
     /// svc31, smartglasses_settings: the firmware's own write path. The ack is always SUCCESS,
     /// so the caller has to read the value back to know whether it took.
     @discardableResult
-    func writeSettingsField(_ schema: SettingSchema, value: String, timeout: TimeInterval = 6) throws -> Bool {
+    func writeSettingsField(_ schema: SettingSchema, value: String, timeout: TimeInterval = 2) throws -> Bool {
         var payload = Data()
         switch schema.kind {
         case "bool":
@@ -1977,21 +1988,30 @@ final class Session {
         tags.append(DataX.tag(2, Self.mtSyncData, last: true))
         try sendAny(DataX.message(ch, tags: tags, payload: payload))
 
+        // The glasses answer on the mirror channel, like every other service (glasses logs: requests on
+        // 0x800N, replies on 0x000N). Waiting on `ch` itself never matched, and on an idle link the
+        // read timed out with a throw, so every svc31 write looked like a failure. The ack is always
+        // SUCCESS anyway (Visor's GlassesSettings): without one the write still counts as sent, and
+        // the caller's read-back decides whether it took.
+        let mirror = ch ^ 0x8000
         let deadline = Date().addingTimeInterval(timeout)
-        while true {
-            let left = deadline.timeIntervalSinceNow
-            if left <= 0 { break }
-            let m = try recvMessage(timeout: left)
-            if m.channel != ch { continue }
-            guard m.type == Int(Self.mtAck) else { continue }
-            if let e = m.error, e != Int(AirShield.stOK), e != Int(AirShield.stSuccess) {
-                throw LinkError.serviceError("svc31 ack", UInt16(e))
+        while deadline.timeIntervalSinceNow > 0 {
+            let m: DataX.Message
+            do { m = try recvMessage(timeout: deadline.timeIntervalSinceNow) }
+            catch LinkError.unexpected(_) { break }
+            guard m.channel == mirror, m.service == nil || m.service == Self.svcSettings else { continue }
+            if let e = m.error {
+                guard e == Int(AirShield.stOK) || e == Int(AirShield.stSuccess) else {
+                    throw LinkError.serviceError("svc31", UInt16(truncatingIfNeeded: e))
+                }
+            } else if m.type != Int(Self.mtAck) {
+                continue
             }
             emit("svc31 wrote \(schema.key) = \(value)")
             return true
         }
-        emit("svc31 no ack for \(schema.key)")
-        return false
+        emit("svc31 sent \(schema.key) = \(value), no ack yet")
+        return true
     }
 
     func close() { stream.close() }
