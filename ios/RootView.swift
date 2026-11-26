@@ -22,6 +22,12 @@ struct RootView: View {
         selectedTab == .device && scenePhase == .active && g.canUseGlasses && !g.mediaImportInProgress
     }
 
+    /// With Hey Meta on, its reader sees the glasses' camera reports as they come. Without it nothing
+    /// reads the link between requests, and a take stopped on the glasses would go unnoticed.
+    private var watchesRecording: Bool {
+        scenePhase == .active && g.recording && !g.assistantOn && g.canUseGlasses
+    }
+
     var body: some View {
         TabView(selection: $selectedTab) {
             HomeTab(g: g, openTab: { selectedTab = $0 })
@@ -54,6 +60,13 @@ struct RootView: View {
             guard shouldPollGlassesStatus else { return }
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(60)) } catch { return }
+                g.refreshVisibleDeviceStatus()
+            }
+        }
+        .task(id: watchesRecording) {
+            guard watchesRecording else { return }
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(8)) } catch { return }
                 g.refreshVisibleDeviceStatus()
             }
         }
@@ -154,17 +167,29 @@ private struct ManualMediaWiFiSheet: View {
                 } footer: {
                     Text("这组名称和密码以后不会再变。只要输一次，iPhone 就会记住这个网络。")
                 }
+                Section {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("正在等 iPhone 连上这个网络，连上后自动开始导入。")
+                            .font(.subheadline)
+                    }
+                    Button {
+                        openWiFiSettings()
+                    } label: {
+                        Label("打开「设置」去加入", systemImage: "gear")
+                    }
+                    .fontWeight(.semibold)
+                } footer: {
+                    Text("免费签名的 App 不能替你切换 Wi-Fi，每次都要你在「设置 › 无线局域网」或控制中心里点一下这个眼镜网络。iPhone 在家里的 Wi-Fi 上时不会自己切过去。")
+                }
                 Section("第一次怎么加入") {
                     Text("1. 点上面的「复制密码」。")
                     Text("2. 打开 iPhone「设置 › 无线局域网」，点这个眼镜网络，在密码框长按选「粘贴」。")
-                    Text("加入后 GlassesLink 会自己继续，不用回来点按钮。")
                 }
                 Section("以后") {
-                    Text("在控制中心长按 Wi-Fi 图标，选这个眼镜网络即可，不用再输密码。")
+                    Text("在控制中心长按 Wi-Fi 图标，选这个眼镜网络即可，不用再输密码。导入完 iPhone 会自己回到原来的网络。")
                 }
                 Section {
-                    Button("已加入，继续导入") { resolve(true) }
-                        .fontWeight(.semibold)
                     Button("改用蓝牙（较慢）") { resolve(false) }
                 }
             }
@@ -172,6 +197,15 @@ private struct ManualMediaWiFiSheet: View {
             .navigationBarTitleDisplayMode(.inline)
         }
         .overlay(alignment: .top) { ToastOverlay(g: g, announces: false) }
+    }
+
+    /// The Wi-Fi page of Settings when iOS opens it for us, else this app's own page there.
+    private func openWiFiSettings() {
+        let fallback = URL(string: UIApplication.openSettingsURLString)
+        guard let wifi = URL(string: "App-Prefs:root=WIFI") else { return }
+        UIApplication.shared.open(wifi, options: [:]) { opened in
+            if !opened, let fallback { UIApplication.shared.open(fallback) }
+        }
     }
 }
 

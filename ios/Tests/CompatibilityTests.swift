@@ -1250,6 +1250,138 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(OpusFraming.duration(of: Data([0x0B, 0x03])), 0.060, accuracy: 1e-9)
     }
 
+    /// How many times a second the signal changes sign: twice its frequency for a tone.
+    private func signChanges(_ buffers: [AVAudioPCMBuffer]) -> (changes: Int, frames: Int) {
+        var changes = 0, frames = 0
+        var wasPositive = false
+        for buffer in buffers {
+            guard let samples = buffer.floatChannelData?[0] else { continue }
+            for index in 0 ..< Int(buffer.frameLength) {
+                let positive = samples[index] >= 0
+                if frames > 0, positive != wasPositive { changes += 1 }
+                wasPositive = positive
+                frames += 1
+            }
+        }
+        return (changes, frames)
+    }
+
+    /// The glasses' microphone is 16 kHz speech, which Opus carries in its SILK mode; the answer voice is
+    /// 48 kHz. A decoder that only gave the right number of samples would leave the recogniser deaf
+    /// (glasses log 34: 221 packets decoded, 0 characters heard), so the tone itself has to come back.
+    func testSpeechPacketsDecodeToTheSoundThatWentIn() throws {
+        let rate = 16_000.0
+        let pcmFormat = try XCTUnwrap(OpusCodec.pcmFormat(sampleRate: rate))
+        let pcm = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: AVAudioFrameCount(rate)))
+        pcm.frameLength = AVAudioFrameCount(rate)
+        let samples = try XCTUnwrap(pcm.floatChannelData?[0])
+        for index in 0 ..< Int(rate) { samples[index] = Float(sin(Double(index) * 2 * Double.pi * 440 / rate) * 0.4) }
+        var description = AudioStreamBasicDescription(mSampleRate: rate, mFormatID: kAudioFormatOpus, mFormatFlags: 0,
+                                                      mBytesPerPacket: 0, mFramesPerPacket: 320, mBytesPerFrame: 0,
+                                                      mChannelsPerFrame: 1, mBitsPerChannel: 0, mReserved: 0)
+        guard let speech = AVAudioFormat(streamDescription: &description),
+              let encoder = AVAudioConverter(from: pcmFormat, to: speech) else {
+            throw XCTSkip("no 16 kHz Opus encoder in this simulator")
+        }
+        if encoder.applicableEncodeBitRates?.contains(16_000) == true { encoder.bitRate = 16_000 }
+        var packets: [Data] = []
+        var fed = false
+        while true {
+            let out = AVAudioCompressedBuffer(format: speech, packetCapacity: 64,
+                                              maximumPacketSize: max(1_500, encoder.maximumOutputPacketSize))
+            var failure: NSError?
+            let status = encoder.convert(to: out, error: &failure) { _, state in
+                if fed {
+                    state.pointee = .endOfStream
+                    return nil
+                }
+                fed = true
+                state.pointee = .haveData
+                return pcm
+            }
+            if status == .error { break }
+            if let sizes = out.packetDescriptions {
+                for index in 0 ..< Int(out.packetCount) where sizes[index].mDataByteSize > 0 {
+                    packets.append(Data(bytes: out.data.advanced(by: Int(sizes[index].mStartOffset)),
+                                        count: Int(sizes[index].mDataByteSize)))
+                }
+            }
+            if status == .endOfStream || out.packetCount == 0 { break }
+        }
+        guard packets.count > 20 else { throw XCTSkip("the simulator's Opus encoder gave no 16 kHz packets") }
+        let modes = Set(packets.map { Int(($0.first ?? 0) >> 3) }).sorted()
+        let decoder = try XCTUnwrap(OpusCodec.Decoder())
+        let decoded = packets.compactMap { decoder.decode($0) }
+        let heard = signChanges(decoded)
+        guard heard.frames > 0 else { throw XCTSkip("no Opus decoder in this simulator") }
+        XCTAssertEqual(Double(heard.frames), rate, accuracy: rate * 0.15, "Opus configurations \(modes)")
+        // 440 Hz changes sign 880 times a second.
+        let perSecond = Double(heard.changes) / (Double(heard.frames) / rate)
+        XCTAssertEqual(perSecond, 880, accuracy: 130, "Opus configurations \(modes)")
+    }
+
+    /// The recogniser's text can start over after a pause and its last result can be empty.
+    func testWordsAlreadyHeardSurviveAnEmptyLastResult() {
+        var words = SpokenWords()
+        words.take("今天")
+        words.take("今天天气")
+        words.take("今天天气怎么样")
+        words.take("")
+        XCTAssertEqual(words.text, "今天天气怎么样")
+        words.take("明天呢")                       // after a pause: a new start, much shorter
+        XCTAssertEqual(words.text, "今天天气怎么样明天呢")
+        words.take("明天呢？")
+        XCTAssertEqual(words.text, "今天天气怎么样明天呢？")
+
+        var revised = SpokenWords()
+        revised.take("what is the weather today")
+        revised.take("What's the weather today?")   // a revision of the same sentence replaces it
+        XCTAssertEqual(revised.text, "What's the weather today?")
+        revised.take("And")
+        XCTAssertEqual(revised.text, "What's the weather today? And")
+    }
+
+    func testTheWakeWordIsNotPartOfTheQuestion() {
+        XCTAssertEqual(WakeWord.strip("Hey Meta，今天天气怎么样"), "今天天气怎么样")
+        XCTAssertEqual(WakeWord.strip("嘿 Meta 你是谁？"), "你是谁？")
+        XCTAssertEqual(WakeWord.strip("hey麦塔。现在几点"), "现在几点")
+        XCTAssertEqual(WakeWord.strip("Hey Meta."), "")
+        XCTAssertEqual(WakeWord.strip("meta"), "")
+        // Without the greeting it is the subject of a question.
+        XCTAssertEqual(WakeWord.strip("Meta 公司的总部在哪里"), "Meta 公司的总部在哪里")
+        XCTAssertEqual(WakeWord.strip("今天天气怎么样"), "今天天气怎么样")
+    }
+
+    /// An English answer read by a Chinese voice was part of why 1.03 sounded stiff.
+    func testTheAnswerIsReadInTheLanguageItIsWrittenIn() {
+        XCTAssertEqual(PhoneVoice.languageTag(of: "我是 Claude，由 Anthropic 开发的 AI 助手。", preferred: "zh-CN"), "zh-CN")
+        XCTAssertEqual(PhoneVoice.languageTag(of: "我係 Claude，有咩可以幫到你？", preferred: "zh-HK"), "zh-HK")
+        XCTAssertEqual(PhoneVoice.languageTag(of: "今天天气不错。", preferred: "en-US"), "zh-CN")
+        XCTAssertEqual(PhoneVoice.languageTag(of: "I'm Claude, an AI assistant made by Anthropic. How can I help you today?",
+                                              preferred: "zh-CN"), "en-US")
+        XCTAssertEqual(PhoneVoice.speakable("**好的**，`现在`是 # 三点。"), "好的，现在是  三点。")
+    }
+
+    func testWhatTheGlassesPlayedIsReadFromTheirStreamStatus() {
+        XCTAssertEqual(Assistant.playbackReport(Data("7f3a9c1e22_0b6d-41aa_516480_5400".utf8)),
+                       "assistant: the glasses played 5380 ms of 5400 ms")
+        XCTAssertEqual(Assistant.playbackReport(Data([1, 2, 3])), "assistant: answer stream status, 3 bytes")
+    }
+
+    /// Why the phone heard nothing is told only when the phone's set-up is why.
+    func testTheReasonForHearingNothingIsOneTheUserCanActOn() {
+        XCTAssertNotNil(GlassesEars.problem(authorized: false, hasRecognizer: true, seconds: 4, peak: 0.3, failures: []))
+        let dictation = GlassesEars.problem(authorized: true, hasRecognizer: true, seconds: 4, peak: 0.3,
+                                            failures: ["kLSRErrorDomain 201 Siri and Dictation are disabled"])
+        XCTAssertEqual(dictation?.contains("听写"), true)
+        XCTAssertEqual(GlassesEars.problem(authorized: true, hasRecognizer: true, seconds: 4, peak: 0.0001,
+                                           failures: [])?.contains("没有声音"), true)
+        // Nobody spoke: no fault, nothing to tell.
+        XCTAssertNil(GlassesEars.problem(authorized: true, hasRecognizer: true, seconds: 4, peak: 0.3,
+                                         failures: ["kAFAssistantErrorDomain 1110 No speech detected"]))
+        XCTAssertNil(GlassesEars.problem(authorized: true, hasRecognizer: true, seconds: 0.1, peak: 0, failures: []))
+    }
+
     /// The answer voice needs the system Opus encoder, and the recogniser its decoder.
     func testOpusRoundTripThroughTheSystemCodec() throws {
         let format = try XCTUnwrap(OpusCodec.pcmFormat(sampleRate: 48_000))
@@ -1265,10 +1397,10 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertLessThan(packets.map(\.count).max() ?? 0, 600)
         XCTAssertEqual(OpusFraming.duration(of: packets[packets.count / 2]), 0.020, accuracy: 1e-9)
         let decoder = try XCTUnwrap(OpusCodec.Decoder())
-        var frames = 0
-        for packet in packets { frames += Int(decoder.decode(packet)?.frameLength ?? 0) }
-        guard frames > 0 else { throw XCTSkip("no Opus decoder in this simulator") }
-        XCTAssertEqual(Double(frames), 16_000, accuracy: 1_600)   // one second at 16 kHz for the recogniser
+        let heard = signChanges(packets.compactMap { decoder.decode($0) })
+        guard heard.frames > 0 else { throw XCTSkip("no Opus decoder in this simulator") }
+        XCTAssertEqual(Double(heard.frames), 16_000, accuracy: 1_600)   // one second at 16 kHz for the recogniser
+        XCTAssertEqual(Double(heard.changes), 880, accuracy: 130)      // and it is the 440 Hz tone that went in
     }
 
     /// Chinese is not recognised on the glasses: the request arrives without words, the microphone

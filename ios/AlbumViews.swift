@@ -87,7 +87,8 @@ struct AlbumTab: View {
         snapshot.glassesIDs = Set(g.captures.map { $0.id })
         if source == .glasses {
             let waiting = rows.filter { imported[$0.id] == nil }
-            let deletable = waiting.filter { !$0.handle.isEmpty }
+            // Everything on the glasses can be deleted there; what is already on the phone most of all.
+            let deletable = rows.filter { !$0.handle.isEmpty }
             snapshot.pending = waiting
             snapshot.selectable = deletable
             snapshot.selectableIDs = Set(deletable.map { $0.id })
@@ -152,7 +153,10 @@ struct AlbumTab: View {
                 }
                 Button("取消", role: .cancel) {}
             } message: { captures in
-                Text("所选的 \(captures.count) 项还没有导入，删除后无法找回。")
+                let unsaved = captures.filter { g.importedCaptures[$0.id] == nil }.count
+                Text(unsaved == 0
+                     ? "这 \(captures.count) 项已经导入到 iPhone，只删除眼镜里的那一份。"
+                     : "其中 \(unsaved) 项还没有导入，从眼镜删除后无法找回。")
             }
             .onChange(of: displayedLibrary) { _, source in
                 if source == .local {
@@ -179,9 +183,9 @@ struct AlbumTab: View {
                 .disabled(isDeleting)
         } else {
             HStack(spacing: 16) {
-                if hasSelectable {
+                if displayedLibrary == .glasses {
                     Button("选择") { isSelecting = true }
-                        .disabled(!canDelete)
+                        .disabled(!canDelete || !hasSelectable)
                 }
                 Button {
                     Haptics.tap()
@@ -383,6 +387,15 @@ struct AlbumTab: View {
             .contextMenu {
                 if !isSelecting {
                     tileMenu(capture, item: item, imported: imported, onGlasses: onGlasses, failed: failed)
+                    if onGlasses && selectable && canDelete {
+                        Button(role: .destructive) {
+                            isSelecting = true
+                            selectedIDs = [capture.id]
+                            pendingDeletion = [capture]
+                        } label: {
+                            Label("从眼镜删除", systemImage: "trash")
+                        }
+                    }
                 }
             }
     }
@@ -463,7 +476,7 @@ struct AlbumTab: View {
                 }
                 .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
             } else {
-                Text(chosen.isEmpty ? "选择要从眼镜删除的项目。只能删除还没导入的。" : "已选择 \(chosen.count) 项")
+                Text(chosen.isEmpty ? "选择要从眼镜删除的项目。已导入的在 iPhone 上还有一份。" : "已选择 \(chosen.count) 项")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 12) {

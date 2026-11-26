@@ -146,6 +146,7 @@ struct GlassesSettingsView: View {
     @AppStorage(PhotoLeveling.enabledKey) private var levelPhotos = true
     @AppStorage(VideoLeveling.enabledKey) private var levelVideos = true
     @AppStorage(HeyMetaLanguage.key) private var heyMetaLanguage = "zh-CN"
+    @State private var answerVoice = ""
 
     private var ready: Bool { g.canUseGlasses && g.settingsReadAt != nil }
 
@@ -161,10 +162,17 @@ struct GlassesSettingsView: View {
                         Text(choice.name).tag(choice.tag)
                     }
                 }
+                .task(id: heyMetaLanguage) {
+                    answerVoice = heyMetaLanguage == HeyMetaLanguage.glasses
+                        ? "" : PhoneVoice.currentLabel(for: heyMetaLanguage)
+                }
+                if !answerVoice.isEmpty {
+                    LabeledContent("回答的声音", value: answerVoice)
+                }
             } header: {
                 Label("Hey Meta 用什么语言问", systemImage: "character.bubble")
             } footer: {
-                Text("眼镜自己只听得懂英文。选中文时，说完「Hey Meta」后你的话会传到 iPhone 上识别，回答也由 iPhone 合成语音、送回眼镜播放。首次使用会请求「语音识别」权限。")
+                Text("眼镜自己只听得懂英文。选中文时，说完「Hey Meta」后你的话会传到 iPhone 上识别，回答也由 iPhone 合成语音、送回眼镜播放。首次使用会请求「语音识别」权限，iPhone 的「听写」也要开着（设置 › 通用 › 键盘）。\n\n想让回答的声音更自然：到 iPhone「设置 › 辅助功能 › 朗读内容 › 声音」里，下载这门语言标着「优化音质」或「高音质」的声音，这里会自动改用它。")
             }
             ForEach(CuratedSettings.sections) { section in
                 Section {

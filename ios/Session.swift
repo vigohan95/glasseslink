@@ -671,8 +671,20 @@ final class Session {
             }
             if !forAssistant, parkForAssistant(msg) { continue }
             if !handlesAirshipOffers, try rejectUnrequestedAirshipOffer(msg) { continue }
+            noteCameraState(msg)
             return msg
         }
+    }
+
+    /// Every change of the glasses' camera, also the ones made with their own button, whoever is reading
+    /// the link at the time. Called on the reading thread.
+    var onCameraState: ((Int) -> Void)?
+
+    private func noteCameraState(_ msg: DataX.Message) {
+        guard msg.type == Self.cameraStateType, msg.error == nil, let handler = onCameraState,
+              let status = channel(named: "status"), msg.channel == status ^ 0x8000,
+              let camera = Status.cameraCode(msg.payload) else { return }
+        handler(camera)
     }
 
     private func allocChannel(_ name: String) -> UInt16 {

@@ -26,7 +26,9 @@ final class Assistant: @unchecked Sendable {
         static let initStreamResponse: Int32 = 5001
         static let streamHeader: Int32 = 5002
         static let streamAudio: Int32 = 5003
+        static let streamStatus: Int32 = 5005
         static let streamEnd: Int32 = 6000
+        static let streamConsumed: Int32 = 6001
         static let envelope: Int32 = 9000
         static let envelopeAck: Int32 = 9001
     }
@@ -163,6 +165,8 @@ final class Assistant: @unchecked Sendable {
     var onTranscript: ((String, String) -> Void)?
     /// A finished plain microphone turn had audio but the glasses did not provide usable text.
     var onAudioWithoutTranscript: (() -> Void)?
+    /// The glasses asked for an answer (interaction) but neither they nor the phone heard any words.
+    var onUnheard: ((String) -> Void)?
     var onTurnEnded: ((String) -> Void)?
     var onFailure: ((Error) -> Void)?
 
@@ -176,6 +180,11 @@ final class Assistant: @unchecked Sendable {
     /// The stream the glasses allocated per interaction; an answer in the phone's voice must name it.
     private var streamIDs: [String: String] = [:]
     private var latestStream = ""
+    private var lastEventLogged = 0
+    /// Sent this far ahead of when it plays, so a late Bluetooth packet does not leave the glasses with
+    /// nothing to play; and how long after the last sound the closing events wait.
+    private static let speechLead = 0.24
+    private static let speechTail = 0.2
 
     var registered: Bool {
         stateLock.lock()
@@ -467,6 +476,10 @@ final class Assistant: @unchecked Sendable {
                 if !message.payload.isEmpty, transcribesOnPhone() { onMicrophoneAudio?(message.payload) }
             case Int(MT.streamEnd):
                 finishMicrophoneStream()
+            case Int(MT.streamStatus):
+                log(Self.playbackReport(message.payload))
+            case Int(MT.streamConsumed):
+                log("assistant: the glasses finished the answer stream")
             default:
                 break
             }
@@ -541,9 +554,24 @@ final class Assistant: @unchecked Sendable {
         }
     }
 
+    /// 5005: `<stream>_<interaction>_<pcm bytes>_<ms>`, what the glasses played of an answer stream; the
+    /// PCM is counted at 96 bytes a millisecond.
+    static func playbackReport(_ payload: Data) -> String {
+        let parts = (String(data: payload, encoding: .utf8) ?? "").split(separator: "_")
+        guard parts.count >= 4, let ms = Int(parts[parts.count - 1]), let pcm = Int(parts[parts.count - 2]) else {
+            return "assistant: answer stream status, \(payload.count) bytes"
+        }
+        return "assistant: the glasses played \(pcm / 96) ms of \(ms) ms"
+    }
+
     private func handleEvent(_ payload: Data) throws {
         guard payload.count <= Self.maxMessageBytes,
               let fields = try? ThriftCompact.loads(payload), let id = fields.int(1) else { return }
+        // Which events a turn consists of is what a log is read for; repeats of one event are left out.
+        if id != lastEventLogged {
+            lastEventLogged = id
+            log("assistant: event \(id)")
+        }
         guard let body = Self.netEventBody(fields), let inner = try? ThriftCompact.loads(body) else {
             if id == EV.fulfillmentRequest || id == EV.sessionModeUpdateResponse {
                 log("assistant: could not decode event \(id): \(Self.describeUndecodableEvent(fields))")
@@ -794,6 +822,7 @@ final class Assistant: @unchecked Sendable {
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.registered else { return }
                 self.onAudioWithoutTranscript?()
+                if self.isCurrentRequest(interaction) { self.onUnheard?(interaction) }
             }
             return
         }
@@ -973,7 +1002,7 @@ final class Assistant: @unchecked Sendable {
         }
         if streamID.isEmpty { log("assistant: no stream id from the glasses for this answer; it may not play") }
         let speechStart = ThriftWriter().string(1, interaction).done()
-        let transcription = ThriftWriter().string(1, transcript).i32(2, 0).string(4, "")
+        let transcription = ThriftWriter().string(1, transcript.isEmpty ? text : transcript).i32(2, 0).string(4, "")
             .bool(7, false).string(8, interaction).done()
         let understanding = ThriftWriter().string(1, interaction).bool(2, false)
             .string(3, "IN:GET_WEATHER").bool(4, false).done()
@@ -1011,10 +1040,14 @@ final class Assistant: @unchecked Sendable {
                 try session.sendContinuation(Endpoint.stream.rawValue, service: Int(Self.service), payload: frame)
             }
             index += 2
-            let wait = due - (ProcessInfo.processInfo.systemUptime - started)
+            let wait = due - Self.speechLead - (ProcessInfo.processInfo.systemUptime - started)
             if wait > 0 { try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
         }
         try write(MT.streamEnd, Data(), on: .stream)
+        // The glasses are still playing what was sent ahead. The events below end the answer and reopen
+        // the microphone; sent at once they cut off its last words (glasses log 34).
+        let rest = due + Self.speechTail - (ProcessInfo.processInfo.systemUptime - started)
+        if rest > 0 { try await Task.sleep(nanoseconds: UInt64(rest * 1_000_000_000)) }
         if !active.simplified { try send(EV.voiceAnswer, varm) }
         // Without it the glasses stay in their answering state with the microphone on.
         try send(EV.voiceComplete, Varm.complete(interaction: interaction, text: text, streamed: true))

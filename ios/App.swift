@@ -876,6 +876,12 @@ final class Glasses: NSObject, ObservableObject {
         let sess = Session(stream: s, owner: own, log: { [weak self] in self?.note($0) })
         let quickStart = trust && useQuickHandshake
         sess.blockOTA = Glasses.blockOTA
+        sess.onCameraState = { [weak self, weak sess] code in
+            Task { @MainActor in
+                guard let self, let sess, self.session === sess else { return }
+                self.glassesCameraChanged(code)
+            }
+        }
         session = sess
         // A crash inside handshake() would otherwise be repeated by auto-reconnect on every
         // launch, which is exactly the "闪退十几次" loop. We mark the attempt in flight and
@@ -1404,8 +1410,9 @@ final class Glasses: NSObject, ObservableObject {
             manualMediaDecision = decision
             manualMediaWiFi = ManualMediaWiFiJoin(id: id, ssid: endpoint.ssid, password: endpoint.password)
             manualMediaTimeout = Task { [weak self] in
-                do { try await Task.sleep(nanoseconds: 75_000_000_000) } catch { return }
+                do { try await Task.sleep(nanoseconds: 150_000_000_000) } catch { return }
                 guard let self, self.mediaImportID == id else { return }
+                self.note("等了 150 秒，iPhone 没有连上眼镜 Wi-Fi，改用蓝牙")
                 self.resolveManualMediaWiFi(false)
             }
         }
@@ -1422,8 +1429,7 @@ final class Glasses: NSObject, ObservableObject {
         let deleted: Set<String>? = await withGlassesOperation { active in
             var seen = Set<String>()
             let targets = captures.filter {
-                importedCaptures[$0.id] == nil && selected[$0.handle]?.contains($0.id) == true
-                    && seen.insert($0.handle).inserted
+                selected[$0.handle]?.contains($0.id) == true && seen.insert($0.handle).inserted
             }
             guard targets.count == selected.count else {
                 mediaMessage = "眼镜相册已变化，请刷新后重新选择。"
@@ -1797,7 +1803,8 @@ final class Glasses: NSObject, ObservableObject {
     nonisolated private static func speak(_ text: String, interaction: String, question: String,
                                           assistant: Assistant) async throws {
         if let tag = HeyMetaLanguage.phoneLocale,
-           let pcm = await PhoneVoice.synthesize(text, localeTag: tag), let packets = OpusCodec.encode(pcm) {
+           let speech = await PhoneVoice.synthesize(text, localeTag: tag), let packets = OpusCodec.encode(speech.pcm) {
+            assistant.log("assistant: speaking with \(speech.voice)")
             try await assistant.complete(interaction: interaction, text: text, transcript: question, speech: packets)
         } else {
             try await Task.detached(priority: .userInitiated) {
@@ -1979,18 +1986,69 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
+    /// True while the app's own shutter request is on its way; the glasses' camera reports in that time
+    /// are the answer to it and not news.
+    private var cameraCommandInFlight = false
+
+    /// The glasses report their camera whenever it changes. A take stopped (or started) with the button
+    /// on the glasses has to show in the app too: 1.03 went on counting a recording that was over.
+    private func glassesCameraChanged(_ code: Int) {
+        guard !cameraCommandInFlight else { return }
+        if code == Status.videoStarted {
+            guard !recording else { return }
+            status.camera = Status.cameraName(code)
+            recording = true
+            recordingCatalogBaseline = nil
+            note("眼镜上开始了录像")
+        } else if [0, 3, 4, 5, 6, 7, 10].contains(code), recording {
+            status.camera = Status.cameraName(code)
+            recording = false
+            recordingCatalogBaseline = nil
+            recordDeadline = nil
+            autoStopTask?.cancel()
+            autoStopTask = nil
+            mediaMessage = "眼镜上已停止录像，新视频稍后出现在相册里。"
+            showToast("眼镜上已停止录像", .success)
+            note("眼镜上停止了录像（相机状态 \(code)）")
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                guard let self, self.canUseGlasses, !self.busy, !self.settingsLoading,
+                      !self.mediaImportInProgress, self.live == nil else { return }
+                self.loadCaptures()
+            }
+        }
+    }
+
     func toggleRecording() {
         if queueCameraDuringImport(recording ? .stopVideo : .startVideo) { return }
         Task {
+            cameraCommandInFlight = true
+            defer { cameraCommandInFlight = false }
             _ = await withGlassesOperation { active in
                 let stopping = recording
                 mediaMessage = stopping ? "正在等待眼镜确认停止录像…" : "正在等待眼镜确认开始录像…"
                 var baseline = recordingCatalogBaseline
                 if !stopping { baseline = try await catalogBeforeCapture(on: active) }
-                let cameraState = try await onGlassesQueue {
-                    try (stopping ? active.stopVideo() : active.startVideo())
+                let answered: GlassesState? = try await onGlassesQueue {
+                    do {
+                        return try (stopping ? active.stopVideo() : active.startVideo())
+                    } catch LinkError.unexpected(let reason) {
+                        guard stopping else { throw LinkError.unexpected(reason) }
+                        // Nothing changed, so nothing was confirmed: the take may already have been
+                        // stopped on the glasses. Their state says which.
+                        do { return try active.subscribeStatus(timeout: 3) } catch LinkError.unexpected(_) { return nil }
+                    }
                 }
                 try checkActive(active)
+                guard let cameraState = answered else {
+                    // Two requests without a word back: the link is dead, though iOS has not noticed yet.
+                    note("眼镜对停止录像和状态查询都没有回应，重新连接")
+                    if let p = peripheral { failConnection("眼镜没有响应，正在重新连接。", peripheral: p) }
+                    return
+                }
+                if stopping, cameraState.camera == Status.cameraName(Status.videoStarted) {
+                    throw LinkError.unexpected("眼镜没有确认停止录像")
+                }
                 status.camera = cameraState.camera
                 recording = !stopping
                 if stopping {
@@ -2229,6 +2287,8 @@ final class Glasses: NSObject, ObservableObject {
     private var assistantRef: Assistant?
     private var voiceTurn: String?
     private var submittedVoiceTurn: String?
+    /// Why the phone's recogniser gave nothing for the current question, when the phone's set-up is why.
+    private var hearingProblem: String?
     private var voiceWait: Task<Void, Never>?
     private var voiceAnswer: Task<Void, Never>?
 
@@ -2310,6 +2370,7 @@ final class Glasses: NSObject, ObservableObject {
             Task { @MainActor in
                 guard let self, let a, self.assistantRef === a, self.voiceTurn != interaction else { return }
                 self.resetVoiceTurn()
+                self.hearingProblem = nil
                 self.voiceTurn = interaction
                 self.assistantMessage = "已收到眼镜唤醒，等待你说完问题…"
                 self.voiceWait = Task { [weak self, weak a] in
@@ -2336,7 +2397,7 @@ final class Glasses: NSObject, ObservableObject {
                 }
                 self.voiceWait?.cancel()
                 self.assistantTranscriptMissing = true
-                self.assistantMessage = "眼镜已结束这轮语音，App 没收到问题文字。"
+                self.assistantMessage = self.hearingProblem ?? "眼镜已结束这轮语音，App 没收到问题文字。"
             }
         }
         a.onAudioWithoutTranscript = { [weak self, weak a] in
@@ -2344,7 +2405,7 @@ final class Glasses: NSObject, ObservableObject {
                 guard let self, let a, self.assistantRef === a else { return }
                 self.voiceWait?.cancel()
                 self.assistantTranscriptMissing = true
-                self.assistantMessage = "已收到眼镜的麦克风语音流，未收到转写文字。这轮可以直接打字提问。"
+                self.assistantMessage = self.hearingProblem ?? "这一句没有听清。可以再说一次，或直接打字提问。"
             }
         }
         // A language the glasses do not recognise: their microphone stream goes to the phone's recogniser.
@@ -2356,16 +2417,41 @@ final class Glasses: NSObject, ObservableObject {
             ears.current = fresh
         }
         a.onMicrophoneAudio = { chunk in ears.current?.hear(chunk) }
-        a.onMicrophoneEnded = { [weak a] wake in
+        a.onMicrophoneEnded = { [weak self, weak a] wake in
             guard let assistant = a else { return }
-            guard let heard = ears.current else {
+            guard let listening = ears.current else {
                 assistant.submitPhoneTranscript("", wakeID: wake)
                 return
             }
-            Task {
-                let text = await heard.finish()
-                assistant.log("assistant: phone recogniser (\(heard.localeTag)) heard \(text.count) characters in \(heard.packets) packets, \(heard.undecoded) undecoded")
-                assistant.submitPhoneTranscript(text, wakeID: wake)
+            Task { @MainActor in
+                let heard = await listening.finish()
+                assistant.log("assistant: " + heard.report)
+                if let problem = heard.problem, let self, self.assistantRef === assistant {
+                    self.hearingProblem = problem
+                    self.assistantMessage = problem
+                }
+                assistant.submitPhoneTranscript(heard.text, wakeID: wake)
+            }
+        }
+        a.onUnheard = { [weak self, weak a] interaction in
+            Task { @MainActor in
+                guard let self, let a, self.assistantRef === a, self.submittedVoiceTurn != interaction else { return }
+                self.voiceWait?.cancel()
+                self.voiceTurn = interaction
+                self.submittedVoiceTurn = interaction
+                let chinese = HeyMetaLanguage.phoneLocale?.hasPrefix("zh") ?? false
+                let sorry: String
+                if self.hearingProblem != nil {
+                    sorry = chinese ? "手机的语音识别出了问题，请打开 App 看提示。"
+                                    : "Speech recognition on the phone has a problem. Please open the app."
+                } else {
+                    sorry = chinese ? "没听清，请再说一遍。" : "Sorry, I didn't catch that."
+                }
+                self.note("眼镜语音：这一句没有听到内容，已在眼镜里提示")
+                self.voiceAnswer = Task { [weak a] in
+                    guard let a else { return }
+                    try? await Self.speak(sorry, interaction: interaction, question: "", assistant: a)
+                }
             }
         }
         if HeyMetaLanguage.phoneLocale != nil {

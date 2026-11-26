@@ -6,12 +6,23 @@ import AVFoundation
 enum OpusFraming {
     private static let groupHead = 9
 
-    static func packets(in chunk: Data) -> [Data] {
+    /// Which of the layouts a chunk turned out to have; `bare` is also what an unknown layout looks like.
+    enum Layout: String {
+        case lengths = "length-prefixed"
+        case records
+        case bare
+    }
+
+    static func packets(in chunk: Data) -> [Data] { split(chunk).packets }
+
+    static func split(_ chunk: Data) -> (packets: [Data], layout: Layout) {
         let bytes = [UInt8](chunk)
-        guard !bytes.isEmpty else { return [] }
+        guard !bytes.isEmpty else { return ([], .bare) }
         // No little-endian lengths at the top level: a record starts with its own little-endian length,
         // which would pass for one packet holding the rest of the chunk.
-        return lengthPrefixed(bytes, bigEndian: true) ?? records(bytes) ?? [chunk]
+        if let found = lengthPrefixed(bytes, bigEndian: true) { return (found, .lengths) }
+        if let found = records(bytes) { return (found, .records) }
+        return ([chunk], .bare)
     }
 
     private static func u32(_ b: [UInt8], _ at: Int, bigEndian: Bool) -> Int {
