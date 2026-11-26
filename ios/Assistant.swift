@@ -429,7 +429,7 @@ final class Assistant {
               let fields = try? ThriftCompact.loads(payload), let id = fields.int(1) else { return }
         guard let body = Self.netEventBody(fields), let inner = try? ThriftCompact.loads(body) else {
             if id == EV.fulfillmentRequest || id == EV.sessionModeUpdateResponse {
-                log("assistant: could not decode event \(id) body (compressed=\(fields.bool(3)))")
+                log("assistant: could not decode event \(id): \(Self.describeUndecodableEvent(fields))")
             }
             return
         }
@@ -499,6 +499,27 @@ final class Assistant {
         guard let count, count <= maxMessageBytes else { return nil }
         decoded.removeSubrange(count..<decoded.count)
         return Session.adler32(decoded) == expectedChecksum ? decoded : nil
+    }
+
+    /// One log line that tells a decompression failure from a parse failure; 0.99 logged only
+    /// "could not decode", which made a missing Thrift type look like a zlib problem.
+    static func describeUndecodableEvent(_ fields: [Int: Any]) -> String {
+        let raw = fields.bytes(2)
+        var parts = ["body=\(raw?.count ?? 0)B", "compressed=\(fields.bool(3))"]
+        guard let body = netEventBody(fields) else {
+            parts.append(raw == nil ? "no body" : "inflate failed")
+            if let raw { parts.append("head=\(raw.prefix(16).hex)") }
+            return parts.joined(separator: " ")
+        }
+        parts.append("decoded=\(body.count)B")
+        do {
+            _ = try ThriftCompact.loads(body)
+            parts.append("parsed")
+        } catch {
+            parts.append("thrift: \(error)")
+        }
+        parts.append("head=\(body.prefix(48).hex)")
+        return parts.joined(separator: " ")
     }
 
     private func acknowledgeSpeechStart(_ fields: [Int: Any]) throws {

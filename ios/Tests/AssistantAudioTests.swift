@@ -103,4 +103,57 @@ final class AssistantAudioTests: XCTestCase {
 
         XCTAssertEqual(fields[1] as? [Bool], [true, false])
     }
+
+    func testCompactMapOfStringToStructListParsesAndLaterFieldsSurvive() throws {
+        let slot = ThriftWriter().string(4, "Beijing").done()
+        var event = Data([0x0B, 0x34])                 // field 26 (long form), type map
+        event += [0x01, 0x89]                           // one entry, key binary, value list
+        event += Data([0x08]) + Data("location".utf8)
+        event += Data([0x1C]) + slot                    // list of one struct
+        event += Data([0x18, 0x05]) + Data("after".utf8) // field 27 binary
+        event += [TC.stop]
+        let fields = try ThriftCompact.loads(event)
+
+        let slots = fields.mapField(26)["location"] as? [Any]
+        XCTAssertEqual((slots?.first as? [Int: Any])?.text(4), "Beijing")
+        XCTAssertEqual(fields.text(27), "after")
+    }
+
+    func testCompactBoolMapEmptyMapFloatAndDouble() throws {
+        var event = Data([0x1B, 0x02, 0x81, 0x01, 0x61, 0x01, 0x01, 0x62, 0x02]) // 1: {"a": true, "b": false}
+        event += [0x1B, 0x00]                                                    // 2: {}
+        event += [0x1D, 0x3F, 0xC0, 0x00, 0x00]                                  // 3: float 1.5 (big-endian)
+        event += [0x17, 0, 0, 0, 0, 0, 0, 0x02, 0x40]                            // 4: double 2.25 (little-endian)
+        event += [0x15, 0x0E, TC.stop]                                           // 5: i32 7
+        let fields = try ThriftCompact.loads(event)
+
+        XCTAssertEqual(fields.mapField(1)["a"] as? Bool, true)
+        XCTAssertEqual(fields.mapField(1)["b"] as? Bool, false)
+        XCTAssertTrue(fields.mapField(2).isEmpty)
+        XCTAssertEqual(fields[3] as? Double, 1.5)
+        XCTAssertEqual(fields[4] as? Double, 2.25)
+        XCTAssertEqual(fields.int(5), 7)
+        XCTAssertThrowsError(try ThriftCompact.loads(Data([0x1B, 0x05, 0x88, 0x01, 0x61])))
+    }
+
+    func testFulfillmentRequestWithSlotMapYieldsTheGlassesTranscript() throws {
+        let asr = ThriftWriter().string(1, "今天天气怎么样").done()
+        let understanding = ThriftWriter().structField(1, asr).done()
+        var body = Data(ThriftWriter().string(1, "turn-1").structField(2, understanding).done().dropLast())
+        body += Data([0x0B, 0x34, 0x01, 0x89, 0x04]) + Data("city".utf8)
+        body += Data([0x1C]) + ThriftWriter().string(4, "北京").done()
+        body += [TC.stop]
+        let request = Assistant.spokenRequest(try ThriftCompact.loads(body))
+
+        XCTAssertEqual(request?.interaction, "turn-1")
+        XCTAssertEqual(request?.transcript, "今天天气怎么样")
+    }
+
+    func testUndecodableEventReportsInflateAndThriftFailures() {
+        let broken = Assistant.describeUndecodableEvent([1: Int64(57), 2: Data([0x78, 0x9C, 0x01, 0x02, 0x03, 0x04, 0x05]), 3: true])
+        XCTAssertTrue(broken.contains("inflate failed"), broken)
+        let unknownType = Assistant.describeUndecodableEvent([1: Int64(57), 2: Data([0x1E, 0x00]), 3: false])
+        XCTAssertTrue(unknownType.contains("bad compact type 14"), unknownType)
+        XCTAssertTrue(unknownType.contains("decoded=2B"), unknownType)
+    }
 }
