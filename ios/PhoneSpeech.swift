@@ -243,12 +243,13 @@ final class GlassesEars: @unchecked Sendable {
         if !hasRecognizer { return "这台 iPhone 不支持所选语言的语音识别，请在「眼镜设置」里换一种提问语言。" }
         guard seconds >= 0.3 else { return nil }
         let all = failures.joined(separator: " ")
-        if all.contains("Dictation") || all.contains("kLSRErrorDomain 201") {
+        if all.contains("Dictation") || all.contains("听写") || all.contains("kLSRErrorDomain 201") {
             return "iPhone 的听写没有打开：到「设置 › 通用 › 键盘」打开「启用听写」后再试。"
         }
         if peak < 0.004 { return "眼镜送来的录音没有声音，手机识别不出内容。" }
         // 1110 is "no speech detected": nobody spoke, which is no fault.
         guard let first = failures.first(where: { !$0.contains(" 1110") }) else { return nil }
+        if first.hasPrefix("no result in") { return "手机语音识别一直没有给出结果，请检查 iPhone 的网络后再试。" }
         return "手机语音识别没有结果（\(first)）。"
     }
 }
@@ -348,7 +349,7 @@ private final class Recognition: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let text = words.text
-        return (text, text.isEmpty ? failure ?? "no words" : nil)
+        return (text, text.isEmpty ? failure : nil)
     }
 }
 
