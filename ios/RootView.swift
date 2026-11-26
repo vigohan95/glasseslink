@@ -558,7 +558,8 @@ struct AlbumTab: View {
 
     private func mediaTile(_ capture: Capture, presentOnGlasses: Bool, selectable: Bool) -> some View {
         let item = AlbumMediaSelection(id: capture.id, isPhoto: capture.isPhoto,
-                                       original: g.localMediaURL(for: capture), thumbnail: g.thumbs[capture.id])
+                                       original: g.localMediaURL(for: capture), thumbnail: g.thumbs[capture.id],
+                                       timestampNS: capture.timestampNS)
         let saved = g.importedCaptures[capture.id] != nil
         let selection: CaptureTile.Selection
         if !isSelecting {
@@ -1251,7 +1252,6 @@ struct DeviceTabBody: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var audioTest = AudioRouteTest()
     @State private var showSettings = false
-    @State private var showQuick = false
     @State private var showDiagnostics = false
     @State private var showAbout = false
     @State private var showMicrophoneCheck = false
@@ -1274,9 +1274,7 @@ struct DeviceTabBody: View {
                 if !g.connected { nearbyPanel }
                 if g.canUseGlasses {
                     statusPanel
-                    actionRow("常用眼镜设置", icon: "slider.horizontal.3") { showQuick = true }
-                        .disabled(g.busy)
-                        .glassesPanel(padding: 14)
+                    settingsEntry
                 } else {
                     VStack(alignment: .leading, spacing: 12) {
                         OwnerBadge(g: g)
@@ -1291,8 +1289,7 @@ struct DeviceTabBody: View {
             .padding(18)
         }
         .background(GlassesTheme.page.ignoresSafeArea())
-        .sheet(isPresented: $showQuick) { NavigationStack { QuickPanel(g: g) } }
-        .sheet(isPresented: $showSettings) { SettingsView(g: g) }
+        .sheet(isPresented: $showSettings) { NavigationStack { GlassesSettingsView(g: g) } }
         .sheet(isPresented: $showDiagnostics) { NavigationStack { ContentView(g: g) } }
         .sheet(isPresented: $showAbout) { AboutView() }
         .sheet(isPresented: $showMicrophoneCheck) { MicrophoneCheckView(glassesName: g.connectedGlassesName) }
@@ -1553,11 +1550,42 @@ struct DeviceTabBody: View {
         mb >= 1024 ? String(format: "%.1f GB", Double(mb) / 1024) : "\(mb) MB"
     }
 
+    /// The glasses' own settings, one tap from the 眼镜 tab (it used to sit under 高级 › 完整设置列表).
+    private var settingsEntry: some View {
+        Button { showSettings = true } label: {
+            HStack(spacing: 13) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 11).fill(GlassesTheme.accent.opacity(0.13))
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.headline)
+                        .foregroundStyle(GlassesTheme.accent)
+                }
+                .frame(width: 40, height: 40)
+                .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("眼镜设置").font(.headline).foregroundStyle(.primary)
+                    Text("Hey Meta、拍摄画质、声音、佩戴检测、来电播报等 \(CuratedSettings.all.count) 项")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.leading)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(g.busy)
+        .glassesPanel(padding: 14)
+    }
+
     private var advancedPanel: some View {
         DisclosureGroup {
             VStack(alignment: .leading, spacing: 13) {
-                actionRow("完整设置列表", icon: "list.bullet") { showSettings = true }
-                    .disabled(!g.canUseGlasses || g.busy)
                 if g.canUseGlasses {
                     actionRow("管理主人身份", icon: "checkmark.shield") { g.route = .ownerSetup }
                 }
@@ -1568,10 +1596,9 @@ struct DeviceTabBody: View {
                     get: { Glasses.blockOTA },
                     set: { Glasses.blockOTA = $0 }
                 ))
-                Button("关闭眼镜云端自动更新") {
-                    g.writeSetting("cloud_ota_enabled", "false")
-                }
-                .disabled(!g.canUseGlasses || g.busy)
+                Text("眼镜的自动更新开关在「眼镜设置 › 隐私与更新」。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             .padding(.top, 12)
         } label: {

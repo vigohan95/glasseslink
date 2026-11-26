@@ -1,0 +1,290 @@
+import SwiftUI
+
+/// One setting Ray-Ban Meta (Gen 2) really has and the phone can change, in plain Chinese.
+/// The keys and option values come from Visor's curated topics and settings_ui.json; the words are ours.
+struct CuratedSetting: Identifiable {
+    enum Control {
+        case toggle
+        case choice([CuratedOption])
+        /// A raw integer range shown to people as 0–100 %.
+        case percent(min: Double, max: Double)
+    }
+
+    let key: String
+    let title: String
+    let note: String
+    let control: Control
+    var id: String { key }
+}
+
+struct CuratedOption: Identifiable {
+    let value: String
+    let label: String
+    var id: String { value }
+}
+
+extension CuratedSetting.Control {
+    /// Options in the order written; a dictionary literal would lose it.
+    static func options(_ pairs: KeyValuePairs<String, String>) -> Self {
+        .choice(pairs.map { CuratedOption(value: $0.key, label: $0.value) })
+    }
+}
+
+struct CuratedSection: Identifiable {
+    let title: String
+    let icon: String
+    let items: [CuratedSetting]
+    var id: String { title }
+}
+
+enum CuratedSettings {
+    static let sections: [CuratedSection] = [
+        CuratedSection(title: "Hey Meta 与语音", icon: "waveform", items: [
+            CuratedSetting(key: "assistant_enabled", title: "Meta AI 语音助手",
+                           note: "关闭后眼镜不再响应「Hey Meta」，GlassesLink 的语音接管也收不到问题。", control: .toggle),
+            CuratedSetting(key: "wakeword_enabled", title: "「Hey Meta」唤醒",
+                           note: "说「Hey Meta」开始一条语音指令。", control: .toggle),
+            CuratedSetting(key: "wakeword_sound_enabled", title: "唤醒提示音",
+                           note: "说完「Hey Meta」后眼镜会响一声，表示在听。", control: .toggle),
+            CuratedSetting(key: "assistant_follow_up_enabled", title: "免唤醒追问",
+                           note: "回答结束后麦克风再听一小会儿，接着问不用再说「Hey Meta」。", control: .toggle),
+            CuratedSetting(key: "tts_speak_speed", title: "朗读语速",
+                           note: "眼镜读出回答和通知的速度。",
+                           control: .options(["75": "0.75 倍", "100": "1 倍", "125": "1.25 倍",
+                                             "150": "1.5 倍", "175": "1.75 倍"])),
+        ]),
+        CuratedSection(title: "拍摄", icon: "camera", items: [
+            CuratedSetting(key: "capture_button_short_long_press", title: "拍摄键",
+                           note: "拍摄键单按和长按分别做什么。",
+                           control: .options(["0": "单按拍照，长按录像", "1": "单按录像，长按拍照"])),
+            CuratedSetting(key: "resolution_and_framerate", title: "视频画质",
+                           note: "画质越高越耗电、越占空间。",
+                           control: .options(["0": "标准 · 1080p 30 帧", "2": "高帧率 · 1080p 60 帧",
+                                             "1": "高分辨率 · 3K 30 帧"])),
+            CuratedSetting(key: "video_duration_ms", title: "单段视频最长",
+                           note: "录到这个时长会自动停止。",
+                           control: .options(["30000": "30 秒", "60000": "1 分钟", "180000": "3 分钟",
+                                             "300000": "5 分钟（仅标准画质）", "600000": "10 分钟"])),
+            CuratedSetting(key: "eis_mode", title: "视频防抖",
+                           note: "中（默认）：防抖并校正水平；强：画面最平稳；弱：保留动作感；自动：按画面运动自己选。",
+                           control: .options(["0": "自动", "1": "强", "2": "中", "3": "弱"])),
+            CuratedSetting(key: "motion_blur_reduction_enabled", title: "减少运动模糊",
+                           note: "录像时减少快速移动造成的拖影。", control: .toggle),
+            CuratedSetting(key: "occlusion_detection_enabled", title: "镜头遮挡提醒",
+                           note: "头发或帽檐挡住镜头时提醒你。", control: .toggle),
+            CuratedSetting(key: "music_concurrency_enabled", title: "录像时继续放音乐",
+                           note: "录像时不暂停音乐；音乐声可能会被录进视频。", control: .toggle),
+        ]),
+        CuratedSection(title: "声音", icon: "speaker.wave.2", items: [
+            CuratedSetting(key: "notification_volume", title: "提示音音量",
+                           note: "眼镜提示音的音量，不影响音乐和通话。", control: .percent(min: 55, max: 127)),
+            CuratedSetting(key: "avc_enabled", title: "自适应音量",
+                           note: "根据周围噪音自动调整眼镜音量。", control: .toggle),
+            CuratedSetting(key: "mono_audio_enabled", title: "单声道",
+                           note: "左右两边的扬声器播放同样的声音。", control: .toggle),
+        ]),
+        CuratedSection(title: "佩戴与触控", icon: "hand.tap", items: [
+            CuratedSetting(key: "wear_detection_enabled", title: "佩戴检测",
+                           note: "摘下眼镜时暂停功能，戴上后恢复。", control: .toggle),
+            CuratedSetting(key: "auto_play_pause_on_don_doff", title: "摘下时暂停音乐",
+                           note: "摘下眼镜时音乐自动暂停，戴上后继续。", control: .toggle),
+            CuratedSetting(key: "tap_and_hold_mapping", title: "触控板长按",
+                           note: "手指按住镜腿触控板时做什么。",
+                           control: .options(["1": "不做任何事", "2": "唤醒 Meta AI", "3": "Spotify Tap",
+                                             "5": "Apple Music", "4": "Amazon Music"])),
+            CuratedSetting(key: "sg_captouch_invert_swipe_direction_horizontal", title: "反转前后滑动",
+                           note: "触控板前后滑动调音量的方向反过来。", control: .toggle),
+        ]),
+        CuratedSection(title: "来电与通知", icon: "bell", items: [
+            CuratedSetting(key: "user_setup_ica_toggle_enabled", title: "来电播报",
+                           note: "来电时眼镜读出是谁打来的。", control: .toggle),
+            CuratedSetting(key: "sg_do_not_disturb", title: "勿扰模式",
+                           note: "开启后眼镜不响来电铃声。", control: .toggle),
+            CuratedSetting(key: "attention_deferral_user_enabled", title: "说话时推迟通知",
+                           note: "你正在说话时，等说完再播报通知。", control: .toggle),
+            CuratedSetting(key: "mute_announcements_default_duration", title: "暂停播报的默认时长",
+                           note: "暂停通知播报时默认暂停多久。",
+                           control: .options(["3600": "1 小时", "7200": "2 小时", "14400": "4 小时",
+                                             "28800": "8 小时"])),
+        ]),
+        CuratedSection(title: "隐私与更新", icon: "lock.shield", items: [
+            CuratedSetting(key: "assistant_store_voice_recordings", title: "保存语音录音",
+                           note: "允许 Meta 保存你对 Meta AI 说话的录音。", control: .toggle),
+            CuratedSetting(key: "assistant_store_voice_transcripts", title: "保存语音文字记录",
+                           note: "允许 Meta 保存你说话内容的文字副本。", control: .toggle),
+            CuratedSetting(key: "cloud_media_processing_enabled", title: "照片视频云端处理",
+                           note: "允许把照片和视频发到 Meta 云端处理和临时保存。", control: .toggle),
+            CuratedSetting(key: "location_global_enabled", title: "位置服务",
+                           note: "允许眼镜使用位置信息。", control: .toggle),
+            CuratedSetting(key: "device_share_additional_data_enabled", title: "共享额外使用数据",
+                           note: "向 Meta 额外共享使用频率等数据。", control: .toggle),
+            CuratedSetting(key: "cloud_ota_enabled", title: "自动固件更新",
+                           note: "允许眼镜自己从云端下载新固件。新固件可能让 GlassesLink 失效，建议关闭。",
+                           control: .toggle),
+        ]),
+    ]
+
+    static var all: [CuratedSetting] { sections.flatMap(\.items) }
+
+    /// The label for a stored value, or a plain "其他" for one the list does not name.
+    static func label(_ item: CuratedSetting, _ raw: String?) -> String {
+        guard let raw else { return "未知" }
+        switch item.control {
+        case .toggle:
+            return SettingsSchemaTable.boolValue(raw).map { $0 ? "开" : "关" } ?? raw
+        case .choice(let options):
+            return options.first { SettingsSchemaTable.same(kind: "int", raw, $0.value) || raw == $0.value }?.label
+                ?? "其他（\(raw)）"
+        case .percent(let minimum, let maximum):
+            guard let value = Double(raw) else { return raw }
+            return "\(percent(value, minimum, maximum))%"
+        }
+    }
+
+    static func percent(_ value: Double, _ minimum: Double, _ maximum: Double) -> Int {
+        guard maximum > minimum else { return 0 }
+        return Int(((min(max(value, minimum), maximum) - minimum) / (maximum - minimum) * 100).rounded())
+    }
+}
+
+/// The settings page on the 眼镜 tab: what the glasses really have, read from them, in Chinese.
+struct GlassesSettingsView: View {
+    @ObservedObject var g: Glasses
+    @Environment(\.dismiss) private var dismiss
+    @State private var percentDrafts: [String: Double] = [:]
+    @AppStorage(PhotoLeveling.enabledKey) private var levelPhotos = true
+
+    private var ready: Bool { g.canUseGlasses && g.settingsReadAt != nil }
+
+    var body: some View {
+        List {
+            statusSection
+            ForEach(CuratedSettings.sections) { section in
+                Section {
+                    ForEach(section.items) { item in row(item) }
+                } header: {
+                    Label(section.title, systemImage: section.icon)
+                }
+                .disabled(!ready || g.settingsLoading || g.busy)
+            }
+            Section {
+                Toggle(isOn: $levelPhotos) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("照片自动摆正")
+                        Text("戴着眼镜头一歪，照片就斜。导入时 iPhone 会找画面里的水平线，把存进 iPhone 相册的那份转正并裁掉斜边；App 里的原件不动。歪得太厉害（超过 12°）或画面里找不到水平线时不处理。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Label("导入到 iPhone 相册时", systemImage: "level")
+            } footer: {
+                Text("视频的水平校正由眼镜自己完成：GlassesLink 每次连接都会打开两段式防抖（Meta App 也是这样），配合上面「视频防抖」选「中」效果最好。")
+            }
+            Section {
+                NavigationLink("全部原始设置（开发者）") { SettingsView(g: g) }
+            } footer: {
+                Text("原始列表是眼镜固件里的全部设置项，许多只对其他型号有效，名称多为原厂英文。")
+            }
+        }
+        .navigationTitle("眼镜设置")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } }
+        }
+        .task(id: g.canUseGlasses) {
+            if g.canUseGlasses, g.settingsReadAt == nil, !g.settingsLoading, !g.busy { g.loadSettings() }
+        }
+    }
+
+    @ViewBuilder
+    private var statusSection: some View {
+        Section {
+            if !g.canUseGlasses {
+                Label("连接眼镜并验证主人身份后才能读取和修改。", systemImage: "eyeglasses")
+                    .foregroundStyle(.secondary)
+            } else if g.settingsReadAt == nil {
+                HStack(spacing: 10) {
+                    if g.settingsLoading { ProgressView() }
+                    Text(g.settingsLoading ? "正在从眼镜读取设置…" : (g.settingsMessage ?? "还没有读取眼镜设置。"))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if !g.settingsLoading {
+                        Button("读取") { g.loadSettings() }.disabled(g.busy)
+                    }
+                }
+            } else if let message = g.settingsMessage {
+                Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+            }
+        } footer: {
+            Text("这里只列出 Ray-Ban Meta 第二代上确实存在、能从手机修改的设置。改动会写入眼镜，再读回确认后才算生效。标「默认」的项表示眼镜里没有单独保存过，显示的是出厂默认值。")
+        }
+    }
+
+    @ViewBuilder
+    private func row(_ item: CuratedSetting) -> some View {
+        let current = g.settingValue(item.key)
+        let writing = g.settingsWriting == item.key
+        VStack(alignment: .leading, spacing: 4) {
+            switch item.control {
+            case .toggle:
+                Toggle(isOn: Binding(
+                    get: { current.value.flatMap(SettingsSchemaTable.boolValue) ?? false },
+                    set: { g.writeSetting(item.key, $0 ? "true" : "false") }
+                )) {
+                    title(item, isDefault: current.isDefault, writing: writing)
+                }
+            case .choice(let options):
+                Menu {
+                    ForEach(options) { option in
+                        Button(option.label) { g.writeSetting(item.key, option.value) }
+                    }
+                } label: {
+                    HStack {
+                        title(item, isDefault: current.isDefault, writing: writing)
+                        Spacer(minLength: 8)
+                        Text(CuratedSettings.label(item, current.value)).foregroundStyle(.secondary)
+                        Image(systemName: "chevron.up.chevron.down").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .foregroundStyle(.primary)
+            case .percent(let minimum, let maximum):
+                let stored = current.value.flatMap { Double($0) } ?? minimum
+                let shown = percentDrafts[item.key] ?? stored
+                HStack {
+                    title(item, isDefault: current.isDefault, writing: writing)
+                    Spacer()
+                    Text("\(CuratedSettings.percent(shown, minimum, maximum))%").foregroundStyle(.secondary)
+                }
+                Slider(value: Binding(
+                    get: { percentDrafts[item.key] ?? stored },
+                    set: { percentDrafts[item.key] = $0 }
+                ), in: minimum ... maximum, step: 1, onEditingChanged: { editing in
+                    if !editing, let draft = percentDrafts.removeValue(forKey: item.key) {
+                        g.writeSetting(item.key, String(Int(draft.rounded())))
+                    }
+                })
+                .accessibilityLabel(Text(item.title))
+            }
+            Text(item.note).font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func title(_ item: CuratedSetting, isDefault: Bool, writing: Bool) -> some View {
+        HStack(spacing: 6) {
+            Text(item.title)
+            if writing {
+                ProgressView().controlSize(.mini)
+            } else if isDefault {
+                Text("默认")
+                    .font(.caption2)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.15), in: Capsule())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}

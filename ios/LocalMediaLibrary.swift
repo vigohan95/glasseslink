@@ -1,6 +1,58 @@
 import CryptoKit
 import Foundation
 
+/// The names people see: in iPhone Photos, when sharing, and on the viewer. Stored originals keep their
+/// hashed names, so the index of what was already imported does not change.
+enum MediaNaming {
+    static func captureDate(_ timestampNS: Int?) -> Date? {
+        guard let ns = timestampNS, ns > 0 else { return nil }
+        return Date(timeIntervalSince1970: Double(ns) / 1_000_000_000)
+    }
+
+    /// "眼镜照片_2026-11-26_15-57-02": sorts by time in any file list and says what it is.
+    static func baseName(isPhoto: Bool, timestampNS: Int?, fallback: Date = Date(),
+                         timeZone: TimeZone = .current) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let stamp = formatter.string(from: captureDate(timestampNS) ?? fallback)
+        return (isPhoto ? "眼镜照片_" : "眼镜视频_") + stamp
+    }
+
+    static func fileName(isPhoto: Bool, timestampNS: Int?, fileExtension: String,
+                         timeZone: TimeZone = .current) -> String {
+        let ext = fileExtension.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+        let base = baseName(isPhoto: isPhoto, timestampNS: timestampNS, timeZone: timeZone)
+        return ext.isEmpty ? base : base + "." + ext
+    }
+
+    /// The viewer's title: "照片 · 11月26日 15:57:02".
+    static func title(isPhoto: Bool, timestampNS: Int?, timeZone: TimeZone = .current) -> String {
+        let kind = isPhoto ? "照片" : "视频"
+        guard let date = captureDate(timestampNS) else { return kind }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = timeZone
+        let sameYear = Calendar.current.isDate(date, equalTo: Date(), toGranularity: .year)
+        formatter.dateFormat = sameYear ? "M月d日 HH:mm:ss" : "yyyy年M月d日 HH:mm:ss"
+        return "\(kind) · \(formatter.string(from: date))"
+    }
+
+    /// A copy under the readable name for the share sheet; the stored original is left alone.
+    static func shareableCopy(of original: URL, isPhoto: Bool, timestampNS: Int?) throws -> URL {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("share-\(UUID().uuidString)",
+                                                                                   isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let name = fileName(isPhoto: isPhoto, timestampNS: timestampNS, fileExtension: original.pathExtension)
+        let copy = folder.appendingPathComponent(name)
+        try FileManager.default.copyItem(at: original, to: copy)
+        return copy
+    }
+}
+
 enum LocalMediaLibrary {
     struct Item: Codable {
         let capture: Capture

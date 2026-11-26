@@ -16,9 +16,25 @@ enum Drive {
     static let syncMetadata = "sync_metadata"
     static let media = "media"
 
-    /// Where the glasses file every setting Visor knows about.
+    /// The settings namespace the tables name; on the glasses it is scoped by their device UUID.
     static let deviceSettings = "individual_device_settings"
     static let defaultTypes = [kv, syncMetadata, media]
+
+    /// Visor's GlassesSettings reads these four. The first two live under "<device uuid>@", which is why
+    /// reading the bare name found nothing (glasses log 31: "设置：读到 0 项").
+    static let scopedSettingsNamespaces = ["individual_device_settings", "individual_device_sensitive_settings"]
+    static let deviceSettingsNamespaces = ["local_device_settings", "shared_settings_namespace_1"]
+
+    static func settingsNamespaces(deviceUUID: String?) -> [String] {
+        guard let uuid = deviceUUID, !uuid.isEmpty else { return [deviceSettings] + deviceSettingsNamespaces }
+        return scopedSettingsNamespaces.map { "\(uuid)@\($0)" } + deviceSettingsNamespaces
+    }
+
+    /// Where a write of a setting from `base` goes.
+    static func settingsNamespace(_ base: String, deviceUUID: String?) -> String {
+        guard let uuid = deviceUUID, !uuid.isEmpty, scopedSettingsNamespaces.contains(base) else { return base }
+        return "\(uuid)@\(base)"
+    }
 
     private static let typeSyncMessage: UInt64 = 1
     private static let typeChunked: UInt64 = 5

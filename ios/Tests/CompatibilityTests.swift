@@ -7,8 +7,19 @@
 // rejected trust message, which is expensive to debug over Bluetooth.
 
 import AVFoundation
+import CoreImage
+import CryptoKit
 import XCTest
 @testable import GlassesLink
+
+/// What a background handshake ended with, read after the loopback helper has waited for it.
+private final class HandshakeOutcome: @unchecked Sendable {
+    var error: Error?
+}
+
+private final class ResultBox<Value>: @unchecked Sendable {
+    var value: Value?
+}
 
 final class CompatibilityTests: XCTestCase {
     private func hex(_ d: Data) -> String { d.map { String(format: "%02x", $0) }.joined() }
@@ -160,10 +171,15 @@ final class CompatibilityTests: XCTestCase {
         func nextFrame(timeout: TimeInterval) throws -> Data { try recv.open(stream.nextFrame(timeout: timeout)) }
     }
 
-    private func encryptedLoopback(trust: Bool = false) throws -> (Session, EncryptedPeer) {
+    /// `peerKey` is the glasses' handshake key, `identityKey` the key their EnableTrust names (the same
+    /// one unless given). An `outcome` collects the handshake's error instead of failing the test.
+    private func encryptedLoopback(trust: Bool = false, peerKey: UInt8 = 2, identityKey: UInt8? = nil,
+                                   expectedIdentity: Data? = nil,
+                                   outcome: HandshakeOutcome? = nil) throws -> (Session, EncryptedPeer) {
         let (client, stream) = SDUStream.loopbackPair()
         let session = Session(stream: client, owner: OwnerMaterial(scalar: Data(repeating: 1, count: 32)))
-        let owner = OwnerMaterial(scalar: Data(repeating: 2, count: 32))
+        let owner = OwnerMaterial(scalar: Data(repeating: peerKey, count: 32))
+        let identity = identityKey.map { OwnerMaterial(scalar: Data(repeating: $0, count: 32)) } ?? owner
         let challenge = Data(repeating: 3, count: 16)
         let seed = Data(repeating: 4, count: 32)
         let iv = Data(repeating: 5, count: 16)
@@ -175,8 +191,10 @@ final class CompatibilityTests: XCTestCase {
         let ready = expectation(description: "The encrypted setup link opened")
         DispatchQueue.global(qos: .userInitiated).async {
             defer { ready.fulfill() }
-            do { try session.handshake(timeout: 4, trust: trust) }
-            catch { XCTFail("Encrypted test setup failed: \(error)") }
+            do { try session.handshake(timeout: 4, trust: trust, expectedPeerIdentity: expectedIdentity) }
+            catch {
+                if let outcome { outcome.error = error } else { XCTFail("Encrypted test setup failed: \(error)") }
+            }
         }
         defer { wait(for: [ready], timeout: 5) }
 
@@ -207,8 +225,8 @@ final class CompatibilityTests: XCTestCase {
             let proof = try XCTUnwrap(fields[2]?.first as? Data)
             XCTAssertTrue(P256ECDSA.verify(digest: binding, signature: proof, publicKeyXy: phonePublicKey))
             let peerChannel: UInt16 = 0x8008
-            let peerProof = try owner.signRaw(digest: binding)
-            try peer.write(AirShield.trustMessage(channel: peerChannel, ownerPubkey: owner.publicKeyXy,
+            let peerProof = try identity.signRaw(digest: binding)
+            try peer.write(AirShield.trustMessage(channel: peerChannel, ownerPubkey: identity.publicKeyXy,
                                                  signatureRaw: peerProof))
             try peer.write(DataX.status(ownerRequest.channel ^ 0x8000, AirShield.stSuccess))
             let accepted = try DataX.parse(peer.nextFrame(timeout: 4))
@@ -653,5 +671,219 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertTrue(prompt.hasPrefix("Answer in the same language as the question"))
         XCTAssertTrue(prompt.hasSuffix("Question: what is your name"))
         XCTAssertFalse(prompt.contains("请用"))
+    }
+
+    /// glasses log 31: the handshake key was new on every connection, so the Wi-Fi session compared
+    /// against it could never pass. The identity in the glasses' EnableTrust is what stays the same.
+    func testWiFiChecksTheGlassesTrustIdentityNotTheHandshakeKey() throws {
+        let identity = OwnerMaterial(scalar: Data(repeating: 7, count: 32))
+        let digest = Data(SHA256.hash(data: identity.publicKeyXy))
+        let (first, _) = try encryptedLoopback(trust: true, peerKey: 2, identityKey: 7)
+        let (second, _) = try encryptedLoopback(trust: true, peerKey: 3, identityKey: 7)
+        XCTAssertEqual(first.verifiedPeerIdentity, digest)
+        XCTAssertEqual(second.verifiedPeerIdentity, digest)
+
+        let samePair = HandshakeOutcome()
+        let (wifi, _) = try encryptedLoopback(trust: true, peerKey: 4, identityKey: 7,
+                                              expectedIdentity: digest, outcome: samePair)
+        XCTAssertNil(samePair.error)
+        XCTAssertEqual(wifi.verifiedPeerIdentity, digest)
+
+        let otherPair = HandshakeOutcome()
+        let (stranger, _) = try encryptedLoopback(trust: true, peerKey: 5, identityKey: 8,
+                                                  expectedIdentity: digest, outcome: otherPair)
+        XCTAssertEqual(String(describing: try XCTUnwrap(otherPair.error)),
+                       "unexpected: Wi-Fi 会话的眼镜身份与蓝牙会话不一致。")
+        XCTAssertFalse(stranger.hasVerifiedOwner)
+        XCTAssertNil(stranger.verifiedPeerIdentity)
+    }
+
+    func testDeviceInfoNamesTheScopedSettingsStores() throws {
+        let uuid = "0F1E2D3C-4B5A-4967-8896-A5B4C3D2E1F0"
+        let payload = PB.string(1, "Meta/greathammerhead/greathammerhead:14/1/2:user/release-keys")
+            + PB.string(2, "1WMZ") + PB.string(4, uuid) + PB.string(8, "RB Meta")
+        let info = try XCTUnwrap(Session.parsePeerDeviceInfo(payload))
+        XCTAssertEqual(info.deviceUUID, uuid)
+        XCTAssertEqual(info.serial, "1WMZ")
+        XCTAssertEqual(info.model, "RB Meta")
+        XCTAssertNil(Session.parsePeerDeviceInfo(PB.string(2, "1WMZ") + PB.string(4, "not-a-uuid"))?.deviceUUID)
+        XCTAssertNil(Session.parsePeerDeviceInfo(Data()))
+
+        XCTAssertEqual(Drive.settingsNamespaces(deviceUUID: uuid), [
+            "\(uuid)@individual_device_settings", "\(uuid)@individual_device_sensitive_settings",
+            "local_device_settings", "shared_settings_namespace_1",
+        ])
+        XCTAssertEqual(Drive.settingsNamespaces(deviceUUID: nil),
+                       ["individual_device_settings", "local_device_settings", "shared_settings_namespace_1"])
+        XCTAssertEqual(Drive.settingsNamespace("individual_device_settings", deviceUUID: uuid),
+                       "\(uuid)@individual_device_settings")
+        XCTAssertEqual(Drive.settingsNamespace("shared_settings_namespace_1", deviceUUID: uuid),
+                       "shared_settings_namespace_1")
+        XCTAssertEqual(Drive.settingsNamespace("individual_device_settings", deviceUUID: nil),
+                       "individual_device_settings")
+        XCTAssertEqual(Glasses.storeLabel("\(uuid)@individual_device_settings"), "individual_device_settings")
+    }
+
+    func testDeviceInfoIsAskedOnSvc100AndReadFromItsMirror() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let uuid = "0F1E2D3C-4B5A-4967-8896-A5B4C3D2E1F0"
+        let result = ResultBox<Session.PeerDeviceInfo>()
+        let answered = expectation(description: "svc100 answered")
+        DispatchQueue.global(qos: .userInitiated).async {
+            result.value = try? session.requestPeerDeviceInfo(timeout: 3)
+            answered.fulfill()
+        }
+        let ask = try DataX.parse(peer.nextFrame(timeout: 2))
+        XCTAssertEqual(ask.service, Session.svcPeerBuildInfo)
+        XCTAssertEqual(ask.type, Int(Session.mtPeerGetInfo))
+        XCTAssertTrue(ask.payload.isEmpty)
+        try peer.write(DataX.message(ask.channel ^ 0x8000,
+                                     tags: [DataX.tag(2, UInt16(Session.mtPeerDeviceInfo), last: true)],
+                                     payload: PB.string(2, "1WMZ") + PB.string(4, uuid)))
+        wait(for: [answered], timeout: 4)
+        XCTAssertEqual(result.value?.deviceUUID, uuid)
+        // Asked once per session: the second call answers from memory without another frame.
+        XCTAssertEqual(try session.requestPeerDeviceInfo(timeout: 0.2)?.deviceUUID, uuid)
+        XCTAssertThrowsError(try peer.nextFrame(timeout: 0.2))
+    }
+
+    private func nextPhoneMessage(_ peer: EncryptedPeer, type: Int, timeout: TimeInterval = 4) throws -> DataX.Message {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            let message = try DataX.parse(peer.nextFrame(timeout: max(0.05, deadline.timeIntervalSinceNow)))
+            if message.type == type { return message }
+        }
+    }
+
+    /// glasses log 31, 15:57:02: Hey Meta during a Bluetooth import. The import held the link and the
+    /// assistant only parked, so the glasses resent their envelope every second and the question died.
+    func testPausedAssistantStillAnswersWhatTheOtherReaderParks() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let assistant = Assistant(session: session)
+        let registered = expectation(description: "assistant registered")
+        DispatchQueue.global(qos: .userInitiated).async {
+            do { try assistant.register(timeout: 4) } catch { XCTFail("registration failed: \(error)") }
+            registered.fulfill()
+        }
+        let messages = try nextPhoneMessage(peer, type: Int(Assistant.MT.initMessageRequest))
+        try peer.write(DataX.message(messages.channel ^ 0x8000,
+                                     tags: [DataX.tag(2, UInt16(Assistant.MT.initMessageResponse), last: true)],
+                                     payload: PB.uint(1, 5)))
+        let stream = try nextPhoneMessage(peer, type: Int(Assistant.MT.initStreamRequest))
+        try peer.write(DataX.message(stream.channel ^ 0x8000,
+                                     tags: [DataX.tag(2, UInt16(Assistant.MT.initStreamResponse), last: true)],
+                                     payload: PB.uint(1, 5)))
+        wait(for: [registered], timeout: 6)
+        XCTAssertTrue(assistant.registered)
+
+        assistant.startLoop()
+        defer { assistant.stop() }
+        XCTAssertTrue(assistant.pauseReading(timeout: 3))
+        try peer.write(DataX.message(messages.channel ^ 0x8000,
+                                     tags: [DataX.tag(2, UInt16(Assistant.MT.envelope), last: true)],
+                                     payload: PB.uint(1, 42)))
+        try peer.write(DataX.message(0x8040, tags: [DataX.tag(2, 1, last: true)], payload: Data([9])))
+        // The import's own read: it gets its message and parks the assistant's on the way.
+        XCTAssertEqual(try session.nextMessage(timeout: 2).channel, 0x8040)
+        let ack = try nextPhoneMessage(peer, type: Int(Assistant.MT.envelopeAck), timeout: 3)
+        XCTAssertEqual(ack.channel, messages.channel)
+        XCTAssertEqual(try PB.parse(ack.payload)[1]?.first as? Int, 42)
+        assistant.resumeReading()
+    }
+
+    func testParkedAssistantMessagesWaitUntilSomeoneReadsTheLink() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        session.routeToAssistant([0x0005, 0x8005], quiet: [0x0006, 0x8006])
+        try peer.write(DataX.message(0x8005, tags: [DataX.tag(2, 1010, last: true)], payload: Data([1])))
+        try peer.write(DataX.message(0x8003, tags: [DataX.tag(2, 1001, last: true)], payload: Data([2])))
+        XCTAssertNil(session.takeParkedAssistantMessage())
+        XCTAssertEqual(try session.nextMessage(timeout: 1).channel, 0x8003)
+        XCTAssertEqual(session.takeParkedAssistantMessage()?.payload, Data([1]))
+        XCTAssertNil(session.takeParkedAssistantMessage())
+    }
+
+    func testSettingsReadBackComparesValuesNotSpellings() {
+        XCTAssertTrue(SettingsSchemaTable.same(kind: "bool", "1", "true"))
+        XCTAssertTrue(SettingsSchemaTable.same(kind: "bool", "false", "0"))
+        XCTAssertTrue(SettingsSchemaTable.same(kind: "int", "90", "90.0"))
+        XCTAssertFalse(SettingsSchemaTable.same(kind: "int", "90", "91"))
+        XCTAssertFalse(SettingsSchemaTable.same(kind: "bool", nil, "true"))
+        XCTAssertTrue(SettingsSchemaTable.same(kind: "str", "what is the weather", "what is the weather"))
+    }
+
+    /// The settings page lists only what Ray-Ban Meta (Gen 2) has and the phone can write, all in Chinese.
+    func testCuratedSettingsAreRealWritableGen2SettingsInChinese() throws {
+        let resources = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Resources")
+        let catalogue = SettingsCatalog.decode(try Data(contentsOf: resources.appendingPathComponent("settings_ui.json")))
+        let schema = SettingsSchemaTable.parse(try String(contentsOf: resources.appendingPathComponent("settings.tsv"),
+                                                          encoding: .utf8))
+        XCTAssertGreaterThan(catalogue.count, 300)
+        let items = CuratedSettings.all
+        XCTAssertGreaterThan(items.count, 20)
+        XCTAssertEqual(Set(items.map(\.key)).count, items.count)
+        for item in items {
+            let info = try XCTUnwrap(catalogue.first { $0.key == item.key }, item.key)
+            let row = try XCTUnwrap(schema[item.key], item.key)
+            XCTAssertTrue(info.offeredOnGen2, item.key)
+            XCTAssertTrue(row.writable, item.key)
+            XCTAssertNotNil(item.title.range(of: "\\p{Han}", options: .regularExpression), item.key)
+            XCTAssertNotNil(item.note.range(of: "\\p{Han}", options: .regularExpression), item.key)
+            switch item.control {
+            case .toggle:
+                XCTAssertEqual(info.control.type, "toggle", item.key)
+                XCTAssertEqual(row.kind, "bool", item.key)
+            case .choice(let options):
+                let known = Set((info.control.options ?? []).map(\.value))
+                for option in options {
+                    XCTAssertTrue(known.contains(option.value), "\(item.key)=\(option.value)")
+                    XCTAssertFalse(option.label.isEmpty)
+                }
+            case .percent(let minimum, let maximum):
+                XCTAssertEqual(info.control.min, minimum, item.key)
+                XCTAssertEqual(info.control.max, maximum, item.key)
+            }
+        }
+        XCTAssertEqual(CuratedSettings.percent(55, 55, 127), 0)
+        XCTAssertEqual(CuratedSettings.percent(127, 55, 127), 100)
+        XCTAssertFalse(catalogue.first { $0.key == "captouch_enabled" }?.offeredOnGen2 ?? true)
+    }
+
+    func testAlbumNamesSayWhatAndWhen() throws {
+        let utc = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        let ns = 1_764_172_622_000_000_000   // 2025-11-26 15:57:02 UTC
+        XCTAssertEqual(MediaNaming.fileName(isPhoto: true, timestampNS: ns, fileExtension: "HEIC", timeZone: utc),
+                       "眼镜照片_2025-11-26_15-57-02.heic")
+        XCTAssertEqual(MediaNaming.fileName(isPhoto: false, timestampNS: ns, fileExtension: ".mp4", timeZone: utc),
+                       "眼镜视频_2025-11-26_15-57-02.mp4")
+        XCTAssertTrue(MediaNaming.title(isPhoto: true, timestampNS: ns, timeZone: utc).hasPrefix("照片 · "))
+        XCTAssertTrue(MediaNaming.title(isPhoto: false, timestampNS: ns, timeZone: utc).hasSuffix("15:57:02"))
+        XCTAssertEqual(MediaNaming.title(isPhoto: false, timestampNS: nil), "视频")
+        XCTAssertNil(MediaNaming.captureDate(0))
+    }
+
+    func testPhotoLevelingOnlyFixesAModestTilt() {
+        XCTAssertFalse(PhotoLeveling.shouldLevel(degrees: 0.3))
+        XCTAssertTrue(PhotoLeveling.shouldLevel(degrees: -4))
+        XCTAssertTrue(PhotoLeveling.shouldLevel(degrees: 11.5))
+        XCTAssertFalse(PhotoLeveling.shouldLevel(degrees: 30))
+    }
+
+    /// The correction rotates by the opposite of Vision's angle, so the sign convention has to hold:
+    /// a horizon rising to the right reads as a positive (counter-clockwise) angle.
+    func testHorizonRisingToTheRightReadsAsAPositiveAngle() throws {
+        let frame = CGRect(x: 0, y: 0, width: 1200, height: 900)
+        let sky = CIImage(color: CIColor(red: 0.55, green: 0.75, blue: 0.95)).cropped(to: frame)
+        let tilt = 6.0 * Double.pi / 180
+        let ground = CIImage(color: CIColor(red: 0.25, green: 0.2, blue: 0.1))
+            .cropped(to: CGRect(x: -3000, y: -3000, width: 6000, height: 3000))
+            .transformed(by: CGAffineTransform(rotationAngle: CGFloat(tilt)))
+            .transformed(by: CGAffineTransform(translationX: frame.midX, y: frame.midY))
+        let scene = ground.composited(over: sky).cropped(to: frame)
+        guard let angle = PhotoLeveling.horizonAngle(of: scene) else {
+            throw XCTSkip("Vision found no horizon in the synthetic scene here")
+        }
+        XCTAssertGreaterThan(angle, 0)
+        XCTAssertEqual(angle * 180 / Double.pi, 6, accuracy: 2.5)
     }
 }

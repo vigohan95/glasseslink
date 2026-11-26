@@ -383,7 +383,11 @@ final class Session {
     private var recv: Direction?
     private var ownerTrustCompleted = false
     var hasVerifiedOwner: Bool { ownerTrustCompleted }
-    var verifiedPeerKey: Data? { ownerTrustCompleted ? peerPubkey : nil }
+    /// SHA-256 of the glasses' identity key, field 1 of their own EnableTrust. The handshake key is new on
+    /// every connection (glasses log 31: ten sessions, ten keys), so only this can tell that a Wi-Fi
+    /// session and a Bluetooth one reach the same pair. It was the same in all 28 logged sessions.
+    private var peerIdentityDigest: Data?
+    var verifiedPeerIdentity: Data? { ownerTrustCompleted ? peerIdentityDigest : nil }
     /// Plausible receive-direction keys, built at handshake time and resolved by the
     /// first inbound frame (see `recvMessage`).
     private var rxOptions: [RxCandidate] = []
@@ -396,6 +400,7 @@ final class Session {
     /// Channels the registered assistant reads. Other readers park these messages here instead of
     /// dropping them, so a photo or an import no longer has to end the Hey Meta registration.
     private var assistantChannels: Set<UInt16> = []
+    private var assistantQuietChannels: Set<UInt16> = []
     private var assistantBacklog: [DataX.Message] = []
     private static let assistantBacklogLimit = 512
     /// Separate from receiveLock, which a reader holds while it waits for a frame: stopping the
@@ -413,8 +418,10 @@ final class Session {
     private var idFirst = true
     private var statusSubscribed = false
     private var settingsFirst = true
-    private var peerPubkey = Data()
     private var binding = Data()
+    /// Guards the channel tables below and `serviceChannels`: the assistant answers its parked messages
+    /// on its own thread while an import or a status read holds the link.
+    private let channelLock = NSLock()
     var streamUUID = Data.uuid4()
     var linkUUID = Data.uuid4()
     var peerSerial = ""
@@ -574,8 +581,8 @@ final class Session {
             consumed += msg.consumed
             let bulk = bulkChannels.contains(msg.channel) && msg.error == nil
                 && (msg.type == nil || msg.type == Int(Self.airData))
-            if !bulk {
-                let atc = serviceChannels[MediaWiFiProtocol.channelName]
+            if !bulk, !isQuietAssistantFrame(msg) {
+                let atc = knownServiceChannel(MediaWiFiProtocol.channelName)
                 let sensitive = msg.service == Int(Assistant.service) || msg.service == 10
                     || atc.map { msg.channel == $0 || msg.channel == ($0 ^ 0x8000) } == true
                 emit("ch=0x\(String(msg.channel, radix: 16)) svc=\(msg.service.map(String.init) ?? "-") type=\(msg.type.map { String($0) } ?? "-")",
@@ -589,10 +596,12 @@ final class Session {
     }
 
     /// Routes the assistant's channels (both directions) to its own reader; an empty set ends the routing.
-    func routeToAssistant(_ channels: Set<UInt16>) {
+    /// Untyped frames on `quiet` (the microphone stream, hundreds per question) stay out of the log.
+    func routeToAssistant(_ channels: Set<UInt16>, quiet: Set<UInt16> = []) {
         assistantRouteLock.lock()
         defer { assistantRouteLock.unlock() }
         assistantChannels = channels
+        assistantQuietChannels = channels.isEmpty ? [] : quiet
         if channels.isEmpty { assistantBacklog.removeAll() }
     }
 
@@ -600,6 +609,17 @@ final class Session {
         assistantRouteLock.lock()
         defer { assistantRouteLock.unlock() }
         return assistantBacklog.isEmpty ? nil : assistantBacklog.removeFirst()
+    }
+
+    /// The assistant's messages another reader kept for it. Never touches the link, so the assistant can
+    /// answer them while an import holds the link (glasses log 31, 15:57:02: Hey Meta during a transfer).
+    func takeParkedAssistantMessage() -> DataX.Message? { takeAssistantBacklog() }
+
+    private func isQuietAssistantFrame(_ msg: DataX.Message) -> Bool {
+        guard msg.type == nil, msg.service == nil, msg.error == nil else { return false }
+        assistantRouteLock.lock()
+        defer { assistantRouteLock.unlock() }
+        return assistantQuietChannels.contains(msg.channel)
     }
 
     /// True when the message belongs to the assistant and was kept for its reader.
@@ -656,6 +676,13 @@ final class Session {
     }
 
     private func allocChannel(_ name: String) -> UInt16 {
+        channelLock.lock()
+        defer { channelLock.unlock() }
+        return allocChannelLocked(name)
+    }
+
+    /// Caller holds channelLock.
+    private func allocChannelLocked(_ name: String) -> UInt16 {
         let ch = nextChannel
         nextChannel &+= 1
         channels[ch] = name
@@ -663,7 +690,9 @@ final class Session {
     }
 
     private func channel(named name: String) -> UInt16? {
-        channels.first { $0.value == name }?.key
+        channelLock.lock()
+        defer { channelLock.unlock() }
+        return channels.first { $0.value == name }?.key
     }
 
     // MARK: handshake
@@ -674,8 +703,9 @@ final class Session {
     static let missingPeerEncryptionRequest = "no RequestEncryption from the glasses"
 
     func handshake(timeout: TimeInterval = 12, trust: Bool = true, quickStart: Bool = false,
-                   expectedPeerKey: Data? = nil) throws {
+                   expectedPeerIdentity: Data? = nil) throws {
         ownerTrustCompleted = false
+        peerIdentityDigest = nil
         let pub = owner.publicKeyXy
         let challenge = Data.random(16)
         let seed = Data.random(32)
@@ -750,9 +780,6 @@ final class Session {
         guard let req = peerRequest else {
             throw LinkError.unexpected(Self.missingPeerEncryptionRequest)
         }
-        if let expectedPeerKey, expectedPeerKey != req.pub {
-            throw LinkError.unexpected("Wi-Fi 会话的眼镜身份与蓝牙会话不一致。")
-        }
         let en = peerEnable
         emit("peer version=\(req.version) quirks req=\(req.quirks) enable=\(en == nil ? "absent" : "\(en!.quirks)")")
 
@@ -801,7 +828,6 @@ final class Session {
         emit("rx candidates: \(rxOptions.count)")
         // The MAC proves the key but not the IV; keep the IVs worth trying for the first frame.
         rxIVs = Self.uniqueIVs([peerEnable?.iv ?? Data(), iv, Data(repeating: 0, count: 16)])
-        peerPubkey = req.pub
         binding = AirShield.channelBinding(glassesChallenge: req.challenge, glassesPubkey: req.pub,
                                            seed: seed, phonePubkey: pub)
         emit("keys up — encrypted from here")
@@ -823,8 +849,18 @@ final class Session {
         }
         if trust {
             try doTrust(timeout: timeout)
+            if let expectedPeerIdentity, peerIdentityDigest != expectedPeerIdentity {
+                throw LinkError.unexpected("Wi-Fi 会话的眼镜身份与蓝牙会话不一致。")
+            }
             ownerTrustCompleted = true
         }
+    }
+
+    /// Field 1 of the glasses' EnableTrust: the SHA-256 of their identity key (docs/REFERENCE/03-services.md).
+    static func peerTrustIdentity(_ message: DataX.Message) -> Data? {
+        guard let fields = try? PB.parse(message.payload),
+              let digest = fields[1]?.first as? Data, digest.count == 32 else { return nil }
+        return digest
     }
 
     static func peerTrustReplyChannel(_ message: DataX.Message) -> UInt16? {
@@ -862,6 +898,7 @@ final class Session {
                 }
                 receivedAcceptance = true
             } else if let replyChannel = Self.peerTrustReplyChannel(message) {
+                peerIdentityDigest = Self.peerTrustIdentity(message) ?? peerIdentityDigest
                 // Acknowledge the peer's message independently of the result of our signed request.
                 try sendStatus(replyChannel, AirShield.stSuccess)
                 acknowledgedPeer = true
@@ -908,20 +945,31 @@ final class Session {
     private var serviceChannels: [String: UInt16] = [:]
 
     func serviceChannel(_ name: String, service: Int) -> UInt16 {
+        channelLock.lock()
+        defer { channelLock.unlock() }
         if let ch = serviceChannels[name] { return ch }
-        let ch = allocChannel(name)
+        let ch = allocChannelLocked(name)
         serviceChannels[name] = ch
         return ch
+    }
+
+    /// The channel of a service opened earlier, without opening one.
+    private func knownServiceChannel(_ name: String) -> UInt16? {
+        channelLock.lock()
+        defer { channelLock.unlock() }
+        return serviceChannels[name]
     }
 
     /// Fire-and-forget on a named service: no waiting, so a push-heavy stream can keep sending.
     func sendOnService(_ name: String, service: Int, type: UInt16, payload: Data = Data(),
                        tracePayload: Bool = true) throws {
         let ch = serviceChannel(name, service: service)
+        channelLock.lock()
+        let namesService = servicesNamed.insert(ch).inserted
+        channelLock.unlock()
         var tags: [Data] = []
-        if !servicesNamed.contains(ch) {
+        if namesService {
             tags.append(DataX.tag(1, UInt16(service), last: false))
-            servicesNamed.insert(ch)
         }
         tags.append(DataX.tag(2, type, last: true))
         try sendAny(DataX.message(ch, tags: tags, payload: payload),
@@ -1344,7 +1392,7 @@ final class Session {
     /// the capture channel was open, was skipped, and 6 requested files never came). Answer each offer as
     /// soon as the owner link is trusted; a later request queues the asset again.
     private func rejectUnrequestedAirshipOffer(_ message: DataX.Message) throws -> Bool {
-        guard ownerTrustCompleted || serviceChannels["captures"] != nil, let offer = try Self.airshipOffer(message) else { return false }
+        guard ownerTrustCompleted || knownServiceChannel("captures") != nil, let offer = try Self.airshipOffer(message) else { return false }
         // Drop answers this queue entry. Deleting a capture is a separate svc18 command.
         try sendAirshipReply(Self.airDrop, on: offer.mirror, payload: PB.bytes(1, offer.id))
         emit("media: declined an unrequested Airship offer")
@@ -1369,7 +1417,7 @@ final class Session {
         var pending = expectedAssetIDs
         var active: [UInt16: StagedReception] = [:]
         var airshipChannels: Set<UInt16> = []
-        let capturesMirror = serviceChannels["captures"].map { $0 ^ 0x8000 }
+        let capturesMirror = knownServiceChannel("captures").map { $0 ^ 0x8000 }
         let started = ProcessInfo.processInfo.systemUptime
         let maximumDeadline = maximumDuration.map { started + $0 } ?? .infinity
         var idleDeadline = started + timeout
@@ -1517,7 +1565,7 @@ final class Session {
         }
         let wantedID = expectedAsset.map { asset in withUnsafeBytes(of: asset.uuid) { Data($0) } }
         requestedCaptureAsset = nil
-        let capturesMirror = serviceChannels["captures"].map { $0 ^ 0x8000 }
+        let capturesMirror = knownServiceChannel("captures").map { $0 ^ 0x8000 }
         var accepted: AirshipOffer?
         var lastType: Int?
         var buf = Data()
@@ -1619,6 +1667,101 @@ final class Session {
             b = (b + a) % 65521
         }
         return (b << 16) | a
+    }
+
+    // MARK: svc100 peer build info
+
+    /// What the glasses say about themselves on svc100 (Visor's DeviceInfo.kt).
+    struct PeerDeviceInfo: Equatable {
+        let build: String
+        let serial: String
+        /// Names their settings stores; nil when the answer did not carry a UUID-shaped value.
+        let deviceUUID: String?
+        let model: String
+    }
+
+    static let svcPeerBuildInfo = 100
+    static let mtPeerGetInfo: UInt16 = 1
+    static let mtPeerDeviceInfo = 3
+    private(set) var peerDeviceInfo: PeerDeviceInfo?
+    private var peerDeviceInfoAsked = false
+
+    /// {1 build, 2 serial, 4 device UUID, 8 model}; nil when it names nothing.
+    static func parsePeerDeviceInfo(_ payload: Data) -> PeerDeviceInfo? {
+        guard let fields = try? PB.parse(payload) else { return nil }
+        func text(_ field: Int) -> String {
+            (fields[field]?.first as? Data).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        }
+        let uuid = text(4)
+        let shaped = uuid.count == 36 && UUID(uuidString: uuid) != nil
+        let info = PeerDeviceInfo(build: text(1), serial: text(2), deviceUUID: shaped ? uuid : nil, model: text(8))
+        return info.build.isEmpty && info.serial.isEmpty && info.deviceUUID == nil ? nil : info
+    }
+
+    /// svc100 GET_INFO, an empty ask; the glasses answer with type 3 on the mirror channel. Asked once per
+    /// session. Nil when they do not answer, which leaves the settings read on the unscoped store.
+    func requestPeerDeviceInfo(timeout: TimeInterval = 3) throws -> PeerDeviceInfo? {
+        if let peerDeviceInfo { return peerDeviceInfo }
+        // Glasses that do not answer once will not answer the next write either; do not wait again.
+        guard !peerDeviceInfoAsked else { return nil }
+        peerDeviceInfoAsked = true
+        let name = "peer-build-info"
+        let ch = serviceChannel(name, service: Self.svcPeerBuildInfo)
+        try sendOnService(name, service: Self.svcPeerBuildInfo, type: Self.mtPeerGetInfo)
+        var lastType: Int?
+        let deadline = Date().addingTimeInterval(timeout)
+        while deadline.timeIntervalSinceNow > 0 {
+            let message: DataX.Message
+            do { message = try recvMessage(timeout: deadline.timeIntervalSinceNow) }
+            catch LinkError.unexpected(_) { break }
+            guard message.channel == ch || message.channel == (ch ^ 0x8000) else { continue }
+            if let code = message.error {
+                if code != Int(AirShield.stOK), code != Int(AirShield.stSuccess) { break }
+                continue
+            }
+            if let type = message.type { lastType = type }
+            guard lastType == Self.mtPeerDeviceInfo, let info = Self.parsePeerDeviceInfo(message.payload) else { continue }
+            peerDeviceInfo = info
+            emit("device info: model=\(info.model.isEmpty ? "-" : info.model) build=\(info.build.isEmpty ? "-" : info.build) uuid=\(info.deviceUUID == nil ? "none" : "yes")")
+            return info
+        }
+        emit("device info: no answer on svc100")
+        return nil
+    }
+
+    /// Every stored setting across the stores the Meta app keeps. A store that does not answer is skipped;
+    /// the read fails only when none of them answers, or when the link itself breaks.
+    func readSettingsStores(deviceUUID: String?, timeout: TimeInterval = 5) throws
+        -> (values: [String: String], counts: [String: Int]) {
+        var values: [String: String] = [:]
+        var counts: [String: Int] = [:]
+        var firstFailure: Error?
+        for namespace in Drive.settingsNamespaces(deviceUUID: deviceUUID) {
+            do {
+                let objects = try driveObjects(namespace: namespace, timeout: timeout)
+                var stored = 0
+                for object in objects where object.type == Drive.kv && !object.deleted {
+                    values[object.uri] = object.data
+                    stored += 1
+                }
+                counts[namespace] = stored
+            } catch LinkError.unexpected(let reason) {
+                firstFailure = firstFailure ?? LinkError.unexpected(reason)
+            } catch LinkError.serviceError(let operation, let code) {
+                firstFailure = firstFailure ?? LinkError.serviceError(operation, code)
+            }
+        }
+        if counts.isEmpty, let firstFailure { throw firstFailure }
+        return (values, counts)
+    }
+
+    /// Gives the firmware a moment to apply an svc31 write before the stores are read back, reading the
+    /// link meanwhile so the assistant's messages are parked and nothing else piles up.
+    func settle(for seconds: TimeInterval) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while deadline.timeIntervalSinceNow > 0 {
+            do { _ = try recvMessage(timeout: deadline.timeIntervalSinceNow) } catch { break }
+        }
     }
 
     // MARK: svc33 RLDrive — the settings store

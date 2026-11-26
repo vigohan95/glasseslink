@@ -300,7 +300,7 @@ final class Assistant: @unchecked Sendable {
         }
         running = true
         stateLock.unlock()
-        session.routeToAssistant([m0, m0 ^ 0x8000, s0, s0 ^ 0x8000])
+        session.routeToAssistant([m0, m0 ^ 0x8000, s0, s0 ^ 0x8000], quiet: [s0, s0 ^ 0x8000])
         pauseCondition.lock()
         readerActive = true
         pauseCondition.unlock()
@@ -343,16 +343,27 @@ final class Assistant: @unchecked Sendable {
         pauseCondition.unlock()
     }
 
-    private func parkWhilePaused() {
+    /// True while another reader owns the link. The reader then stays off the link but keeps answering
+    /// what that reader parks for it: glasses log 31 had Hey Meta (15:57:02, 15:58:04) during a
+    /// five-minute Bluetooth import, and the glasses resent their unacknowledged envelope every second.
+    private func pausedByOtherReader() -> Bool {
         pauseCondition.lock()
         defer { pauseCondition.unlock() }
-        guard pauseRequests > 0 else { return }
-        readerParked = true
-        pauseCondition.broadcast()
-        while pauseRequests > 0 && registered {
-            _ = pauseCondition.wait(until: Date().addingTimeInterval(1))
+        guard pauseRequests > 0 else {
+            readerParked = false
+            return false
         }
-        readerParked = false
+        if !readerParked {
+            readerParked = true
+            pauseCondition.broadcast()
+        }
+        return true
+    }
+
+    private func waitWhilePaused() {
+        pauseCondition.lock()
+        if pauseRequests > 0 { _ = pauseCondition.wait(until: Date().addingTimeInterval(0.05)) }
+        pauseCondition.unlock()
     }
 
     private func loop() {
@@ -365,7 +376,15 @@ final class Assistant: @unchecked Sendable {
         }
         do {
             while registered {
-                parkWhilePaused()
+                if pausedByOtherReader() {
+                    if let parked = session.takeParkedAssistantMessage() {
+                        if registered { try handle(parked) }
+                    } else {
+                        waitWhilePaused()
+                    }
+                    try maintainTurn()
+                    continue
+                }
                 guard registered else { return }
                 if let message = try nextIfAvailable(timeout: receiveTimeout), registered {
                     try handle(message)

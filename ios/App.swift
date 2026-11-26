@@ -208,6 +208,11 @@ final class Glasses: NSObject, ObservableObject {
     @Published var modelTestOK = false
     @Published var settings: [String: String] = [:]
     @Published var settingsLoading = false
+    /// Set once the glasses' settings stores were read on this connection; nil means "not read yet",
+    /// which is different from an empty read (glasses that never had a setting changed store nothing).
+    @Published private(set) var settingsReadAt: Date?
+    @Published private(set) var settingsMessage: String?
+    @Published private(set) var settingsWriting: String?
     @Published var status = GlassesState()
     @Published private(set) var statusRefreshing = false
     @Published private(set) var statusMessage: String?
@@ -360,7 +365,7 @@ final class Glasses: NSObject, ObservableObject {
         let key = p.identifier.uuidString
         let name = ScanEntry.usableName(p.name)
         var saved = verifiedPeripheralNames
-        if let peerKey = session?.verifiedPeerKey {
+        if let peerKey = session?.verifiedPeerIdentity {
             let fingerprint = Data(SHA256.hash(data: peerKey)).hex
             var peers = UserDefaults.standard.dictionary(forKey: "verifiedPeripheralPeers") as? [String: String] ?? [:]
             let aliases = peers.filter { $0.key != key && $0.value == fingerprint }.keys.sorted()
@@ -932,8 +937,12 @@ final class Glasses: NSObject, ObservableObject {
         openingL2CAP = false
         ownerRegistrationCompleted = false
         assistantAutoTries = 0
+        videoStabilizationSent = false
         busy = mediaImportID != nil
         settingsLoading = false
+        settingsReadAt = nil
+        settingsWriting = nil
+        settingsMessage = nil
         loadCatalogAfterStatus = false
         statusRefreshPending = false
         statusRefreshing = false
@@ -1510,7 +1519,7 @@ final class Glasses: NSObject, ObservableObject {
         var failure: Error?
         do {
             guard !cancellation.isCancelled else { throw CancellationError() }
-            guard let expectedKey = control.verifiedPeerKey, let peripheralID = peripheral?.identifier,
+            guard let expectedKey = control.verifiedPeerIdentity, let peripheralID = peripheral?.identifier,
                   let country = Locale.current.region?.identifier else {
                 throw LinkError.unexpected("眼镜身份或 iPhone 地区尚未读取。")
             }
@@ -1577,13 +1586,14 @@ final class Glasses: NSObject, ObservableObject {
             guard mediaImportID == job, !cancellation.isCancelled else { transport.close(); throw CancellationError() }
             mediaWiFiTransport = transport
             releaseBluetoothForMediaWiFi()
-            let connection = Session(stream: transport, owner: control.owner)
+            let connection = Session(stream: transport, owner: control.owner,
+                                     log: { [weak self] in self?.note("Wi-Fi \($0)") })
             connection.blockOTA = true
             wifi = connection
             mediaWiFiAuthenticating = true
             transferDetail = "Wi-Fi · 正在验证同一副眼镜"
             try await onGlassesQueue {
-                try connection.handshake(timeout: 10, trust: true, quickStart: true, expectedPeerKey: expectedKey)
+                try connection.handshake(timeout: 10, trust: true, quickStart: true, expectedPeerIdentity: expectedKey)
             }
             guard mediaImportID == job, !cancellation.isCancelled else { throw CancellationError() }
             mediaWiFiAuthenticating = false
@@ -1626,7 +1636,7 @@ final class Glasses: NSObject, ObservableObject {
     private func closeMediaHotspot(using link: Session, job: UUID) async {
         guard let pending = pendingMediaHotspot, pending.job == job else { return }
         guard ContinuousClock.now < pending.deadline else { pendingMediaHotspot = nil; return }
-        guard peripheral?.identifier == pending.peripheralID, link.verifiedPeerKey == pending.peerKey else { return }
+        guard peripheral?.identifier == pending.peripheralID, link.verifiedPeerIdentity == pending.peerKey else { return }
         if (try? await onGlassesQueue { try link.destroyMediaSoftAP() }) != nil,
            pendingMediaHotspot?.job == job { pendingMediaHotspot = nil }
     }
@@ -1755,7 +1765,20 @@ final class Glasses: NSObject, ObservableObject {
     }
 
     private func saveImportedCapture(_ capture: Capture, file: URL) async throws {
-        try await persistCapture(nil, isPhoto: capture.isPhoto, original: file)
+        var source = file
+        var leveled: URL?
+        defer { if let leveled { try? FileManager.default.removeItem(at: leveled) } }
+        if capture.isPhoto, PhotoLeveling.isEnabled {
+            if let result = await Task.detached(priority: .userInitiated, operation: { PhotoLeveling.leveledCopy(of: file) }).value {
+                source = result.url
+                leveled = result.url
+                note(String(format: "照片自动摆正 %.1f°：iPhone 相册存摆正后的版本，App 里保留原件", result.degrees))
+            }
+        }
+        try await persistCapture(nil, isPhoto: capture.isPhoto, original: source,
+                                 name: MediaNaming.fileName(isPhoto: capture.isPhoto, timestampNS: capture.timestampNS,
+                                                            fileExtension: source.pathExtension),
+                                 takenAt: MediaNaming.captureDate(capture.timestampNS))
         importedCaptures[capture.id] = capture
         if let data = try? JSONEncoder().encode(importedCaptures) {
             UserDefaults.standard.set(data, forKey: "importedCaptureRecords")
@@ -1965,7 +1988,10 @@ final class Glasses: NSObject, ObservableObject {
         guard statusRefreshPending, canUseGlasses, let active = session, !busy, !settingsLoading, !mediaImportInProgress,
               live == nil else {
             // Every operation ends here; once nothing else is waiting, put Hey Meta back on the link.
-            if !statusRefreshPending, !loadCatalogAfterStatus, queuedCamera == nil { autoStartAssistantIfWanted() }
+            if !statusRefreshPending, !loadCatalogAfterStatus, queuedCamera == nil {
+                ensureVideoStabilization()
+                autoStartAssistantIfWanted()
+            }
             return
         }
         statusRefreshPending = false
@@ -2043,6 +2069,27 @@ final class Glasses: NSObject, ObservableObject {
     var assistantModelConfigured: Bool {
         ModelClient.baseComponents(modelBaseURL) != nil
             && !modelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Sent once per connection, before Hey Meta registers.
+    private var videoStabilizationSent = false
+
+    /// The Meta app turns two-stage stabilization on at every connect for Gen 2 (Visor's GlassesSettings:
+    /// TWO_STAGE_EIS_PRODUCTS includes 266); off, video is not stabilized and its horizon is not corrected.
+    /// GlassesLink never sent it, which is why clips came out shaky and tilted.
+    private func ensureVideoStabilization() {
+        guard !videoStabilizationSent, canUseGlasses, ownerState == .verified, mediaImportID == nil, !busy,
+              !settingsLoading, live == nil, let sess = session,
+              let schema = SettingsSchemaTable.schema("two_stage_eis"), !schema.viaDrive else { return }
+        videoStabilizationSent = true
+        onGlassesQueueAsync { [weak self] in
+            let sent = (try? sess.writeSettingsField(schema, value: "true")) ?? false
+            DispatchQueue.main.async {
+                guard let self, self.session === sess else { return }
+                self.note(sent ? "视频防抖：已打开两段式防抖（Meta App 每次连接也会这样做）"
+                               : "视频防抖：眼镜没有确认两段式防抖")
+            }
+        }
     }
 
     private func autoStartAssistantIfWanted() {
@@ -2206,9 +2253,11 @@ final class Glasses: NSObject, ObservableObject {
             guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
             self.assistantAnswer = text
             do {
-                try await self.onGlassesQueue {
+                // complete() only writes, so it does not wait for the link queue: an import holds that
+                // queue for minutes, and the glasses give up on the question long before.
+                try await Task.detached(priority: .userInitiated) {
                     try assistant.complete(interaction: interaction, text: text, transcript: question)
-                }
+                }.value
                 guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
                 self.assistantMessage = "模型已回复，已将回答发给眼镜。"
                 self.note("将模型回复发给眼镜")
@@ -2393,15 +2442,21 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
-    private func persistCapture(_ data: Data?, isPhoto: Bool, original: URL? = nil) async throws {
+    /// `name` is what Photos shows and shares the file as (the stored original has a hashed name);
+    /// `takenAt` dates the asset by the capture, so an import days later still sorts where it was taken.
+    private func persistCapture(_ data: Data?, isPhoto: Bool, original: URL? = nil,
+                                name: String? = nil, takenAt: Date? = nil) async throws {
         let authorization = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
         guard authorization == .authorized || authorization == .limited else {
             throw LinkError.io("请允许 GlassesLink 添加到 iPhone 相册。")
         }
         if let original {
             try await PHPhotoLibrary.shared().performChanges {
-                PHAssetCreationRequest.forAsset().addResource(with: isPhoto ? .photo : .video,
-                                                              fileURL: original, options: nil)
+                let request = PHAssetCreationRequest.forAsset()
+                let options = PHAssetResourceCreationOptions()
+                options.originalFilename = name
+                if let takenAt { request.creationDate = takenAt }
+                request.addResource(with: isPhoto ? .photo : .video, fileURL: original, options: options)
             }
         } else if let data, isPhoto {
             try await PHPhotoLibrary.shared().performChanges {
@@ -2670,31 +2725,40 @@ final class Glasses: NSObject, ObservableObject {
 
     // MARK: settings (svc33)
 
-    /// Reads the whole settings namespace once and keeps it keyed by setting name.
+    /// The value in force: what the glasses store, else the firmware default from settings.tsv.
+    func settingValue(_ key: String) -> (value: String?, isDefault: Bool) {
+        if let stored = settings[key] { return (stored, false) }
+        return (SettingsSchemaTable.schema(key)?.defaultValue, true)
+    }
+
+    /// Reads every settings store once (svc100 names the scoped ones) and keeps them keyed by setting name.
     func loadSettings() {
         guard canUseGlasses, let sess = session, !busy, !settingsLoading,
               live == nil else {
             return
         }
         settingsLoading = true
+        settingsMessage = "正在读取眼镜设置…"
         onGlassesQueueAsync { [weak self] in
             do {
-                let objects = try sess.driveObjects()
-                var map: [String: String] = [:]
-                for object in objects where object.type == Drive.kv && !object.deleted {
-                    map[object.uri] = object.data
-                }
+                let info = try? sess.requestPeerDeviceInfo()
+                let read = try sess.readSettingsStores(deviceUUID: info?.deviceUUID)
                 DispatchQueue.main.async {
                     guard let self, self.session === sess else { return }
-                    self.settings = map
+                    self.settings = read.values
+                    self.settingsReadAt = Date()
                     self.settingsLoading = false
-                    self.note("设置：读到 \(map.count) 项")
+                    self.settingsMessage = nil
+                    let stores = read.counts.sorted { $0.key < $1.key }
+                        .map { "\(Self.storeLabel($0.key))=\($0.value)" }.joined(separator: " ")
+                    self.note("设置：读到 \(read.values.count) 项（\(stores)）")
                     self.startPendingStatusRefresh()
                 }
             } catch {
                 DispatchQueue.main.async {
                     guard let self, self.session === sess else { return }
                     self.settingsLoading = false
+                    self.settingsMessage = "读取失败 · \(Glasses.explain(error))"
                     self.reportOperationError(error, session: sess)
                     self.startPendingStatusRefresh()
                 }
@@ -2702,40 +2766,59 @@ final class Glasses: NSObject, ObservableObject {
         }
     }
 
-    /// Writes one setting and only reports success if the read-back agrees.
+    /// The store's own name without the device UUID, for the log.
+    nonisolated static func storeLabel(_ namespace: String) -> String {
+        namespace.split(separator: "@").last.map(String.init) ?? namespace
+    }
+
+    /// Writes one setting and reports success only once a read of the stores shows it. svc31 settings go
+    /// over svc31 first; when the stores still show the old value they are written into RLDrive, as Visor does.
     func writeSetting(_ key: String, _ value: String) {
         guard canUseGlasses, let sess = session, !busy, !settingsLoading,
               live == nil else {
             note("先连接眼镜，再改设置")
             return
         }
-        note("写 \(key) = \(value)")
         let schema = SettingsSchemaTable.schema(key)
+        if let schema, !schema.writable {
+            settingsMessage = "这一项不能从手机修改。"
+            return
+        }
+        note("写设置 \(key) = \(value)")
         settingsLoading = true
+        settingsWriting = key
+        settingsMessage = nil
         onGlassesQueueAsync { [weak self] in
             do {
-                // Firmware-parsed settings go over svc31; the rest live in RLDrive.
-                // Either way the write is only trusted once a read comes back equal.
-                var ok = false
-                if let schema, !schema.viaDrive {
-                    let sent = try sess.writeSettingsField(schema, value: value)
-                    if sent {
-                        // Read-back is only meaningful where RLDrive mirrors the same key.
-                        let after = try sess.driveObjects()
-                        let mirrored = after.first { $0.uri == key }
-                        ok = mirrored?.data == value
-                    }
-                } else {
-                    ok = try sess.driveWrite(key: key, value: value)
+                let uuid = (try? sess.requestPeerDeviceInfo())?.deviceUUID
+                var stores: [String: String]?
+                var accepted = false
+                if let schema, !schema.viaDrive, try sess.writeSettingsField(schema, value: value) {
+                    sess.settle(for: 0.8)
+                    stores = try? sess.readSettingsStores(deviceUUID: uuid).values
+                    accepted = SettingsSchemaTable.same(kind: schema.kind, stores?[key], value)
+                }
+                if !accepted {
+                    let base = schema?.namespace ?? Drive.deviceSettings
+                    _ = try sess.driveWrite(key: key, value: value,
+                                            namespace: Drive.settingsNamespace(base, deviceUUID: uuid))
+                    stores = try? sess.readSettingsStores(deviceUUID: uuid).values
+                    accepted = SettingsSchemaTable.same(kind: schema?.kind, stores?[key], value)
                 }
                 DispatchQueue.main.async {
                     guard let self, self.session === sess else { return }
                     self.settingsLoading = false
-                    if ok {
+                    self.settingsWriting = nil
+                    if let stores {
+                        self.settings = stores
+                        self.settingsReadAt = Date()
+                    }
+                    if accepted {
                         self.settings[key] = value
                         self.note("\(key) 已生效")
                     } else {
-                        self.note("\(key) 写进去了但读回不一致（固件可能拒收）")
+                        self.settingsMessage = "眼镜没有保存这个值，仍是原来的设置。"
+                        self.note("\(key) 写入后读回仍是原值（眼镜未接受）")
                     }
                     self.startPendingStatusRefresh()
                 }
@@ -2743,6 +2826,8 @@ final class Glasses: NSObject, ObservableObject {
                 DispatchQueue.main.async {
                     guard let self, self.session === sess else { return }
                     self.settingsLoading = false
+                    self.settingsWriting = nil
+                    self.settingsMessage = "写入失败 · \(Glasses.explain(error))"
                     self.reportOperationError(error, session: sess)
                     self.startPendingStatusRefresh()
                 }
@@ -3087,7 +3172,7 @@ struct ContentView: View {
                 }
 
                 Section("3.5 · 快捷") {
-                    Button("常用开关（助手 / 提示音 / 画质）") { showQuick = true }
+                    Button("眼镜设置") { showQuick = true }
                         .disabled(!g.connected)
                 }
 
@@ -3118,7 +3203,7 @@ struct ContentView: View {
                         .font(.caption2).foregroundStyle(.secondary)
                 }
 
-                Section("6 · 眼镜设置（\(SettingsCatalog.all.count) 项）") {
+                Section("6 · 原始设置表（\(SettingsCatalog.all.count) 项）") {
                     Button("打开设置") { showSettings = true }
                         .disabled(!g.connected)
                     Text(g.settingsLoading ? "读取中…" : "已读到 \(g.settings.count) 项")
@@ -3170,9 +3255,9 @@ struct ContentView: View {
                              onCancel: { showLogin = false })
             }
             .sheet(item: $g.share) { box in ActivityView(url: box.url) }
-            .sheet(isPresented: $showSettings) { SettingsView(g: g) }
+            .sheet(isPresented: $showSettings) { NavigationStack { SettingsView(g: g) } }
             .sheet(isPresented: $showLive) { LiveView(g: g) }
-            .sheet(isPresented: $showQuick) { NavigationStack { QuickPanel(g: g) } }
+            .sheet(isPresented: $showQuick) { NavigationStack { GlassesSettingsView(g: g) } }
             .sheet(isPresented: $g.showSelfTest) { SelfTestView(g: g) }
             .fileImporter(isPresented: $showImport, allowedContentTypes: [.json, .data]) { result in
                 switch result {

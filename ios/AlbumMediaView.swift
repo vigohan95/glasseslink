@@ -9,6 +9,9 @@ struct AlbumMediaSelection: Identifiable {
     let isPhoto: Bool
     let original: URL?
     let thumbnail: UIImage?
+    var timestampNS: Int?
+
+    var title: String { MediaNaming.title(isPhoto: isPhoto, timestampNS: timestampNS) }
 }
 
 struct AlbumMediaView: View {
@@ -19,6 +22,18 @@ struct AlbumMediaView: View {
     @State private var player: AVPlayer?
     @State private var loadError: String?
     @State private var audioActive = false
+    @State private var share: ShareBox?
+
+    /// Shares a copy named like "眼镜照片_2026-11-26_15-57-02.heic" instead of the stored hash name.
+    private func shareOriginal() {
+        guard let original = media.original else { return }
+        do {
+            share = ShareBox(url: try MediaNaming.shareableCopy(of: original, isPhoto: media.isPhoto,
+                                                                timestampNS: media.timestampNS))
+        } catch {
+            loadError = "无法准备分享的文件。"
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -36,13 +51,20 @@ struct AlbumMediaView: View {
                         .tint(.white)
                 }
             }
-            .navigationTitle(media.isPhoto ? "照片" : "视频")
+            .navigationTitle(media.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("完成") { dismiss() }
                 }
+                ToolbarItem(placement: .topBarTrailing) {
+                    if media.original != nil {
+                        Button { shareOriginal() } label: { Image(systemName: "square.and.arrow.up") }
+                            .accessibilityLabel("分享原件")
+                    }
+                }
             }
+            .sheet(item: $share) { box in ActivityView(url: box.url) }
             .safeAreaInset(edge: .bottom) {
                 if player != nil {
                     HStack {
