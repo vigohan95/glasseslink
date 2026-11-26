@@ -626,6 +626,13 @@ final class Assistant: @unchecked Sendable {
         }
     }
 
+    /// The language the glasses' own voice speaks, from their running locale ("en_US"); English when
+    /// they have not said.
+    var glassesLanguage: String {
+        let code = locale.prefix(2).lowercased()
+        return code.count == 2 ? code : "en"
+    }
+
     private func readLocale(_ payload: Data) {
         let nested = (try? PB.parse(payload))?[1]?.first as? Data
         if let value = String(data: nested ?? payload, encoding: .utf8), value != locale {

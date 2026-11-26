@@ -1813,7 +1813,10 @@ final class Glasses: NSObject, ObservableObject {
     /// cannot speak, and as text for their own voice otherwise (or when the phone's voice is unavailable).
     nonisolated private static func speak(_ text: String, interaction: String, question: String,
                                           assistant: Assistant) async throws {
+        // What the glasses' own voice can read, it reads: it is the voice the wearer knows, and it needs
+        // nothing from the phone. Chinese it cannot, so that is the iPhone's.
         if let tag = HeyMetaLanguage.phoneLocale,
+           !PhoneVoice.languageTag(of: PhoneVoice.speakable(text), preferred: tag).hasPrefix(assistant.glassesLanguage),
            let speech = await PhoneVoice.synthesize(text, localeTag: tag), let packets = OpusCodec.encode(speech.pcm) {
             assistant.log("assistant: speaking with \(speech.voice)")
             try await assistant.complete(interaction: interaction, text: text, transcript: question, speech: packets)
