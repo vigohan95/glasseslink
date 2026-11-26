@@ -869,9 +869,10 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertFalse(PhotoLeveling.shouldLevel(degrees: 30))
     }
 
-    /// The correction rotates by the opposite of Vision's angle, so the sign convention has to hold:
-    /// a horizon rising to the right reads as a positive (counter-clockwise) angle.
-    func testHorizonRisingToTheRightReadsAsAPositiveAngle() throws {
+    /// Vision's sign convention decides whether a photo is straightened or tilted twice as far; the first
+    /// CI run of this test showed the angle comes back as the correction, not the tilt. So check the
+    /// whole round trip: straighten by the detected angle and the horizon must read level afterwards.
+    func testStraighteningByTheDetectedAngleLevelsTheHorizon() throws {
         let frame = CGRect(x: 0, y: 0, width: 1200, height: 900)
         let sky = CIImage(color: CIColor(red: 0.55, green: 0.75, blue: 0.95)).cropped(to: frame)
         let tilt = 6.0 * Double.pi / 180
@@ -880,10 +881,15 @@ final class CompatibilityTests: XCTestCase {
             .transformed(by: CGAffineTransform(rotationAngle: CGFloat(tilt)))
             .transformed(by: CGAffineTransform(translationX: frame.midX, y: frame.midY))
         let scene = ground.composited(over: sky).cropped(to: frame)
-        guard let angle = PhotoLeveling.horizonAngle(of: scene) else {
+        guard let correction = PhotoLeveling.detectedHorizon(of: scene) else {
             throw XCTSkip("Vision found no horizon in the synthetic scene here")
         }
-        XCTAssertGreaterThan(angle, 0)
-        XCTAssertEqual(angle * 180 / Double.pi, 6, accuracy: 2.5)
+        XCTAssertEqual(correction * 180 / Double.pi, -6, accuracy: 2.5)
+        XCTAssertEqual(PhotoLeveling.levelingAngle(of: scene), correction)
+
+        let level = PhotoLeveling.straightened(scene, by: correction)
+        let residual = try XCTUnwrap(PhotoLeveling.detectedHorizon(of: level))
+        XCTAssertLessThan(abs(residual * 180 / Double.pi), 1.5)
+        XCTAssertNil(PhotoLeveling.levelingAngle(of: level))
     }
 }

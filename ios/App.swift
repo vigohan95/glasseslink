@@ -2762,6 +2762,9 @@ final class Glasses: NSObject, ObservableObject {
                     let stores = read.counts.sorted { $0.key < $1.key }
                         .map { "\(Self.storeLabel($0.key))=\($0.value)" }.joined(separator: " ")
                     self.note("设置：读到 \(read.values.count) 项（\(stores)）")
+                    self.note("拍摄相关：" + Self.captureSettingKeys.map { key in
+                        "\(key)=\(read.values[key] ?? "默认 \(SettingsSchemaTable.schema(key)?.defaultValue ?? "?")")"
+                    }.joined(separator: " "))
                     self.startPendingStatusRefresh()
                 }
             } catch {
@@ -2775,6 +2778,13 @@ final class Glasses: NSObject, ObservableObject {
             }
         }
     }
+
+    /// Logged after each read: whether the glasses hand over unprocessed media for the Meta app to finish
+    /// (asset types 3 and 4 are its IMU and frame log), and how video is stabilized.
+    static let captureSettingKeys = [
+        "mps_transfer_unprocessed_video_assets", "mps_transfer_unprocessed_image_assets", "two_stage_eis",
+        "eis_mode", "resolution_and_framerate", "flicker_reduction_mode", "media_auto_leveling_enabled",
+    ]
 
     /// The store's own name without the device UUID, for the log.
     nonisolated static func storeLabel(_ namespace: String) -> String {

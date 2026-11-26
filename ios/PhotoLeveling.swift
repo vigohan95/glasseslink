@@ -21,31 +21,39 @@ enum PhotoLeveling {
         abs(degrees) >= minimumDegrees && abs(degrees) <= maximumDegrees
     }
 
-    /// The tilt Vision sees, in radians, counter-clockwise positive; nil when there is none to fix.
-    static func horizonAngle(of image: CIImage) -> Double? {
+    /// Vision's horizon angle in radians. CI showed it is the rotation that levels the picture, in Core
+    /// Image's counter-clockwise convention: a horizon rising 6° to the right reads as about -6°.
+    static func detectedHorizon(of image: CIImage) -> Double? {
         let request = VNDetectHorizonRequest()
         let handler = VNImageRequestHandler(ciImage: image, options: [:])
         do { try handler.perform([request]) } catch { return nil }
         guard let observation = request.results?.first else { return nil }
-        let angle = Double(observation.angle)
-        return shouldLevel(degrees: angle * 180 / .pi) ? angle : nil
+        return Double(observation.angle)
+    }
+
+    /// The correction to apply, or nil when there is none worth making.
+    static func levelingAngle(of image: CIImage) -> Double? {
+        guard let angle = detectedHorizon(of: image), shouldLevel(degrees: angle * 180 / .pi) else { return nil }
+        return angle
+    }
+
+    /// Rotated by `angle` (Vision's value as it comes), enlarged and cropped back to the original size.
+    static func straightened(_ image: CIImage, by angle: Double) -> CIImage {
+        image.applyingFilter("CIStraightenFilter", parameters: [kCIInputAngleKey: angle]).cropped(to: image.extent)
     }
 
     /// A level HEIC copy at the original size, or nil when the photo is already level (or unreadable).
     static func leveledCopy(of url: URL) -> (url: URL, degrees: Double)? {
         guard let source = CIImage(contentsOf: url, options: [.applyOrientationProperty: true]),
-              let angle = horizonAngle(of: source) else { return nil }
-        let extent = source.extent
-        // Rotating by the opposite angle levels the horizon; the filter enlarges and crops to the original size.
-        let straightened = source.applyingFilter("CIStraightenFilter", parameters: [kCIInputAngleKey: -angle])
-            .cropped(to: extent)
+              let angle = levelingAngle(of: source) else { return nil }
+        let level = straightened(source, by: angle)
         var properties = source.properties
         properties[kCGImagePropertyOrientation as String] = 1
         if var tiff = properties[kCGImagePropertyTIFFDictionary as String] as? [String: Any] {
             tiff[kCGImagePropertyTIFFOrientation as String] = 1
             properties[kCGImagePropertyTIFFDictionary as String] = tiff
         }
-        let image = straightened.settingProperties(properties)
+        let image = level.settingProperties(properties)
         guard let space = source.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
         let output = FileManager.default.temporaryDirectory.appendingPathComponent("level-\(UUID().uuidString).heic")
         let quality = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
