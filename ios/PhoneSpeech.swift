@@ -431,14 +431,40 @@ enum PhoneVoice {
             .sorted { rank($0) > rank($1) }
     }
 
+    /// Mandarin, which the bundled voice speaks; Cantonese it does not.
+    static func mandarin(_ localeTag: String) -> Bool {
+        localeTag == "zh" || localeTag.hasPrefix("zh-CN") || localeTag.hasPrefix("zh-TW") || localeTag.hasPrefix("zh-Hans")
+    }
+
     static func choices(for localeTag: String) -> [Choice] {
-        candidates(for: localeTag).map { Choice(id: $0.identifier, name: label($0)) }
+        var list: [Choice] = []
+        if mandarin(localeTag), NeuralVoice.isAvailable {
+            list = NeuralVoice.offered.map { Choice(id: NeuralVoice.prefix + String($0), name: NeuralVoice.label($0)) }
+        }
+        return list + candidates(for: localeTag).map { Choice(id: $0.identifier, name: label($0)) }
+    }
+
+    /// What "自动" means for the language, for the picker.
+    static func automaticLabel(for localeTag: String) -> String {
+        mandarin(localeTag) && NeuralVoice.isAvailable ? "自动（内置 AI 女声）" : "自动（音质最好的女声）"
     }
 
     /// The voice the user picked for the language; empty for "the best there is", also once it is gone.
     static func chosenIdentifier(for localeTag: String) -> String {
         let stored = UserDefaults.standard.string(forKey: chosenKey(localeTag)) ?? ""
+        if stored.hasPrefix(NeuralVoice.prefix) { return NeuralVoice.isAvailable ? stored : "" }
         return stored.isEmpty || AVSpeechSynthesisVoice(identifier: stored) == nil ? "" : stored
+    }
+
+    /// The bundled voice's speaker for answers in this language, or nil when the iPhone's voice reads them:
+    /// another language than Mandarin, a build without the model, or a system voice picked by hand.
+    static func neuralSpeaker(for localeTag: String) -> Int? {
+        guard mandarin(localeTag), NeuralVoice.isAvailable else { return nil }
+        let stored = chosenIdentifier(for: localeTag)
+        if stored.isEmpty { return NeuralVoice.defaultSpeaker }
+        guard stored.hasPrefix(NeuralVoice.prefix), let speaker = Int(stored.dropFirst(NeuralVoice.prefix.count)),
+              NeuralVoice.speakers.indices.contains(speaker) else { return nil }
+        return speaker
     }
 
     static func choose(_ identifier: String, for localeTag: String) {
@@ -477,7 +503,13 @@ enum PhoneVoice {
                            timeout: TimeInterval = 15) async -> (pcm: AVAudioPCMBuffer, voice: String)? {
         let words = speakable(text)
         guard !words.isEmpty, let target = OpusCodec.pcmFormat(sampleRate: 48_000) else { return nil }
-        let chosen = voice(for: languageTag(of: words, preferred: localeTag))
+        let language = languageTag(of: words, preferred: localeTag)
+        if let speaker = neuralSpeaker(for: language), let made = await NeuralVoice.shared.speak(words, speaker: speaker),
+           let samples = resample(made.samples, from: made.rate, to: target.sampleRate),
+           let out = padded(samples, format: target) {
+            return (out, NeuralVoice.label(speaker))
+        }
+        let chosen = voice(for: language)
         let collector = Collector(target: target)
         let utterance = AVSpeechUtterance(string: words)
         utterance.voice = chosen
@@ -499,17 +531,51 @@ enum PhoneVoice {
         }
         // The synthesiser has to outlive the wait above, or it stops mid-sentence.
         withExtendedLifetime(synthesizer) {}
+        guard !spoken.isEmpty, let out = padded(spoken, format: target) else { return nil }
+        return (out, label(chosen))
+    }
+
+    /// `spoken` with a moment of silence before and the closing silence after, as one buffer.
+    static func padded(_ spoken: [Float], format: AVAudioFormat) -> AVAudioPCMBuffer? {
         guard !spoken.isEmpty else { return nil }
-        let lead = Int(leadingSilence * target.sampleRate)
-        let samples = [Float](repeating: 0, count: lead) + spoken
-            + [Float](repeating: 0, count: Int(trailingSilence * target.sampleRate))
-        guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: AVAudioFrameCount(samples.count)),
+        let samples = [Float](repeating: 0, count: Int(leadingSilence * format.sampleRate)) + spoken
+            + [Float](repeating: 0, count: Int(trailingSilence * format.sampleRate))
+        guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
               let channel = out.floatChannelData?[0] else { return nil }
         samples.withUnsafeBufferPointer { source in
             if let base = source.baseAddress { channel.update(from: base, count: samples.count) }
         }
         out.frameLength = AVAudioFrameCount(samples.count)
-        return (out, label(chosen))
+        return out
+    }
+
+    /// Mono floats from one rate to another, in one pass that also flushes the converter's tail.
+    static func resample(_ samples: [Float], from rate: Double, to target: Double) -> [Float]? {
+        guard !samples.isEmpty, rate > 0, target > 0 else { return nil }
+        if rate == target { return samples }
+        guard let input = OpusCodec.pcmFormat(sampleRate: rate), let output = OpusCodec.pcmFormat(sampleRate: target),
+              let converter = AVAudioConverter(from: input, to: output),
+              let source = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: AVAudioFrameCount(samples.count)),
+              let channel = source.floatChannelData?[0] else { return nil }
+        samples.withUnsafeBufferPointer { buffer in
+            if let base = buffer.baseAddress { channel.update(from: base, count: samples.count) }
+        }
+        source.frameLength = AVAudioFrameCount(samples.count)
+        let capacity = AVAudioFrameCount(Double(samples.count) * target / rate) + 4_096
+        guard let out = AVAudioPCMBuffer(pcmFormat: output, frameCapacity: capacity) else { return nil }
+        var fed = false
+        var failure: NSError?
+        let status = converter.convert(to: out, error: &failure) { _, state in
+            if fed {
+                state.pointee = .endOfStream
+                return nil
+            }
+            fed = true
+            state.pointee = .haveData
+            return source
+        }
+        guard status != .error, out.frameLength > 0, let result = out.floatChannelData?[0] else { return nil }
+        return Array(UnsafeBufferPointer(start: result, count: Int(out.frameLength)))
     }
 
     /// Gathers the synthesiser's buffers, resampled to the target format, and hands them over once.
@@ -604,6 +670,11 @@ enum VisualQuestion {
 @MainActor
 final class PhoneSpeaker: NSObject, AVSpeechSynthesizerDelegate {
     private let synthesizer = AVSpeechSynthesizer()
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+    private var attached = false
+    /// Bumped by every new sentence and by `stop`; a voice that finishes for an older one stays silent.
+    private var generation = 0
 
     override init() {
         super.init()
@@ -615,19 +686,67 @@ final class PhoneSpeaker: NSObject, AVSpeechSynthesizerDelegate {
     func say(_ text: String, preferred localeTag: String) -> String {
         let words = PhoneVoice.speakable(text)
         guard !words.isEmpty else { return "" }
+        stop()
+        let language = PhoneVoice.languageTag(of: words, preferred: localeTag)
+        if let speaker = PhoneVoice.neuralSpeaker(for: language) {
+            let turn = generation
+            Task { [weak self] in
+                let made = await NeuralVoice.shared.speak(words, speaker: speaker)
+                guard let self, self.generation == turn else { return }
+                if let made {
+                    self.play(made.samples, rate: made.rate)
+                } else {
+                    _ = self.speakWithSystem(words, language: language)
+                }
+            }
+            return NeuralVoice.label(speaker)
+        }
+        return speakWithSystem(words, language: language)
+    }
+
+    func stop() {
+        generation += 1
         if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
+        if attached { player.stop() }
+        if engine.isRunning { engine.stop() }
+    }
+
+    private func activate() {
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .voicePrompt, options: [.duckOthers])
         try? session.setActive(true)
-        let voice = PhoneVoice.voice(for: PhoneVoice.languageTag(of: words, preferred: localeTag))
+    }
+
+    private func speakWithSystem(_ words: String, language: String) -> String {
+        activate()
+        let voice = PhoneVoice.voice(for: language)
         let utterance = AVSpeechUtterance(string: words)
         utterance.voice = voice
         synthesizer.speak(utterance)
         return PhoneVoice.label(voice)
     }
 
-    func stop() {
-        if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
+    private func play(_ samples: [Float], rate: Double) {
+        guard let format = OpusCodec.pcmFormat(sampleRate: rate),
+              let buffer = PhoneVoice.padded(samples, format: format) else { return }
+        activate()
+        if !attached {
+            engine.attach(player)
+            attached = true
+        }
+        engine.disconnectNodeOutput(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+        do { try engine.start() } catch { return }
+        let turn = generation
+        player.scheduleBuffer(buffer) { [weak self] in
+            Task { @MainActor in
+                guard let self, self.generation == turn else { return }
+                self.player.stop()
+                self.engine.stop()
+                self.release()
+            }
+        }
+        player.play()
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
@@ -640,7 +759,7 @@ final class PhoneSpeaker: NSObject, AVSpeechSynthesizerDelegate {
 
     /// Hands the audio output back, so music that was turned down comes up again.
     private func release() {
-        guard !synthesizer.isSpeaking else { return }
+        guard !synthesizer.isSpeaking, !engine.isRunning else { return }
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 }

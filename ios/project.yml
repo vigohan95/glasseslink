@@ -5,6 +5,11 @@ options:
     iOS: "17.0"
   createIntermediateGroups: true
 
+packages:
+  SherpaOnnx:
+    url: https://github.com/k2-fsa/sherpa-onnx
+    exactVersion: 2.0.3
+
 targets:
   GlassesLink:
     type: application
@@ -52,13 +57,21 @@ targets:
       - MotionLog.swift
       - OpusCodec.swift
       - PhoneSpeech.swift
+      - NeuralVoice.swift
       - Thrift.swift
       - Assistant.swift
       - SettingsSchema.swift
       - Resources/settings_ui.json
       - Resources/settings.tsv
       - Resources/varm_template.bin
+      # The bundled Chinese voice, fetched by the build (.github/workflows/ios.yml); absent locally.
+      - path: Resources/kokoro
+        type: folder
+        optional: true
       - Assets.xcassets
+    dependencies:
+      - package: SherpaOnnx
+        product: sherpa-onnx
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.local.glasseslink
@@ -74,8 +87,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "1.05"
-        CFBundleVersion: "105"
+        CFBundleShortVersionString: "1.06"
+        CFBundleVersion: "106"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。

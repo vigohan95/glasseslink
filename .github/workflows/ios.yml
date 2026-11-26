@@ -29,6 +29,25 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+      # Kokoro v1.1-zh (int8) for sherpa-onnx: the bundled Chinese voice. Pinned by checksum; only the
+      # files the lexicon voice reads are kept (espeak-ng-data is ignored since sherpa-onnx 2.0).
+      - name: Fetch the bundled voice
+        run: |
+          set -euo pipefail
+          url=https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_1.tar.bz2
+          curl -sSL --retry 3 -o "$RUNNER_TEMP/kokoro.tar.bz2" "$url"
+          echo "259c9c8bc906d6078e4e0570421885dabb68b539c2f970fcbb890a58eeaf3e9c  $RUNNER_TEMP/kokoro.tar.bz2" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/kokoro"
+          tar xjf "$RUNNER_TEMP/kokoro.tar.bz2" -C "$RUNNER_TEMP/kokoro"
+          src=$(dirname "$(find "$RUNNER_TEMP/kokoro" -name model.int8.onnx | head -1)")
+          dst=ios/Resources/kokoro
+          mkdir -p "$dst"
+          for f in model.int8.onnx voices.bin tokens.txt lexicon-us-en.txt lexicon-zh.txt phone-zh.fst date-zh.fst number-zh.fst LICENSE; do
+            cp "$src/$f" "$dst/"
+          done
+          cp -R "$src/dict" "$dst/"
+          du -sh "$dst"
+
       - name: Generate project
         run: cd ios && xcodegen generate
 

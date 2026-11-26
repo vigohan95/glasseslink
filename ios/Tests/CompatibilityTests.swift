@@ -1337,6 +1337,27 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(replies.first?.payload, PB.uint(2, 1))
     }
 
+    /// The bundled voice reads Chinese with numbers and English words in it, and the result goes to the
+    /// glasses' 48 kHz Opus like the iPhone's voice did.
+    func testTheBundledVoiceReadsChinese() async throws {
+        guard NeuralVoice.isAvailable else { throw XCTSkip("this build has no bundled voice model") }
+        XCTAssertEqual(NeuralVoice.speakers.count, 103)
+        XCTAssertEqual(NeuralVoice.speakers[NeuralVoice.defaultSpeaker], "zf_001")
+        XCTAssertEqual(NeuralVoice.offered.count, 12)
+        let made = try XCTUnwrap(await NeuralVoice.shared.speak("你好，今天是 11 月 26 日，我是你的 AI 助手。",
+                                                               speaker: NeuralVoice.defaultSpeaker))
+        XCTAssertEqual(made.rate, 24_000)
+        let seconds = Double(made.samples.count) / made.rate
+        XCTAssertGreaterThan(seconds, 1.5)
+        XCTAssertLessThan(seconds, 12)
+        XCTAssertGreaterThan(made.samples.map(abs).max() ?? 0, 0.05)
+        let upsampled = try XCTUnwrap(PhoneVoice.resample(made.samples, from: made.rate, to: 48_000))
+        XCTAssertEqual(Double(upsampled.count), Double(made.samples.count) * 2, accuracy: 2_400)
+        XCTAssertEqual(PhoneVoice.neuralSpeaker(for: "zh-CN"), NeuralVoice.defaultSpeaker)
+        XCTAssertNil(PhoneVoice.neuralSpeaker(for: "zh-HK"))     // Cantonese is the iPhone's
+        XCTAssertNil(PhoneVoice.neuralSpeaker(for: "en-US"))
+    }
+
     /// Chinese is the phone's to hear and English the glasses': which of the two transcripts is the question.
     func testChineseComesFromThePhoneAndEnglishFromTheGlasses() {
         func asked(_ phone: String, _ glasses: String, _ tag: String = "zh-CN") -> String {

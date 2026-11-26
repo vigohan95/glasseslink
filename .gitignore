@@ -16,3 +16,5 @@ config.json
 *.zip
 .DS_Store
 tools/anthropic.key
+
+ios/Resources/kokoro/

@@ -2391,6 +2391,10 @@ final class Glasses: NSObject, ObservableObject {
         assistantRegistering = true
         a.log = { [weak self] line in self?.note("asst: \(line)") }
         a.useGlassesVoice(settings["assistant_voice_id"])
+        if let tag = HeyMetaLanguage.phoneLocale, PhoneVoice.neuralSpeaker(for: tag) != nil {
+            // Loading the voice takes a second or two; not while a question waits.
+            NeuralVoice.shared.warmUp()
+        }
         a.onTurn = { [weak self, weak a] interaction in
             Task { @MainActor in
                 guard let self, let a, self.assistantRef === a, self.voiceTurn != interaction else { return }

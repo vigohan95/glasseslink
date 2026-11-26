@@ -24,6 +24,14 @@ struct AboutView: View {
                     }
                     Link("Visor 源码", destination: URL(string: "https://github.com/macedonga/visor")!)
                     Link("完整的 AGPL-3.0 文本", destination: URL(string: "https://www.gnu.org/licenses/agpl-3.0.txt")!)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("sherpa-onnx、Kokoro-82M v1.1-zh — Apache-2.0").font(.subheadline).bold()
+                        Text("内置的中文 AI 语音：sherpa-onnx（k2-fsa）在手机上运行 Kokoro v1.1-zh 模型（hexgrad），全程离线。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    Link("sherpa-onnx 源码", destination: URL(string: "https://github.com/k2-fsa/sherpa-onnx")!)
+                    Link("Kokoro-82M v1.1-zh", destination: URL(string: "https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh")!)
                 }
                 Section("本项目的源码") {
                     Link(repo, destination: URL(string: repo)!)
