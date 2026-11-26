@@ -955,6 +955,13 @@ final class Session {
         return ch
     }
 
+    /// A frame that goes on with the previous message's type on a service channel: no tags at all. The
+    /// glasses play an audio stream only when the frames after the first come this way.
+    func sendContinuation(_ name: String, service: Int, payload: Data) throws {
+        let ch = serviceChannel(name, service: service)
+        try sendAny(DataX.message(ch, tags: [], payload: payload), tracePayload: false)
+    }
+
     /// The channel of a service opened earlier, without opening one.
     private func knownServiceChannel(_ name: String) -> UInt16? {
         channelLock.lock()

@@ -826,7 +826,7 @@ final class CompatibilityTests: XCTestCase {
                                                           encoding: .utf8))
         XCTAssertGreaterThan(catalogue.count, 300)
         let items = CuratedSettings.all
-        XCTAssertGreaterThan(items.count, 20)
+        XCTAssertGreaterThan(items.count, 18)
         XCTAssertEqual(Set(items.map(\.key)).count, items.count)
         for item in items {
             let info = try XCTUnwrap(catalogue.first { $0.key == item.key }, item.key)
@@ -1086,6 +1086,7 @@ final class CompatibilityTests: XCTestCase {
     func testTheWakeEventDoesNotCostTheQuestionThatFollows() throws {
         let (session, peer) = try encryptedLoopback(trust: true)
         let assistant = Assistant(session: session)
+        assistant.transcribesOnPhone = { false }
         let heard = expectation(description: "the question reached the app")
         let question = ResultBox<String>()
         assistant.onTranscript = { text, _ in
@@ -1229,5 +1230,102 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(step[60], 0.5, accuracy: 0.1)   // no lag: the step is centred where it happened
         XCTAssertEqual(VideoLeveling.median([3, 1, 2]), 2)
         XCTAssertEqual(VideoLeveling.median([4, 1, 2, 3]), 2.5)
+    }
+
+    // MARK: Hey Meta in Chinese
+
+    func testMicrophoneChunksAreSplitIntoOpusPackets() {
+        let a = Data([0x08, 1, 2, 3]), b = Data([0x08, 9, 8, 7, 6])
+        func be(_ n: Int) -> Data { Data([0, 0, 0, UInt8(n)]) }
+        func leBytes(_ n: Int) -> Data { Data([UInt8(n), 0, 0, 0]) }
+        XCTAssertEqual(OpusFraming.packets(in: be(a.count) + a + be(b.count) + b), [a, b])
+        // The assistant stream's own record: length and milliseconds little-endian, then the Opus length big-endian.
+        let record = leBytes(12 + a.count) + leBytes(40) + be(a.count) + Data([0, 0, 0, 0]) + a
+        XCTAssertEqual(OpusFraming.packets(in: record), [a])
+        XCTAssertEqual(OpusFraming.packets(in: a), [a])
+        XCTAssertTrue(OpusFraming.packets(in: Data()).isEmpty)
+        // TOC: config 1 is SILK narrowband 20 ms, one frame; config 3 is 60 ms; code 3 names its frame count.
+        XCTAssertEqual(OpusFraming.duration(of: Data([0x08])), 0.020, accuracy: 1e-9)
+        XCTAssertEqual(OpusFraming.duration(of: Data([0x18])), 0.060, accuracy: 1e-9)
+        XCTAssertEqual(OpusFraming.duration(of: Data([0x0B, 0x03])), 0.060, accuracy: 1e-9)
+    }
+
+    /// The answer voice needs the system Opus encoder, and the recogniser its decoder.
+    func testOpusRoundTripThroughTheSystemCodec() throws {
+        let format = try XCTUnwrap(OpusCodec.pcmFormat(sampleRate: 48_000))
+        let pcm = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 48_000))
+        pcm.frameLength = 48_000
+        let samples = try XCTUnwrap(pcm.floatChannelData?[0])
+        for index in 0 ..< 48_000 { samples[index] = Float(sin(Double(index) * 2 * Double.pi * 440 / 48_000) * 0.4) }
+        guard let packets = OpusCodec.encode(pcm) else {
+            throw XCTSkip("no Opus encoder in this simulator")
+        }
+        // One second in 20 ms packets, each well under a kilobyte at 32 kbit/s.
+        XCTAssertEqual(Double(packets.count), 50, accuracy: 4)
+        XCTAssertLessThan(packets.map(\.count).max() ?? 0, 600)
+        XCTAssertEqual(OpusFraming.duration(of: packets[packets.count / 2]), 0.020, accuracy: 1e-9)
+        let decoder = try XCTUnwrap(OpusCodec.Decoder())
+        var frames = 0
+        for packet in packets { frames += Int(decoder.decode(packet)?.frameLength ?? 0) }
+        guard frames > 0 else { throw XCTSkip("no Opus decoder in this simulator") }
+        XCTAssertEqual(Double(frames), 16_000, accuracy: 1_600)   // one second at 16 kHz for the recogniser
+    }
+
+    /// Chinese is not recognised on the glasses: the request arrives without words, the microphone
+    /// stream goes to the phone, and what the phone heard is answered under the id of that request.
+    func testWordsFromThePhoneAnswerTheRequestFromTheGlasses() throws {
+        let (session, peer) = try encryptedLoopback(trust: true)
+        let assistant = Assistant(session: session)
+        assistant.transcribesOnPhone = { true }
+        let heard = expectation(description: "the question reached the app")
+        let question = ResultBox<String>()
+        let turn = ResultBox<String>()
+        assistant.onTranscript = { text, interaction in
+            question.value = text
+            turn.value = interaction
+            heard.fulfill()
+        }
+        let streamEnded = expectation(description: "the microphone stream ended")
+        let chunks = ResultBox<Int>()
+        chunks.value = 0
+        assistant.onMicrophoneAudio = { _ in chunks.value = (chunks.value ?? 0) + 1 }
+        assistant.onMicrophoneEnded = { wake in
+            assistant.submitPhoneTranscript("今天天气怎么样", wakeID: wake)
+            streamEnded.fulfill()
+        }
+        let registered = expectation(description: "assistant registered")
+        DispatchQueue.global(qos: .userInitiated).async {
+            do { try assistant.register(timeout: 8) } catch { XCTFail("registration failed: \(error)") }
+            registered.fulfill()
+        }
+        let messages = try nextPhoneMessage(peer, type: Int(Assistant.MT.initMessageRequest), timeout: 8)
+        try peer.write(DataX.message(messages.channel ^ 0x8000,
+                                     tags: [DataX.tag(2, UInt16(Assistant.MT.initMessageResponse), last: true)],
+                                     payload: PB.uint(1, 5)))
+        let stream = try nextPhoneMessage(peer, type: Int(Assistant.MT.initStreamRequest), timeout: 8)
+        try peer.write(DataX.message(stream.channel ^ 0x8000,
+                                     tags: [DataX.tag(2, UInt16(Assistant.MT.initStreamResponse), last: true)],
+                                     payload: PB.uint(1, 5)))
+        wait(for: [registered], timeout: 10)
+        assistant.startLoop()
+        defer { assistant.stop() }
+
+        func send(_ channel: UInt16, _ type: Int32?, _ payload: Data) throws {
+            let tags = type.map { [DataX.tag(2, UInt16($0), last: true)] } ?? []
+            try peer.write(DataX.message(channel ^ 0x8000, tags: tags, payload: payload))
+        }
+        try send(messages.channel, Assistant.MT.startInteraction, ThriftWriter().string(1, "turn-zh").done())
+        try send(stream.channel, Assistant.MT.streamHeader, PB.string(1, "stream-0123456789") + PB.string(2, "turn-zh"))
+        try send(stream.channel, Assistant.MT.streamAudio, Data([0, 0, 0, 2, 0x08, 1]))
+        try send(stream.channel, nil, Data([0, 0, 0, 2, 0x08, 2]))
+        try send(stream.channel, Assistant.MT.streamEnd, Data())
+        wait(for: [streamEnded], timeout: 5)
+        XCTAssertEqual(chunks.value, 2)
+        // The request from the glasses: a turn id, no usable words.
+        let request = ThriftWriter().string(1, "turn-zh").structField(2, ThriftWriter().done()).done()
+        try send(messages.channel, Assistant.MT.netEvent, assistant.netEvent(Assistant.EV.fulfillmentRequest, request))
+        wait(for: [heard], timeout: 5)
+        XCTAssertEqual(question.value, "今天天气怎么样")
+        XCTAssertEqual(turn.value, "turn-zh")
     }
 }

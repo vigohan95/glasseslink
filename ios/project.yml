@@ -12,6 +12,11 @@ targets:
     sources:
       - App.swift
       - RootView.swift
+      - DesignSystem.swift
+      - HomeViews.swift
+      - AlbumViews.swift
+      - ShootViews.swift
+      - AssistantViews.swift
       - AlbumMediaView.swift
       - AudioOutput.swift
       - MicrophoneCheckView.swift
@@ -45,6 +50,8 @@ targets:
       - PhotoLeveling.swift
       - VideoLeveling.swift
       - MotionLog.swift
+      - OpusCodec.swift
+      - PhoneSpeech.swift
       - Thrift.swift
       - Assistant.swift
       - SettingsSchema.swift
@@ -67,13 +74,13 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "1.02"
-        CFBundleVersion: "102"
+        CFBundleShortVersionString: "1.03"
+        CFBundleVersion: "103"
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         NSBluetoothAlwaysUsageDescription: 连接你的眼镜，走本地蓝牙链路，不经 Meta 云。
         NSMicrophoneUsageDescription: 在你主动发起语音提问或麦克风测试时使用你选择的麦克风。
-        NSSpeechRecognitionUsageDescription: 将你主动录制的问题在 iPhone 上转写，确认后可发送文字给选定的模型。
+        NSSpeechRecognitionUsageDescription: 把你对眼镜说的「Hey Meta」问题和你主动录制的问题转写成文字，再发给你选定的模型。
         NSLocalNetworkUsageDescription: 通过眼镜 Wi-Fi 导入照片和视频，以及连接你配置的局域网模型或桥接服务。
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true

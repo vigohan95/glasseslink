@@ -151,6 +151,7 @@ final class Glasses: NSObject, ObservableObject {
     private var adoptingID: UUID?
     /// Candidates that failed that check this launch, so recovery does not pick them again.
     private var rejectedCandidates: Set<UUID> = []
+    private var gattListed = false
     private var ignoredAdvertisers: Set<UUID> = []
     private var sawGlassesAdvertisement = false
     private var scanRound = 0
@@ -539,7 +540,7 @@ final class Glasses: NSObject, ObservableObject {
                 }
                 self.stopScanning()
                 if self.primaryDevices.isEmpty {
-                    self.discoveryMessage = "没找到可连接的眼镜。看到眼镜指示灯闪蓝后，再扫描一次。"
+                    self.discoveryMessage = "没找到可连接的眼镜。看到眼镜指示灯闪蓝后，再搜索一次。"
                     self.note("扫描结束，未发现兼容的眼镜")
                 }
             }
@@ -896,7 +897,10 @@ final class Glasses: NSObject, ObservableObject {
             phase = .connected
             assistantAutoTries = 0
             if UIApplication.shared.applicationState == .background { note("后台重新连上了眼镜") }
-            if trust { showToast("眼镜已连接", .success) }
+            if trust {
+                showToast("眼镜已连接", .success)
+                if let p = peripheral { listGATTOnce(p) }
+            }
             if trust {
                 verifiedAt = ContinuousClock.now
                 UserDefaults.standard.set(true, forKey: "isOwner")
@@ -1100,7 +1104,8 @@ final class Glasses: NSObject, ObservableObject {
             connectingID = nil
             phase = .failed(reason)
             glassesLine = reason
-            mediaMessage = reason + " 可在设备页重新连接。"
+            mediaMessage = reason + " 可在「眼镜」页重新连接。"
+            showToast("没有连上眼镜", .failure)
             runQueuedCameraIfReady()
             return
         }
@@ -1108,6 +1113,7 @@ final class Glasses: NSObject, ObservableObject {
         connectingID = id
         glassesLine = reason
         mediaMessage = "连接中断，正在自动重连。请在连接恢复后重新发起操作。"
+        if attempt == 1 { showToast("眼镜连接断开了，正在重连…", .failure) }
     }
 
     private func scheduleRecovery(_ id: UUID) -> Int? {
@@ -1300,14 +1306,22 @@ final class Glasses: NSObject, ObservableObject {
         note("相册清单 \(list.count) 条")
     }
 
-    func loadCaptures() {
+    /// `announce`: the user pressed refresh and is told when it is done; automatic reads stay quiet.
+    func loadCaptures(announce: Bool = false) {
         Task {
-            _ = await withGlassesOperation { active in
+            let read: Int? = await withGlassesOperation { active in
                 mediaMessage = "正在读取眼镜相册…"
                 let list = try await onGlassesQueue { try active.captureList() }
                 try checkActive(active)
                 updateCaptures(list)
                 mediaMessage = list.isEmpty ? "眼镜相册为空。" : nil
+                return list.count
+            }
+            guard announce else { return }
+            if let read {
+                showToast(read == 0 ? "眼镜相册是空的" : "相册已刷新，共 \(read) 项", .success)
+            } else {
+                showToast("没有读到眼镜相册", .failure)
             }
         }
     }
@@ -1778,6 +1792,20 @@ final class Glasses: NSObject, ObservableObject {
             + "Question: \(question)"
     }
 
+    /// Sends an answer to the glasses off the main thread: in the phone's voice for a language the glasses
+    /// cannot speak, and as text for their own voice otherwise (or when the phone's voice is unavailable).
+    nonisolated private static func speak(_ text: String, interaction: String, question: String,
+                                          assistant: Assistant) async throws {
+        if let tag = HeyMetaLanguage.phoneLocale,
+           let pcm = await PhoneVoice.synthesize(text, localeTag: tag), let packets = OpusCodec.encode(pcm) {
+            try await assistant.complete(interaction: interaction, text: text, transcript: question, speech: packets)
+        } else {
+            try await Task.detached(priority: .userInitiated) {
+                try assistant.complete(interaction: interaction, text: text, transcript: question)
+            }.value
+        }
+    }
+
     /// What the glasses say when the model could not answer, in the language of the question.
     nonisolated static func spokenFailure(for question: String) -> String {
         let chinese = question.unicodeScalars.contains { (0x4E00 ... 0x9FFF).contains($0.value) }
@@ -1945,6 +1973,7 @@ final class Glasses: NSObject, ObservableObject {
                 try checkActive(active)
                 if let cameraState { status.camera = cameraState.camera }
                 note(cameraState == nil ? "拍照：未收到相机状态，改查新照片" : "拍照：眼镜确认开始")
+                if cameraState != nil { showToast("已拍照", .success) }
                 await verifyNewCapture(on: active, baseline: baseline, photo: true, acknowledged: cameraState != nil)
             }
         }
@@ -1969,6 +1998,7 @@ final class Glasses: NSObject, ObservableObject {
                     autoStopTask = nil
                     recordDeadline = nil
                     mediaMessage = "眼镜已确认停止录像，正在查询新视频…"
+                    showToast("已停止录像", .success)
                     note("眼镜确认停止录像")
                     recordingCatalogBaseline = nil
                     await verifyNewCapture(on: active, baseline: baseline, photo: false, acknowledged: true)
@@ -1976,6 +2006,7 @@ final class Glasses: NSObject, ObservableObject {
                     recordingCatalogBaseline = baseline
                     scheduleAutoStop()
                     mediaMessage = nil
+                    showToast("开始录像", .success)
                     note("眼镜确认开始录像")
                 }
             }
@@ -2065,6 +2096,7 @@ final class Glasses: NSObject, ObservableObject {
                 }
                 if Shutter.hasNewOriginal(in: catalog, comparedTo: baseline, photo: photo) {
                     mediaMessage = "眼镜相册已出现新\(kind)，可以打开相册导入。"
+                    if photo, !acknowledged { showToast("已拍照", .success) }
                     note("拍摄验证：已发现包含原件的新\(kind)")
                     return
                 }
@@ -2078,6 +2110,7 @@ final class Glasses: NSObject, ObservableObject {
         guard session === active else { return }
         let state = acknowledged ? (photo ? "眼镜已响应快门。" : "眼镜已停止录像。") : "眼镜没有确认拍照。"
         mediaMessage = "\(state)相册暂未找到新\(kind)。"
+        if !acknowledged { showToast("眼镜没有确认拍照，请再试一次", .failure) }
         note("拍摄验证：暂未找到新\(kind)原件")
     }
 
@@ -2314,6 +2347,36 @@ final class Glasses: NSObject, ObservableObject {
                 self.assistantMessage = "已收到眼镜的麦克风语音流，未收到转写文字。这轮可以直接打字提问。"
             }
         }
+        // A language the glasses do not recognise: their microphone stream goes to the phone's recogniser.
+        let ears = EarsBox()
+        a.onMicrophoneBegan = { _ in
+            guard let tag = HeyMetaLanguage.phoneLocale else { return }
+            let fresh = GlassesEars(localeTag: tag)
+            fresh.begin()
+            ears.current = fresh
+        }
+        a.onMicrophoneAudio = { chunk in ears.current?.hear(chunk) }
+        a.onMicrophoneEnded = { [weak a] wake in
+            guard let assistant = a else { return }
+            guard let heard = ears.current else {
+                assistant.submitPhoneTranscript("", wakeID: wake)
+                return
+            }
+            Task {
+                let text = await heard.finish()
+                assistant.log("assistant: phone recogniser (\(heard.localeTag)) heard \(text.count) characters in \(heard.packets) packets, \(heard.undecoded) undecoded")
+                assistant.submitPhoneTranscript(text, wakeID: wake)
+            }
+        }
+        if HeyMetaLanguage.phoneLocale != nil {
+            GlassesEars.requestAuthorization { [weak self] allowed in
+                guard !allowed else { return }
+                Task { @MainActor in
+                    self?.note("语音识别未授权：中文提问需要在 设置 › 隐私与安全性 › 语音识别 里允许 GlassesLink")
+                    self?.showToast("请允许 GlassesLink 使用语音识别", .failure)
+                }
+            }
+        }
         a.onFailure = { [weak self, weak a] error in
             Task { @MainActor in
                 guard let self, let a, self.assistantRef === a else { return }
@@ -2336,6 +2399,7 @@ final class Glasses: NSObject, ObservableObject {
                 a.startLoop()
                 assistantOn = true
                 assistantMessage = "眼镜已确认注册。说「Hey Meta」，听到提示后说出问题。"
+                if !automatic { showToast("Hey Meta 已开启", .success) }
                 note("眼镜确认了助手注册")
             } catch {
                 guard session === sess, assistantRef === a else { return }
@@ -2390,7 +2454,7 @@ final class Glasses: NSObject, ObservableObject {
         assistantTranscriptMissing = false
         assistantAnswer = ""
         let client = configuredModel
-        assistantMessage = "已收到问题，正在调用 \(client.model)…"
+        assistantMessage = "听到：「\(question)」，正在问 \(client.model)…"
         note("眼镜语音：已收到转写，开始调用用户配置的模型")
         holdBackgroundTime("hey-meta-answer", seconds: 28)
         voiceAnswer = Task { [weak self, weak assistant] in
@@ -2403,10 +2467,8 @@ final class Glasses: NSObject, ObservableObject {
                 self.assistantMessage = "模型请求失败 · \(Glasses.explain(error))"
                 self.note("眼镜语音的模型请求失败：\(Glasses.explain(error))")
                 // Say so and close the turn; the glasses otherwise wait in silence for up to a minute.
-                let sorry = Self.spokenFailure(for: question)
-                try? await Task.detached(priority: .userInitiated) {
-                    try assistant.complete(interaction: interaction, text: sorry, transcript: question)
-                }.value
+                try? await Self.speak(Self.spokenFailure(for: question), interaction: interaction,
+                                      question: question, assistant: assistant)
                 return
             }
             guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
@@ -2414,9 +2476,7 @@ final class Glasses: NSObject, ObservableObject {
             do {
                 // complete() only writes, so it does not wait for the link queue: an import holds that
                 // queue for minutes, and the glasses give up on the question long before.
-                try await Task.detached(priority: .userInitiated) {
-                    try assistant.complete(interaction: interaction, text: text, transcript: question)
-                }.value
+                try await Self.speak(text, interaction: interaction, question: question, assistant: assistant)
                 guard !Task.isCancelled, self.assistantRef === assistant, self.voiceTurn == interaction else { return }
                 self.assistantMessage = "模型已回复，已将回答发给眼镜。"
                 self.note("将模型回复发给眼镜")
@@ -2435,6 +2495,7 @@ final class Glasses: NSObject, ObservableObject {
         assistantOn = false
         resetVoiceTurn()
         reconnect(forRegistration: false)
+        showToast("Hey Meta 已关闭")
         note("助手接管已关闭")
     }
 
@@ -3168,10 +3229,37 @@ extension Glasses: CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
 
+    /// Listed once per launch after a verified connection. iOS wakes a suspended app for a GATT
+    /// notification but not for L2CAP data (glasses log 32: four imports stalled in the background), so a
+    /// characteristic here that notifies would be the way to hear Hey Meta with the app in the background.
+    /// Discovery only: nothing is read or subscribed, so no pairing prompt can come of it.
+    private func listGATTOnce(_ p: CBPeripheral) {
+        guard !gattListed else { return }
+        gattListed = true
+        p.discoverServices(nil)
+    }
+
     nonisolated func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
         Task { @MainActor in
             guard self.peripheral === p else { return }
-            for s in p.services ?? [] { self.note("service \(s.uuid)") }
+            for s in p.services ?? [] {
+                self.note("GATT 服务 \(s.uuid)")
+                p.discoverCharacteristics(nil, for: s)
+            }
+        }
+    }
+
+    nonisolated func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        Task { @MainActor in
+            guard self.peripheral === p else { return }
+            for c in service.characteristics ?? [] {
+                var can: [String] = []
+                if c.properties.contains(.read) { can.append("读") }
+                if c.properties.contains(.write) || c.properties.contains(.writeWithoutResponse) { can.append("写") }
+                if c.properties.contains(.notify) { can.append("通知") }
+                if c.properties.contains(.indicate) { can.append("指示") }
+                self.note("GATT 特征 \(service.uuid) / \(c.uuid)：\(can.joined(separator: "、"))")
+            }
         }
     }
 

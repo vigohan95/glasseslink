@@ -38,18 +38,23 @@ struct CuratedSection: Identifiable {
 }
 
 enum CuratedSettings {
+    /// Only what passes three tests: the firmware reads it (settings.tsv marks the svc31 field as parsed,
+    /// or the catalogue's code note says so), its effect is on the glasses themselves, and it does not
+    /// depend on the Meta app or Meta's cloud. Location, cloud processing, stored voice records and the
+    /// notification timing switches fail the last test and were dropped; docs/SETTINGS-GEN2.md has the
+    /// reasoning per setting.
     static let sections: [CuratedSection] = [
         CuratedSection(title: "Hey Meta 与语音", icon: "waveform", items: [
-            CuratedSetting(key: "assistant_enabled", title: "Meta AI 语音助手",
-                           note: "关闭后眼镜不再响应「Hey Meta」，GlassesLink 的语音接管也收不到问题。", control: .toggle),
+            CuratedSetting(key: "assistant_enabled", title: "语音助手",
+                           note: "关闭后眼镜不再响应「Hey Meta」，GlassesLink 也就收不到提问。", control: .toggle),
             CuratedSetting(key: "wakeword_enabled", title: "「Hey Meta」唤醒",
                            note: "说「Hey Meta」开始一条语音指令。", control: .toggle),
             CuratedSetting(key: "wakeword_sound_enabled", title: "唤醒提示音",
                            note: "说完「Hey Meta」后眼镜会响一声，表示在听。", control: .toggle),
             CuratedSetting(key: "assistant_follow_up_enabled", title: "免唤醒追问",
                            note: "回答结束后麦克风再听一小会儿，接着问不用再说「Hey Meta」。", control: .toggle),
-            CuratedSetting(key: "tts_speak_speed", title: "朗读语速",
-                           note: "眼镜读出回答和通知的速度。",
+            CuratedSetting(key: "tts_speak_speed", title: "眼镜朗读语速",
+                           note: "眼镜用自己的声音朗读时的速度；中文回答由 iPhone 合成，不受它影响。",
                            control: .options(["75": "0.75 倍", "100": "1 倍", "125": "1.25 倍",
                                              "150": "1.5 倍", "175": "1.75 倍"])),
         ]),
@@ -58,11 +63,11 @@ enum CuratedSettings {
                            note: "拍摄键单按和长按分别做什么。",
                            control: .options(["0": "单按拍照，长按录像", "1": "单按录像，长按拍照"])),
             CuratedSetting(key: "resolution_and_framerate", title: "视频画质",
-                           note: "画质越高越耗电、越占空间。",
+                           note: "画质越高越耗电、越占空间；高帧率每帧曝光更短，室内噪点会更多。",
                            control: .options(["0": "标准 · 1080p 30 帧", "2": "高帧率 · 1080p 60 帧",
                                              "1": "高分辨率 · 3K 30 帧"])),
             CuratedSetting(key: "video_duration_ms", title: "单段视频最长",
-                           note: "录到这个时长会自动停止。",
+                           note: "录到这个时长自动停止。这是官方给的几档；过热和电量由眼镜另外的保护机制管。",
                            control: .options(["30000": "30 秒", "60000": "1 分钟", "180000": "3 分钟",
                                              "300000": "5 分钟（仅标准画质）", "600000": "10 分钟"])),
             CuratedSetting(key: "eis_mode", title: "视频防抖",
@@ -92,35 +97,18 @@ enum CuratedSettings {
             CuratedSetting(key: "auto_play_pause_on_don_doff", title: "摘下时暂停音乐",
                            note: "摘下眼镜时音乐自动暂停，戴上后继续。", control: .toggle),
             CuratedSetting(key: "tap_and_hold_mapping", title: "触控板长按",
-                           note: "手指按住镜腿触控板时做什么。",
-                           control: .options(["1": "不做任何事", "2": "唤醒 Meta AI", "3": "Spotify Tap",
-                                             "5": "Apple Music", "4": "Amazon Music"])),
+                           note: "手指按住镜腿触控板时做什么。其他选项要靠 Meta App 绑定音乐服务，这里不列。",
+                           control: .options(["1": "不做任何事", "2": "唤醒语音助手"])),
             CuratedSetting(key: "sg_captouch_invert_swipe_direction_horizontal", title: "反转前后滑动",
                            note: "触控板前后滑动调音量的方向反过来。", control: .toggle),
         ]),
-        CuratedSection(title: "来电与通知", icon: "bell", items: [
+        CuratedSection(title: "来电", icon: "phone", items: [
             CuratedSetting(key: "user_setup_ica_toggle_enabled", title: "来电播报",
                            note: "来电时眼镜读出是谁打来的。", control: .toggle),
             CuratedSetting(key: "sg_do_not_disturb", title: "勿扰模式",
                            note: "开启后眼镜不响来电铃声。", control: .toggle),
-            CuratedSetting(key: "attention_deferral_user_enabled", title: "说话时推迟通知",
-                           note: "你正在说话时，等说完再播报通知。", control: .toggle),
-            CuratedSetting(key: "mute_announcements_default_duration", title: "暂停播报的默认时长",
-                           note: "暂停通知播报时默认暂停多久。",
-                           control: .options(["3600": "1 小时", "7200": "2 小时", "14400": "4 小时",
-                                             "28800": "8 小时"])),
         ]),
-        CuratedSection(title: "隐私与更新", icon: "lock.shield", items: [
-            CuratedSetting(key: "assistant_store_voice_recordings", title: "保存语音录音",
-                           note: "允许 Meta 保存你对 Meta AI 说话的录音。", control: .toggle),
-            CuratedSetting(key: "assistant_store_voice_transcripts", title: "保存语音文字记录",
-                           note: "允许 Meta 保存你说话内容的文字副本。", control: .toggle),
-            CuratedSetting(key: "cloud_media_processing_enabled", title: "照片视频云端处理",
-                           note: "允许把照片和视频发到 Meta 云端处理和临时保存。", control: .toggle),
-            CuratedSetting(key: "location_global_enabled", title: "位置服务",
-                           note: "允许眼镜使用位置信息。", control: .toggle),
-            CuratedSetting(key: "device_share_additional_data_enabled", title: "共享额外使用数据",
-                           note: "向 Meta 额外共享使用频率等数据。", control: .toggle),
+        CuratedSection(title: "固件更新", icon: "arrow.down.circle", items: [
             CuratedSetting(key: "cloud_ota_enabled", title: "自动固件更新",
                            note: "允许眼镜自己从云端下载新固件。新固件可能让 GlassesLink 失效，建议关闭。",
                            control: .toggle),
@@ -157,12 +145,27 @@ struct GlassesSettingsView: View {
     @State private var percentDrafts: [String: Double] = [:]
     @AppStorage(PhotoLeveling.enabledKey) private var levelPhotos = true
     @AppStorage(VideoLeveling.enabledKey) private var levelVideos = true
+    @AppStorage(HeyMetaLanguage.key) private var heyMetaLanguage = "zh-CN"
 
     private var ready: Bool { g.canUseGlasses && g.settingsReadAt != nil }
+
+    /// Unverified lengths offered only as an experiment, away from the proven list.
+    private static let longerVideoMinutes = [15, 20, 30]
 
     var body: some View {
         List {
             statusSection
+            Section {
+                Picker("提问语言", selection: $heyMetaLanguage) {
+                    ForEach(HeyMetaLanguage.choices) { choice in
+                        Text(choice.name).tag(choice.tag)
+                    }
+                }
+            } header: {
+                Label("Hey Meta 用什么语言问", systemImage: "character.bubble")
+            } footer: {
+                Text("眼镜自己只听得懂英文。选中文时，说完「Hey Meta」后你的话会传到 iPhone 上识别，回答也由 iPhone 合成语音、送回眼镜播放。首次使用会请求「语音识别」权限。")
+            }
             ForEach(CuratedSettings.sections) { section in
                 Section {
                     ForEach(section.items) { item in row(item) }
@@ -193,6 +196,18 @@ struct GlassesSettingsView: View {
             } footer: {
                 Text("App 里保留的始终是原件；关掉开关后重新存到相册，得到的就是未处理的原样。")
             }
+            Section {
+                ForEach(Self.longerVideoMinutes, id: \.self) { minutes in
+                    Button("把单段视频上限设为 \(minutes) 分钟") {
+                        g.writeSetting("video_duration_ms", String(minutes * 60_000))
+                    }
+                }
+            } header: {
+                Label("实验：更长的录像", systemImage: "flask")
+            } footer: {
+                Text("官方最多给到 10 分钟。固件里另有一种拍摄模式的上限是 30 分钟，所以硬件录得了更久，但普通录像认不认更大的值还没有验证。帮我试一次：点一个时长，显示「已保存」后录一段直到它自己停，把实际录了多久告诉我。眼镜过热或电量低时会自己停止，这是它的保护，不受这里影响。")
+            }
+            .disabled(!ready || g.settingsLoading || g.busy)
             Section {
                 NavigationLink("全部原始设置（开发者）") { SettingsView(g: g) }
             } footer: {

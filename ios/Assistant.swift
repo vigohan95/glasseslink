@@ -44,6 +44,8 @@ final class Assistant: @unchecked Sendable {
         static let sessionStateUpdate = 339
         static let onPhoneUnderstanding = 342
         static let remoteInteractionComplete = 360
+        static let ttsStartInfo = 388
+        static let ttsEndInfo = 389
         static let keepAirSessionAlive = 392
     }
 
@@ -87,6 +89,11 @@ final class Assistant: @unchecked Sendable {
         var deadline = ProcessInfo.processInfo.systemUptime + 30
         var keepaliveSequence = 0
         var nextKeepalive = TimeInterval.infinity
+        /// Phone-side recognition: what the glasses made of the speech, what the phone made of it, and
+        /// until when the other half is waited for.
+        var glassesTranscript: String?
+        var phoneText: String?
+        var phoneDeadline = TimeInterval.infinity
 
         func includes(_ id: String) -> Bool {
             wakeID == id || relatedWakeID == id || requestID == id
@@ -158,6 +165,17 @@ final class Assistant: @unchecked Sendable {
     var onAudioWithoutTranscript: (() -> Void)?
     var onTurnEnded: ((String) -> Void)?
     var onFailure: ((Error) -> Void)?
+
+    /// True when the words come from the phone's recogniser (a language the glasses do not recognise).
+    /// Then the glasses' request only names the turn, and the microphone stream is handed out below.
+    var transcribesOnPhone: () -> Bool = { HeyMetaLanguage.phoneLocale != nil }
+    /// The microphone stream of the turn with this wake id began / one chunk of it / it ended.
+    var onMicrophoneBegan: ((String) -> Void)?
+    var onMicrophoneAudio: ((Data) -> Void)?
+    var onMicrophoneEnded: ((String) -> Void)?
+    /// The stream the glasses allocated per interaction; an answer in the phone's voice must name it.
+    private var streamIDs: [String: String] = [:]
+    private var latestStream = ""
 
     var registered: Bool {
         stateLock.lock()
@@ -423,16 +441,30 @@ final class Assistant: @unchecked Sendable {
                    let bytes = fields[2]?.first as? Data,
                    let interaction = String(data: bytes, encoding: .utf8) {
                     beginTurn(interaction)
+                    var began: String?
                     stateLock.lock()
+                    if let stream = (fields[1]?.first as? Data).flatMap({ String(data: $0, encoding: .utf8) }),
+                       stream.count > 8 {
+                        if streamIDs.count > 16 { streamIDs.removeAll() }
+                        streamIDs[interaction] = stream
+                        latestStream = stream
+                    }
                     if turn?.includes(interaction) == true, turn?.microphone == nil {
                         turn?.microphone = MicrophoneStream()
+                        began = turn?.wakeID
+                        // A request that came first now waits for this stream's words.
+                        if turn?.requestID != nil, turn?.phoneText == nil {
+                            turn?.phoneDeadline = ProcessInfo.processInfo.systemUptime + 12
+                        }
                     }
                     stateLock.unlock()
+                    if let began, transcribesOnPhone() { onMicrophoneBegan?(began) }
                 }
             case Int(MT.streamAudio), 0:
                 stateLock.lock()
                 turn?.microphone?.noteAudio(bytes: message.payload.count)
                 stateLock.unlock()
+                if !message.payload.isEmpty, transcribesOnPhone() { onMicrophoneAudio?(message.payload) }
             case Int(MT.streamEnd):
                 finishMicrophoneStream()
             default:
@@ -520,6 +552,16 @@ final class Assistant: @unchecked Sendable {
         }
         switch id {
         case EV.fulfillmentRequest:
+            let named = inner.text(8)
+            if named.count > 8, !inner.text(1).isEmpty {
+                stateLock.lock()
+                if streamIDs[inner.text(1)] == nil { streamIDs[inner.text(1)] = named }
+                stateLock.unlock()
+            }
+            if transcribesOnPhone(), let request = Self.spokenRequest(inner, requireTranscript: false) {
+                acceptRequest(request.interaction, glassesTranscript: request.transcript, simplified: request.simplified)
+                return
+            }
             guard let request = Self.spokenRequest(inner) else {
                 // The wake itself arrives as a fulfillment request too (intent IN:WAKE_WORD), before the
                 // one that carries the words: the 0.99 log has two event 57 for one wake. Closing the
@@ -621,7 +663,8 @@ final class Assistant: @unchecked Sendable {
         log("assistant: confirmed speech start for a matching glasses turn")
     }
 
-    static func spokenRequest(_ fields: [Int: Any]) -> (interaction: String, transcript: String, simplified: Bool)? {
+    static func spokenRequest(_ fields: [Int: Any], requireTranscript: Bool = true)
+        -> (interaction: String, transcript: String, simplified: Bool)? {
         let understanding = fields.structField(2)
         let onDevice = fields.structField(55)
         let fallbackIntent = onDevice.text(1)
@@ -635,7 +678,7 @@ final class Assistant: @unchecked Sendable {
         let interaction = fields.text(1)
         let transcript = understanding.structField(1).text(1).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !interaction.isEmpty, interaction.utf8.count <= 128,
-              !transcript.isEmpty, transcript.utf8.count <= Self.maxMessageBytes else { return nil }
+              !requireTranscript || !transcript.isEmpty, transcript.utf8.count <= Self.maxMessageBytes else { return nil }
         return (interaction, transcript, (fields[30] as? Bool) ?? true)
     }
 
@@ -696,6 +739,71 @@ final class Assistant: @unchecked Sendable {
         }
     }
 
+    /// Phone-side recognition: the glasses' request names the turn; the words are the phone's, and the
+    /// glasses' own only stand in when the phone heard nothing or there was no microphone stream.
+    private func acceptRequest(_ interaction: String, glassesTranscript: String, simplified: Bool) {
+        stateLock.lock()
+        guard !stopped, !recentInteractions.contains(interaction), turn?.requestID == nil,
+              turn?.supportsSpeech != false, onTranscript != nil else {
+            stateLock.unlock()
+            return
+        }
+        let newlyAwake = turn == nil
+        if newlyAwake { turn = Turn(wakeID: interaction) }
+        let now = ProcessInfo.processInfo.systemUptime
+        turn?.requestID = interaction
+        turn?.simplified = simplified
+        turn?.deadline = now + 65
+        turn?.nextKeepalive = now + 3
+        turn?.glassesTranscript = glassesTranscript
+        let heard = turn?.phoneText
+        let hasMicrophone = turn?.microphone != nil
+        let wake = turn?.wakeID ?? interaction
+        // The phone's words get 12 s from here, or 4 s to show that a microphone stream is coming at all;
+        // after that the glasses' own words stand in (maintainTurn).
+        turn?.phoneDeadline = heard != nil ? .infinity : now + (hasMicrophone ? 12 : 4)
+        stateLock.unlock()
+        if newlyAwake { notifyWake(interaction) }
+        log("assistant: glasses request received; the words come from the phone's recogniser")
+        if let heard { deliver(heard.isEmpty ? glassesTranscript : heard, interaction: interaction, wakeID: wake) }
+    }
+
+    /// What the phone recognised in the microphone stream of the turn `wakeID` woke.
+    func submitPhoneTranscript(_ text: String, wakeID: String) {
+        let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        stateLock.lock()
+        guard !stopped, let active = turn, active.includes(wakeID), !active.replying, active.phoneText == nil else {
+            stateLock.unlock()
+            return
+        }
+        turn?.phoneText = words
+        if let request = active.requestID {
+            turn?.phoneDeadline = .infinity
+            stateLock.unlock()
+            deliver(words.isEmpty ? (active.glassesTranscript ?? "") : words, interaction: request, wakeID: active.wakeID)
+        } else {
+            // The request usually arrives within a moment of the stream ending.
+            turn?.phoneDeadline = ProcessInfo.processInfo.systemUptime + 2.5
+            stateLock.unlock()
+        }
+    }
+
+    private func deliver(_ words: String, interaction: String, wakeID: String) {
+        guard !words.isEmpty else {
+            log("assistant: neither the phone nor the glasses recognised any words")
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.registered else { return }
+                self.onAudioWithoutTranscript?()
+            }
+            return
+        }
+        log("assistant: question ready, \(words.count) characters")
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isCurrentRequest(interaction) else { return }
+            self.onTranscript?(words, interaction)
+        }
+    }
+
     private func closeTurn(_ interaction: String) {
         guard !interaction.isEmpty else { return }
         stateLock.lock()
@@ -739,9 +847,11 @@ final class Assistant: @unchecked Sendable {
         stateLock.lock()
         let finished = turn?.microphone?.finish(at: ProcessInfo.processInfo.systemUptime) == true
             ? turn?.microphone : nil
+        let wake = turn?.wakeID
         stateLock.unlock()
         if let finished {
             log("assistant: glasses microphone stream ended, \(finished.frames) audio frames, \(finished.bytes) audio bytes")
+            if let wake, transcribesOnPhone() { onMicrophoneEnded?(wake) }
         }
     }
 
@@ -767,7 +877,24 @@ final class Assistant: @unchecked Sendable {
             forgetTurn()
             stateLock.unlock()
             notifyTurnEnded(active.requestID ?? active.wakeID)
-        } else if active.requestID == nil, active.supportsSpeech != false,
+        } else if transcribesOnPhone(), now >= active.phoneDeadline {
+            // The other half never came: answer with what there is.
+            turn?.phoneDeadline = .infinity
+            if let request = active.requestID {
+                stateLock.unlock()
+                deliver(active.glassesTranscript ?? "", interaction: request, wakeID: active.wakeID)
+            } else if let words = active.phoneText, !words.isEmpty {
+                // Words but no request from the glasses: the wake's own id names the turn.
+                turn?.requestID = active.wakeID
+                turn?.deadline = now + 65
+                turn?.nextKeepalive = now + 3
+                stateLock.unlock()
+                deliver(words, interaction: active.wakeID, wakeID: active.wakeID)
+            } else {
+                stateLock.unlock()
+                notifyMissingTranscript(active.wakeID)
+            }
+        } else if !transcribesOnPhone(), active.requestID == nil, active.supportsSpeech != false,
                   active.microphone?.shouldReportMissingTranscript(at: now) == true {
             turn?.microphone?.reportedMissingTranscript = true
             stateLock.unlock()
@@ -829,6 +956,93 @@ final class Assistant: @unchecked Sendable {
             try send(event, body, type: type)
         }
         log("assistant: model response written to the glasses")
+    }
+
+    /// The answer in the phone's voice (Visor's stream()): the usual preamble, a stream header naming the
+    /// stream the glasses allocated, the Opus packets two to a frame at the pace they play, the VARM, and
+    /// ev60 marked as streamed so the glasses do not speak the text themselves.
+    func complete(interaction: String, text: String, transcript: String, speech packets: [Data]) async throws {
+        guard !packets.isEmpty else {
+            try complete(interaction: interaction, text: text, transcript: transcript)
+            return
+        }
+        let (active, streamID) = try beginSpokenReply(interaction)
+        defer { endSpokenReply(interaction) }
+        guard let varm = Varm.build(interaction: interaction, transcript: transcript, text: text, onGlasses: false) else {
+            throw LinkError.unexpected("缺少眼镜播报所需的语音模板")
+        }
+        if streamID.isEmpty { log("assistant: no stream id from the glasses for this answer; it may not play") }
+        let speechStart = ThriftWriter().string(1, interaction).done()
+        let transcription = ThriftWriter().string(1, transcript).i32(2, 0).string(4, "")
+            .bool(7, false).string(8, interaction).done()
+        let understanding = ThriftWriter().string(1, interaction).bool(2, false)
+            .string(3, "IN:GET_WEATHER").bool(4, false).done()
+        try send(EV.startOfUserSpeech, speechStart)
+        try send(EV.finalTranscription, transcription, type: 0)
+        try send(EV.onPhoneUnderstanding, understanding, type: 0)
+
+        let mono = Int64(ProcessInfo.processInfo.systemUptime * 1000)
+        func wall() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+        try send(EV.ttsStartInfo, ThriftWriter().i64(1, wall()).i64(2, mono).string(3, interaction).done())
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        // Field 1 is the stream the glasses allocated; without it they drop the audio silently.
+        let header = (streamID.isEmpty ? Data() : PB.string(1, streamID)) + PB.string(2, interaction)
+            + PB.uint(4, 1) + PB.uint(7, 1) + PB.uint(19, 1)
+        try write(MT.streamHeader, header, on: .stream)
+        let started = ProcessInfo.processInfo.systemUptime
+        var due = 0.0
+        var index = 0
+        while index < packets.count {
+            guard isCurrentRequest(interaction) else { throw LinkError.unexpected("眼镜的语音请求已结束") }
+            let pair = packets[index ..< min(index + 2, packets.count)]
+            var frame = Data()
+            for packet in pair {
+                let n = UInt32(packet.count)
+                frame.append(contentsOf: [UInt8(n & 0xFF), UInt8((n >> 8) & 0xFF), UInt8((n >> 16) & 0xFF), UInt8(n >> 24)])
+                frame.append(packet)
+                due += OpusFraming.duration(of: packet)
+            }
+            if index == 0 {
+                try write(MT.streamAudio, frame, on: .stream)
+                if active.simplified { try send(EV.voiceAnswer, varm) }
+            } else {
+                // Tagged with a type, only the first 40 ms would ever play.
+                try session.sendContinuation(Endpoint.stream.rawValue, service: Int(Self.service), payload: frame)
+            }
+            index += 2
+            let wait = due - (ProcessInfo.processInfo.systemUptime - started)
+            if wait > 0 { try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+        }
+        try write(MT.streamEnd, Data(), on: .stream)
+        if !active.simplified { try send(EV.voiceAnswer, varm) }
+        // Without it the glasses stay in their answering state with the microphone on.
+        try send(EV.voiceComplete, Varm.complete(interaction: interaction, text: text, streamed: true))
+        try send(EV.ttsEndInfo, ThriftWriter().i64(1, wall()).i64(2, mono).i64(3, 7000).string(4, interaction).done())
+        try await Task.sleep(nanoseconds: 20_000_000)
+        try send(EV.keepAirSessionAlive, ThriftWriter().string(1, "VoiceActionResponseMessage")
+            .i32(2, Int32(truncatingIfNeeded: mono & 0xFFFF)).i32(3, 1).done())
+        log("assistant: answer streamed in the phone's voice, \(packets.count) packets, \(String(format: "%.1f", due)) s")
+    }
+
+    /// Marks the turn as being answered and names the stream the glasses allocated for it.
+    private func beginSpokenReply(_ interaction: String) throws -> (Turn, String) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !stopped, let active = turn, active.requestID == interaction, active.supportsSpeech != false,
+              !active.replying else {
+            throw LinkError.unexpected("眼镜的语音请求已结束")
+        }
+        turn?.replying = true
+        let streamID = streamIDs[interaction] ?? streamIDs[active.wakeID]
+            ?? active.relatedWakeID.flatMap { streamIDs[$0] } ?? latestStream
+        return (active, streamID)
+    }
+
+    private func endSpokenReply(_ interaction: String) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if turn?.requestID == interaction { forgetTurn() }
     }
 
     private func send(_ event: Int, _ body: Data, type: Int32 = MT.netEvent) throws {
