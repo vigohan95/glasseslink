@@ -1359,13 +1359,16 @@ final class Glasses: NSObject, ObservableObject {
             return nil
         }
         let capture = item.capture
+        transferDetail = "正在处理视频…"
+        defer { if mediaImportID == nil { transferDetail = nil } }
         let outcome = await VideoLeveling.leveledCopy(of: file, imu: LocalMediaLibrary.sidecarURL(for: capture, .imu),
                                                       frames: LocalMediaLibrary.sidecarURL(for: capture, .frames),
                                                       steadiedSizes: steadiedVideoSizes,
                                                       steadiness: Int(settingValue("eis_mode").value ?? "") ?? 2)
         switch outcome {
-        case .leveled(let url, _, let warps):
+        case .leveled(let url, _, let warps, let enhanced):
             defer { try? FileManager.default.removeItem(at: url) }
+            if let enhanced { note("视频画质：" + enhanced.line) }
             do {
                 try LocalMediaLibrary.storeProcessed(url, capture: capture)
             } catch {
@@ -2014,15 +2017,16 @@ final class Glasses: NSObject, ObservableObject {
             }
         }
         if !capture.isPhoto, let made = await VideoLeveling.describe(file) { note("视频规格：\(made)") }
-        if !capture.isPhoto, VideoLeveling.isEnabled || VideoSteady.isEnabled {
+        if !capture.isPhoto, VideoLeveling.isEnabled || VideoSteady.isEnabled || VideoEnhance.isEnabled {
             if mediaImportID != nil { transferDetail = "正在处理视频…" }
             switch await VideoLeveling.leveledCopy(of: file, imu: LocalMediaLibrary.sidecarURL(for: capture, .imu),
                                                    frames: LocalMediaLibrary.sidecarURL(for: capture, .frames),
                                                    steadiedSizes: steadiedVideoSizes,
                                                    steadiness: Int(settingValue("eis_mode").value ?? "") ?? 2) {
-            case .leveled(let url, let plan, let warps):
+            case .leveled(let url, let plan, let warps, let enhanced):
                 source = url
                 leveled = url
+                if let enhanced { note("视频画质：" + enhanced.line) }
                 // The app's own album shows this copy too; the original stays beside it.
                 do { try LocalMediaLibrary.storeProcessed(url, capture: capture) } catch {
                     note("处理后的视频没能存进 App 相册：\(error.localizedDescription)")

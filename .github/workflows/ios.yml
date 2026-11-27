@@ -19,7 +19,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15-intel
+    # macOS 26 with Xcode 26: the iOS 26 SDK has the video frame processors (VideoEnhance.swift).
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
@@ -54,7 +55,9 @@ jobs:
       - name: Unit tests (golden vectors)
         run: |
           cd ios
-          DEVICE=$(xcrun simctl list devices available | grep -Eo 'iPhone [0-9]+( Pro)?' | head -1)
+          xcodebuild -version
+          # The first available iPhone, by its id: names like "iPhone 16e" do not fit a name pattern.
+          DEVICE=$(xcrun simctl list devices available | grep -E '^ +iPhone' | head -1 | grep -Eo '[0-9A-F-]{36}')
           echo "simulator: $DEVICE"
           xcodebuild test \
             -project GlassesLink.xcodeproj \
@@ -70,7 +73,7 @@ jobs:
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testLoopbackPipeKeepsTrailingPartialFrame \
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testTransportReportsUnexpectedEndOnceAndPreservesItsCause \
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testTransportReadsLargestDocumentedDataXFrameAcrossReads \
-            -destination "platform=iOS Simulator,name=$DEVICE" \
+            -destination "platform=iOS Simulator,id=$DEVICE" \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 

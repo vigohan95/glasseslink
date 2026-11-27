@@ -201,8 +201,9 @@ enum VideoLeveling {
     // MARK: the clip
 
     enum Outcome {
-        /// A copy that is levelled (`Plan`), steadied on the phone (`Warps`), or both.
-        case leveled(URL, Plan?, VideoSteady.Warps?)
+        /// A copy that is levelled (`Plan`), steadied on the phone (`Warps`), denoised or scaled up
+        /// (`VideoEnhance.Report`), or any of these.
+        case leveled(URL, Plan?, VideoSteady.Warps?, VideoEnhance.Report?)
         /// Nothing to do, or nothing to go by; the string says which, for the log.
         case unchanged(String)
     }
@@ -265,10 +266,39 @@ enum VideoLeveling {
                                  width: Double(size.width), height: Double(size.height))
                 why = rolls == nil && vision.count < 4 ? "没有传感器记录，画面里也找不到水平线" : "已经是平的"
             }
-            guard plan != nil || warps != nil else { return .unchanged(why) }
+            let denoise = VideoEnhance.isEnabled && VideoEnhance.canDenoise
+            let upscale = VideoEnhance.isEnabled && warps != nil && VideoEnhance.canUpscale
+            guard plan != nil || warps != nil || denoise else { return .unchanged(why) }
             let output = FileManager.default.temporaryDirectory.appendingPathComponent("level-\(UUID().uuidString).mp4")
+            if denoise || upscale {
+                let cut = warps.map { (width: $0.outWidth, height: $0.outHeight) } ?? (width: width, height: height)
+                let steady = warps, level = plan
+                do {
+                    let report = try await VideoEnhance.export(asset: asset, to: output, cut: cut, denoise: denoise,
+                                                               upscale: upscale) { image, time in
+                        var out = image
+                        if let steady {
+                            out = VideoSteady.warped(out, by: steady.matrix(at: time), outWidth: steady.outWidth,
+                                                     outHeight: steady.outHeight)
+                        }
+                        if let level { out = PhotoLeveling.straightened(out, by: level.angle(at: time), zoom: level.zoom) }
+                        return out
+                    }
+                    return .leveled(output, plan, warps, report)
+                } catch {
+                    // The old way still steadies and levels.
+                    try? FileManager.default.removeItem(at: output)
+                    guard plan != nil || warps != nil else {
+                        return .unchanged("增强失败：\(error.localizedDescription)")
+                    }
+                    var failed = VideoEnhance.Report()
+                    failed.note = "增强失败，改用普通处理：\(error.localizedDescription)"
+                    try await export(asset: asset, plan: plan, warps: warps, to: output)
+                    return .leveled(output, plan, warps, failed)
+                }
+            }
             try await export(asset: asset, plan: plan, warps: warps, to: output)
-            return .leveled(output, plan, warps)
+            return .leveled(output, plan, warps, nil)
         } catch {
             return .unchanged("处理失败：\(error.localizedDescription)")
         }

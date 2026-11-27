@@ -1362,6 +1362,67 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(VideoSteady.cropAndSmoothing(1).keep, 0.8)
     }
 
+    /// A short portrait clip of moving bands, for the exporter.
+    private func syntheticClip(width: Int, height: Int, frames: Int, fps: Int32) async throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("synthetic-\(UUID().uuidString).mp4")
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height,
+        ])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
+        ])
+        writer.add(input)
+        XCTAssertTrue(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+        let context = CIContext()
+        for index in 0 ..< frames {
+            while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 1_000_000) }
+            var buffer: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, try XCTUnwrap(adaptor.pixelBufferPool), &buffer)
+            let pixels = try XCTUnwrap(buffer)
+            let shift = CGFloat(index * 4)
+            let bands = CIFilter(name: "CIStripesGenerator", parameters: [
+                "inputCenter": CIVector(x: shift, y: 0), "inputWidth": 12,
+            ])?.outputImage?.cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
+            context.render(try XCTUnwrap(bands), to: pixels)
+            XCTAssertTrue(adaptor.append(pixels, withPresentationTime: CMTime(value: CMTimeValue(index), timescale: fps)))
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        XCTAssertEqual(writer.status, .completed)
+        return url
+    }
+
+    /// The frame-by-frame exporter writes every frame through the transform, at the cut's size, whether
+    /// or not this system has the iOS 26 processors (the simulator has neither).
+    func testTheFrameByFrameExportWritesEveryFrameAtTheCutSize() async throws {
+        let clip = try await syntheticClip(width: 360, height: 480, frames: 20, fps: 30)
+        defer { try? FileManager.default.removeItem(at: clip) }
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent("enhanced-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: output) }
+        var times: [Double] = []
+        let report = try await VideoEnhance.export(asset: AVURLAsset(url: clip), to: output, cut: (width: 300, height: 400),
+                                                   denoise: VideoEnhance.canDenoise, upscale: false) { image, time in
+            times.append(time)
+            return image.cropped(to: CGRect(x: 30, y: 40, width: 300, height: 400))
+                .transformed(by: CGAffineTransform(translationX: -30, y: -40))
+        }
+        XCTAssertEqual(report.frames, 20)
+        XCTAssertEqual(times.first ?? -1, 0, accuracy: 1e-6)
+        XCTAssertEqual(times.last ?? -1, 19.0 / 30, accuracy: 0.01)
+        let track = try await XCTUnwrap(AVURLAsset(url: output).loadTracks(withMediaType: .video).first)
+        let size = try await track.load(.naturalSize)
+        XCTAssertEqual(Int(size.width), 300)
+        XCTAssertEqual(Int(size.height), 400)
+        // The scaler only doubles a cut that is too small for the standard size.
+        XCTAssertEqual(VideoEnhance.outputSize(cutWidth: 994, cutHeight: 1326, upscale: true).width, 1512)
+        XCTAssertEqual(VideoEnhance.outputSize(cutWidth: 994, cutHeight: 1326, upscale: false).width, 994)
+        XCTAssertEqual(VideoEnhance.outputSize(cutWidth: 1332, cutHeight: 1776, upscale: true).width, 1512)
+        XCTAssertEqual(VideoEnhance.outputSize(cutWidth: 600, cutHeight: 800, upscale: true).width, 600)
+    }
+
     /// A wide clip is cut to the standard clip's view by default; 60-frame clips are less wide than 3K.
     func testWideClipsAreCutToTheStandardView() throws {
         XCTAssertEqual(VideoSteady.keep(fps: 30, view: .standard, steadiness: 2), 1 / 1.62, accuracy: 1e-9)

@@ -185,6 +185,7 @@ struct GlassesSettingsView: View {
     @AppStorage(VideoLeveling.enabledKey) private var levelVideos = true
     @AppStorage(VideoSteady.enabledKey) private var steadyWideVideos = true
     @AppStorage(VideoSteady.View.key) private var wideVideoView = VideoSteady.View.standard.rawValue
+    @AppStorage(VideoEnhance.enabledKey) private var enhanceVideos = true
     @AppStorage(HeyMetaLanguage.key) private var heyMetaLanguage = HeyMetaLanguage.defaultTag
 
     private var ready: Bool { g.canUseGlasses && g.settingsReadAt != nil }
@@ -247,6 +248,16 @@ struct GlassesSettingsView: View {
                         ForEach(VideoSteady.View.allCases, id: \.rawValue) { view in
                             Text(view.title).tag(view.rawValue)
                         }
+                    }
+                }
+                Toggle(isOn: $enhanceVideos) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("视频降噪和超分辨率")
+                        Text(VideoEnhance.canDenoise
+                             ? "用 iPhone 系统自带的视频处理（离线）：参考前后几帧去掉室内和 60 帧的满屏噪点；裁切后变小的 60 帧画面放大回标准画质的尺寸。导入会慢一些。"
+                             : "需要 iOS 26 及以上的 iPhone；这台不支持，导入时会跳过。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             } header: {
