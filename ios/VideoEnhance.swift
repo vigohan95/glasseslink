@@ -349,9 +349,13 @@ final class Denoiser {
 
     init?(width: Int, height: Int) {
         guard VTTemporalNoiseFilterConfiguration.isSupported else { return nil }
-        let low = VTTemporalNoiseFilterConfiguration.minimumDimensions
-        let high = VTTemporalNoiseFilterConfiguration.maximumDimensions
-        guard width >= Int(low.width), height >= Int(low.height), width <= Int(high.width), height <= Int(high.height) else {
+        // Both limits are optional in the SDK; a limit the system does not state is no limit.
+        if let low = VTTemporalNoiseFilterConfiguration.minimumDimensions,
+           width < Int(low.width) || height < Int(low.height) {
+            return nil
+        }
+        if let high = VTTemporalNoiseFilterConfiguration.maximumDimensions,
+           width > Int(high.width) || height > Int(high.height) {
             return nil
         }
         let formats = VTTemporalNoiseFilterConfiguration.supportedSourcePixelFormats
@@ -365,8 +369,8 @@ final class Denoiser {
         do { try session.startSession(configuration: configuration) } catch { return nil }
         processor = session
         format = chosen
-        previousCount = max(0, configuration.previousFrameCount)
-        nextCount = max(0, configuration.nextFrameCount)
+        previousCount = max(0, configuration.previousFrameCount ?? 0)
+        nextCount = max(0, configuration.nextFrameCount ?? 0)
         self.sources = sources
         self.destinations = destinations
     }
