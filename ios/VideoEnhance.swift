@@ -18,13 +18,18 @@ enum VideoEnhance {
     static let standardWidth = 1512
     static let standardHeight = 2016
 
+    // The processors' classes are not in the simulator's SDK (Xcode 26.6), only in the devices'.
     static var canDenoise: Bool {
+        #if !targetEnvironment(simulator)
         if #available(iOS 26.0, *) { return VTTemporalNoiseFilterConfiguration.isSupported }
+        #endif
         return false
     }
 
     static var canUpscale: Bool {
+        #if !targetEnvironment(simulator)
         if #available(iOS 26.0, *) { return VTSuperResolutionScalerConfiguration.isSupported }
+        #endif
         return false
     }
 
@@ -72,23 +77,27 @@ enum VideoEnhance {
 
         var report = Report()
         var denoiser: AnyObject?
+        var scaler: AnyObject?
+        #if !targetEnvironment(simulator)
         if denoise, #available(iOS 26.0, *) {
             denoiser = Denoiser(width: width, height: height)
             if denoiser == nil { report.note = "这台 iPhone 不支持降噪" }
         }
-        var scaler: AnyObject?
         if upscale, cut.width * 2 >= standardWidth, cut.width < standardWidth, #available(iOS 26.0, *) {
             switch await Upscaler.make(width: cut.width, height: cut.height) {
             case .ready(let made): scaler = made
             case .unavailable(let why): report.note = report.note.isEmpty ? why : report.note + "；" + why
             }
         }
+        #endif
         let size = outputSize(cutWidth: cut.width, cutHeight: cut.height, upscale: scaler != nil)
 
         // Reading.
         let reader = try AVAssetReader(asset: asset)
         var format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        #if !targetEnvironment(simulator)
         if #available(iOS 26.0, *), let made = denoiser as? Denoiser { format = made.format }
+        #endif
         let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: format,
             kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
@@ -198,17 +207,22 @@ enum VideoEnhance {
         func finish(_ pixels: CVPixelBuffer, at time: CMTime) async throws {
             let seconds = (time - (firstTime ?? .zero)).seconds
             var image = transform(CIImage(cvPixelBuffer: pixels), seconds)
+            #if !targetEnvironment(simulator)
             if #available(iOS 26.0, *), let made = scaler as? Upscaler {
                 image = try await made.scale(image, context: context, to: size, at: time)
                 report.upscaled = true
             }
+            #endif
             if image.extent.origin != .zero {
                 image = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
             }
             try await write(image.cropped(to: CGRect(x: 0, y: 0, width: size.width, height: size.height)), at: time)
         }
 
+        var handled = false
+        #if !targetEnvironment(simulator)
         if #available(iOS 26.0, *), let made = denoiser as? Denoiser {
+            handled = true
             // The filter looks a few frames ahead: a frame is finished once its next ones are read.
             var window: [(VTFrameProcessorFrame, CMTime)] = []
             var index = 0
@@ -241,7 +255,10 @@ enum VideoEnhance {
             }
             report.denoised = report.frames > 0
             made.end()
-        } else {
+        }
+        if #available(iOS 26.0, *), let made = scaler as? Upscaler { made.end() }
+        #endif
+        if !handled {
             while let sample = videoOut.copyNextSampleBuffer() {
                 guard let decoded = CMSampleBufferGetImageBuffer(sample) else { continue }
                 let time = CMSampleBufferGetPresentationTimeStamp(sample)
@@ -249,7 +266,6 @@ enum VideoEnhance {
                 try await finish(decoded, at: time)
             }
         }
-        if #available(iOS 26.0, *), let made = scaler as? Upscaler { made.end() }
 
         if reader.status == .failed { throw reader.error ?? LinkError.io("读取视频失败。") }
         guard sessionStarted else { throw LinkError.io("视频里没有读到画面。") }
@@ -319,6 +335,7 @@ enum VideoEnhance {
 
 // MARK: - the noise filter
 
+#if !targetEnvironment(simulator)
 @available(iOS 26.0, *)
 final class Denoiser {
     let processor: VTFrameProcessor
@@ -472,3 +489,4 @@ final class Upscaler {
 
     func end() { processor.endSession() }
 }
+#endif

@@ -52,6 +52,18 @@ jobs:
       - name: Generate project
         run: cd ios && xcodegen generate
 
+      # The device build first: it fails in five minutes where the tests take fifteen.
+      - name: Build unsigned
+        run: |
+          cd ios
+          xcodebuild \
+            -project GlassesLink.xcodeproj \
+            -scheme GlassesLink \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
       - name: Unit tests (golden vectors)
         run: |
           cd ios
@@ -74,17 +86,6 @@ jobs:
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testTransportReportsUnexpectedEndOnceAndPreservesItsCause \
             -only-testing:GlassesLinkTests/SessionLoopbackTests/testTransportReadsLargestDocumentedDataXFrameAcrossReads \
             -destination "platform=iOS Simulator,id=$DEVICE" \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
-
-      - name: Build unsigned
-        run: |
-          cd ios
-          xcodebuild \
-            -project GlassesLink.xcodeproj \
-            -scheme GlassesLink \
-            -sdk iphoneos \
-            -configuration Release \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
