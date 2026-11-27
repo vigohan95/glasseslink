@@ -78,7 +78,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.local.glasseslink
         PRODUCT_NAME: GlassesLink
-        TARGETED_DEVICE_FAMILY: 1
+        # iPhone and iPad.
+        TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.9"
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGN_ENTITLEMENTS: GlassesLink.entitlements
@@ -89,8 +90,14 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: GlassesLink
-        CFBundleShortVersionString: "1.09"
-        CFBundleVersion: "109"
+        CFBundleShortVersionString: "1.10"
+        CFBundleVersion: "110"
+        # An iPad app turns every way and shares the screen (Split View, Slide Over, Stage Manager).
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         # Built with the iOS 26 SDK for its video processors; the screens keep the look they were made with.
         UIDesignRequiresCompatibility: true
         UILaunchScreen: {}

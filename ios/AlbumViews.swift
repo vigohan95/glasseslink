@@ -42,8 +42,12 @@ struct AlbumTab: View {
         self.openDevice = openDevice
     }
 
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    /// Three to a row on an iPhone; on an iPad as many as fit at about a phone's tile size.
     private var columns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 4), count: 3)
+        if sizeClass == .regular { return [GridItem(.adaptive(minimum: 150, maximum: 220), spacing: 4)] }
+        return Array(repeating: GridItem(.flexible(), spacing: 4), count: 3)
     }
 
     private var canBrowseGlasses: Bool { g.canUseGlasses || g.mediaImportInProgress }
@@ -121,6 +125,7 @@ struct AlbumTab: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     controls(snapshot)
+                        .readableColumn()
                     gallery(snapshot)
                 }
                 .padding(.horizontal, GlassesTheme.pagePadding)
@@ -497,6 +502,7 @@ struct AlbumTab: View {
         .padding(.horizontal, GlassesTheme.pagePadding)
         .padding(.vertical, 12)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .readableColumn()
         .background(.regularMaterial)
     }
 

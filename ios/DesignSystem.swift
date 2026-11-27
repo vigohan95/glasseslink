@@ -24,6 +24,8 @@ enum GlassesTheme {
     static let cardRadius: CGFloat = 16
     static let controlRadius: CGFloat = 12
     static let pagePadding: CGFloat = 20
+    /// The widest a column of cards and text grows on an iPad; an iPhone is narrower anyway.
+    static let readableWidth: CGFloat = 680
     static let sectionSpacing: CGFloat = 16
 
     static var card: RoundedRectangle {
@@ -47,6 +49,12 @@ extension View {
     /// The page colour behind a tab's scrolling content.
     func glassesPage() -> some View {
         background(GlassesTheme.page.ignoresSafeArea())
+    }
+
+    /// Centred and no wider than a comfortable reading column, so cards do not stretch across an iPad.
+    func readableColumn() -> some View {
+        frame(maxWidth: GlassesTheme.readableWidth)
+            .frame(maxWidth: .infinity)
     }
 }
 

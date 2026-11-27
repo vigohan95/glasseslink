@@ -89,6 +89,40 @@ jobs:
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
+      # Each tab on an iPhone and an iPad simulator, for checking the layout by eye.
+      - name: Screenshots
+        if: contains(github.event.head_commit.message, '[shots]')
+        continue-on-error: true
+        run: |
+          cd ios
+          mkdir -p ../shots
+          for kind in "iPhone" "iPad"; do
+            DEVICE=$(xcrun simctl list devices available | grep -E "^ +$kind" | head -1 | grep -Eo '[0-9A-F-]{36}')
+            echo "$kind simulator: $DEVICE"
+            [ -n "$DEVICE" ] || continue
+            xcodebuild build -project GlassesLink.xcodeproj -scheme GlassesLink -configuration Release \
+              -destination "platform=iOS Simulator,id=$DEVICE" -derivedDataPath build-shots \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO -quiet
+            xcrun simctl boot "$DEVICE" || true
+            xcrun simctl bootstatus "$DEVICE" -b
+            xcrun simctl install "$DEVICE" build-shots/Build/Products/Release-iphonesimulator/GlassesLink.app
+            for tab in device album camera assistant; do
+              xcrun simctl launch "$DEVICE" dev.local.glasseslink -startTab "$tab"
+              sleep 8
+              xcrun simctl io "$DEVICE" screenshot "../shots/$kind-$tab.png"
+              xcrun simctl terminate "$DEVICE" dev.local.glasseslink || true
+            done
+            xcrun simctl shutdown "$DEVICE" || true
+          done
+          ls -la ../shots
+
+      - uses: actions/upload-artifact@v4
+        if: contains(github.event.head_commit.message, '[shots]')
+        with:
+          name: screenshots
+          path: shots/
+          retention-days: 7
+
       - name: Package ipa
         run: |
           mkdir -p out/Payload

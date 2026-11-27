@@ -14,7 +14,19 @@ enum AppTab: Hashable { case device, album, camera, assistant }
 struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var g = Glasses()
-    @State private var selectedTab: AppTab = .device
+    @State private var selectedTab: AppTab = RootView.launchTab
+
+    /// `-startTab album` and the like open another tab first: the build's screenshots of each tab.
+    private static var launchTab: AppTab {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let at = arguments.firstIndex(of: "-startTab"), at + 1 < arguments.count else { return .device }
+        switch arguments[at + 1] {
+        case "album": return .album
+        case "camera": return .camera
+        case "assistant": return .assistant
+        default: return .device
+        }
+    }
     @State private var manualMediaWiFiSheet: ManualMediaWiFiJoin?
 
     private var importBadge: String? { g.mediaImportInProgress ? "导入中" : nil }

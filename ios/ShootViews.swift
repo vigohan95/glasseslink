@@ -66,6 +66,7 @@ struct ShootTab: View {
                 .padding(.horizontal, GlassesTheme.pagePadding)
                 .padding(.top, 8)
                 .padding(.bottom, 24)
+                .readableColumn()
             }
             .glassesPage()
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -195,6 +196,7 @@ struct ShootTab: View {
         .padding(.horizontal, GlassesTheme.pagePadding)
         .padding(.top, 14)
         .padding(.bottom, 10)
+        .readableColumn()
         .background(.regularMaterial)
     }
 

@@ -58,6 +58,7 @@ struct AssistantTab: View {
                 .padding(.horizontal, GlassesTheme.pagePadding)
                 .padding(.top, 8)
                 .padding(.bottom, 24)
+                .readableColumn()
             }
             .glassesPage()
             .scrollDismissesKeyboard(.interactively)
@@ -263,6 +264,7 @@ struct AssistantTab: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+        .readableColumn()
         .background(.regularMaterial)
     }
 

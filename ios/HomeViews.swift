@@ -48,6 +48,7 @@ struct HomeTab: View {
                 .padding(.horizontal, GlassesTheme.pagePadding)
                 .padding(.top, 8)
                 .padding(.bottom, 24)
+                .readableColumn()
                 .animation(.easeInOut(duration: 0.25), value: linkReady)
             }
             .glassesPage()
